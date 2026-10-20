@@ -32,6 +32,8 @@ struct strata_context {
 
     // Loads the vocabulary and chat template from the GGUF (vocab only, no tensors) and waits for the engine's READY.
     bool load(common_params & params, std::string & err);
+    // --picture-cache: how many pictures' encoded rows are kept for the turns that resend them (0: none); before load()
+    void set_picture_cache(size_t entries, size_t bytes);
 
     // Blocks the calling thread running the task loop until terminate().
     void start_loop();

@@ -20,6 +20,7 @@
 #include <atomic>
 #include <clocale>
 #include <csignal>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -55,6 +56,8 @@ void usage() {
         "                         handed to the engine (Qwen family); on the CPU (--threads N) unless --mmproj-gpu\n"
         "  --mmproj-gpu           encode on the card: about 1 GB of VRAM plus work buffers, taken before the engine\n"
         "                         sizes its expert cache only if the encoder loads first; for cards with room\n"
+        "  --picture-cache N      keep the encoded rows of the last N pictures (default 64, up to 1 GiB) so a chat\n"
+        "                         that resends its pictures every turn encodes each once; 0 turns it off\n"
         "  --                     everything after it is passed to the engine; --serve is added\n"
         "\n"
         "example (Qwen3.6-35B-A3B from its GGUF):\n"
@@ -91,6 +94,7 @@ int main(int argc, char ** argv) {
     std::vector<std::string> engine_args;
     std::vector<char *> llama_argv;
     bool mmproj_gpu = false; // the vision encoder on the card: only where the engine leaves room (a 48 GB card)
+    long picture_cache = 64; // --picture-cache N: encoded pictures kept for the turns that resend them
     llama_argv.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -111,6 +115,12 @@ int main(int argc, char ** argv) {
         }
         if (a == "--mmproj-gpu") {
             mmproj_gpu = true;
+            continue;
+        }
+        if (a == "--picture-cache") {
+            if (i + 1 >= argc) { usage(); return 2; }
+            picture_cache = std::strtol(argv[++i], nullptr, 10);
+            if (picture_cache < 0) { usage(); return 2; }
             continue;
         }
         llama_argv.push_back(argv[i]);
@@ -153,6 +163,7 @@ int main(int argc, char ** argv) {
     llama_numa_init(params.numa);
 
     strata_context ctx_server;
+    ctx_server.set_picture_cache((size_t) picture_cache, (size_t) 1 << 30);
     server_http_context ctx_http;
     if (!ctx_http.init(params)) {
         SRV_ERR("%s", "failed to initialize HTTP server\n");

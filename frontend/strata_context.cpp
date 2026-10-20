@@ -6,6 +6,7 @@
 #include "strata_context.hpp"
 #include "engine.hpp"
 #include "literals.hpp"
+#include "picture_cache.hpp"
 
 #include "server-common.h"
 #include "server-task.h"
@@ -67,6 +68,7 @@ struct Slot {
     int32_t n_predict = -1;
 
     std::string images_path; // the request's picture rows for GENI (step 8); unlinked when the slot is released
+    std::vector<uint64_t> image_keys; // one per picture, for img_keys= on the GENI line (0: none)
 
     bool active() const { return task != nullptr; }
 
@@ -180,6 +182,7 @@ struct strata_context_impl {
     int32_t               vision_width = 0;  // the projector's output width, checked against the model's embedding
     int32_t               image_pad_id = -1; // the token whose runs in the ids the engine replaces with picture rows
     bool                  p_mmproj_gpu = false;
+    strata_frontend::PictureCache pictures; // encoded rows per picture (--picture-cache N; 64 pictures, 1 GiB)
 
     // the texts of the vocabulary's control tokens and marker-like added tokens: inside a message they are text
     // (literals.hpp, USTRAT-14)
@@ -338,7 +341,7 @@ struct strata_context_impl {
                     t.id, t.params.sampling.grammar.grammar.size());
         }
 
-        const std::string header = gen_header(t, slot.n_predict, slot.images_path);
+        const std::string header = gen_header(t, slot.n_predict, slot.images_path, slot.image_keys);
         if (!engine.send_request(header, ids)) {
             send_error(t, "the engine is not running", ERROR_TYPE_UNAVAILABLE);
             slot.release();
@@ -356,7 +359,8 @@ struct strata_context_impl {
 
     // `GEN <max_new> key=value...` from the request's sampling parameters. Absent keys mean greedy to the engine
     // (generate.cpp: "Absent = greedy"), so temperature <= 0 sends none of them.
-    std::string gen_header(const server_task & t, int32_t max_new, const std::string & images_path = std::string()) const {
+    std::string gen_header(const server_task & t, int32_t max_new, const std::string & images_path = std::string(),
+                           const std::vector<uint64_t> & image_keys = {}) const {
         const auto & s = t.params.sampling;
         std::string h = (images_path.empty() ? "GEN " : "GENI ") + std::to_string(max_new);
         char b[128];
@@ -388,6 +392,11 @@ struct strata_context_impl {
         if (!images_path.empty()) {
             // GENI <max_new> [key=value ...] image_pad=<id> <file> <ids>: the engine reads strata-vision records from the
             // file and places them at the runs of image_pad (src/poly/main.cpp take_pictures, generate.cpp for strata)
+            // img_keys= (#2228): the conversation cache matches a picture by its key and grid, not its rows
+            const std::string keys = strata_frontend::PictureCache::hex_list(image_keys);
+            if (!keys.empty()) {
+                h += " img_keys=" + keys;
+            }
             h += " image_pad=" + std::to_string(image_pad_id) + " " + images_path;
         }
         return h;
@@ -478,6 +487,8 @@ struct strata_context_impl {
         p_mmproj_gpu = p.mmproj_use_gpu;
         LOG_INF("vision: %s, rows of %d, encoder on the %s (%d CPU threads), at most %d rows a picture, image_pad=%d\n",
                 p.mmproj.path.c_str(), vision_width, cp.use_gpu ? "GPU" : "CPU", cp.n_threads, cp.image_max_tokens, image_pad_id);
+        LOG_INF("vision: the rows of the last %zu pictures (%zu MiB at most) are kept for the turns that resend them\n",
+                pictures.max_entries(), pictures.max_bytes() >> 20);
         return true;
     }
 
@@ -488,79 +499,16 @@ struct strata_context_impl {
             err = "images need the server started with --mmproj";
             return false;
         }
-        char name[] = "/tmp/unbiased-strata-pictures-XXXXXX";
-        const int fd = ::mkstemp(name);
-        if (fd < 0) {
-            err = "cannot create the pictures file";
-            return false;
-        }
-        slot.images_path = name;
-        std::FILE * f = ::fdopen(fd, "wb");
+        std::FILE * f = open_pictures_file(err);
         if (f == nullptr) {
-            ::close(fd);
-            err = "cannot open the pictures file";
             return false;
         }
-        const size_t n = t.tokens.size();
-        int n_pictures = 0;
-        ids.reserve(n);
-        for (size_t i = 0; i < n;) {
-            if (t.tokens[i] != LLAMA_TOKEN_NULL) {
-                ids.push_back(t.tokens[i]);
-                ++i;
-                continue;
-            }
-            const mtmd_input_chunk * ch = nullptr;
-            try {
-                ch = t.tokens.find_chunk(i).get();
-            } catch (const std::exception &) {
-                ch = nullptr;
-            }
-            if (ch == nullptr || mtmd_input_chunk_get_type(ch) != MTMD_INPUT_CHUNK_TYPE_IMAGE) {
-                std::fclose(f);
-                err = "only pictures are supported, not audio or video";
-                return false;
-            }
-            const int32_t n_tok = (int32_t) mtmd_input_chunk_get_n_tokens(ch);
-            const auto t0 = std::chrono::steady_clock::now();
-            if (mtmd_encode_chunk(mctx, ch) != 0) {
-                std::fclose(f);
-                err = "the vision encoder failed";
-                return false;
-            }
-            const float * embd = mtmd_get_output_embd(mctx);
-            const mtmd_image_tokens * it = mtmd_input_chunk_get_tokens_image(ch);
-            if (embd == nullptr || it == nullptr || n_tok < 1) {
-                std::fclose(f);
-                err = "the vision encoder returned nothing";
-                return false;
-            }
-            // the grid from the decoder positions of the last row (strata-vision does the same)
-            const mtmd_decoder_pos last = mtmd_image_tokens_get_decoder_pos(it, 0, (size_t) n_tok - 1);
-            int32_t nx = (int32_t) last.x + 1, ny = (int32_t) last.y + 1;
-            if (n_tok > 1 && nx == n_tok && ny == n_tok) {
-                ny = 1;
-            }
-            if ((int64_t) nx * ny != n_tok) {
-                std::fclose(f);
-                err = string_format("picture %d: %d rows are not a grid (tiled encoders are not supported)", n_pictures + 1, n_tok);
-                return false;
-            }
-            const int32_t hdr[5] = {0x31455653, n_tok, nx, ny, vision_width};
-            const size_t count = (size_t) n_tok * (size_t) vision_width;
-            if (std::fwrite(hdr, sizeof hdr, 1, f) != 1 || std::fwrite(embd, sizeof(float), count, f) != count) {
-                std::fclose(f);
-                err = "short write to the pictures file";
-                return false;
-            }
-            ids.insert(ids.end(), (size_t) n_tok, image_pad_id);
-            ++n_pictures;
-            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-            SRV_INF("task %d: picture %d: %d rows (%dx%d) encoded in %.0f ms on the %s\n", t.id, n_pictures, n_tok, nx, ny, ms,
-                    p_mmproj_gpu ? "GPU" : "CPU");
-            i += (size_t) n_tok;
+        const bool filled = fill_pictures(t, f, ids, err);
+        const bool closed = std::fclose(f) == 0;
+        if (!filled) {
+            return false;
         }
-        if (std::fclose(f) != 0) {
+        if (!closed) {
             err = "cannot write the pictures file";
             return false;
         }
@@ -569,6 +517,135 @@ struct strata_context_impl {
             return false;
         }
         return true;
+    }
+
+    // the request's pictures file (slot.images_path, unlinked when the slot is released)
+    std::FILE * open_pictures_file(std::string & err) {
+        char name[] = "/tmp/unbiased-strata-pictures-XXXXXX";
+        const int fd = ::mkstemp(name);
+        if (fd < 0) {
+            err = "cannot create the pictures file";
+            return nullptr;
+        }
+        slot.images_path = name;
+        std::FILE * f = ::fdopen(fd, "wb");
+        if (f == nullptr) {
+            ::close(fd);
+            err = "cannot open the pictures file";
+        }
+        return f;
+    }
+
+    // the ids with every picture's rows written to `f` and image_pad in their place; slot.image_keys for the GENI line
+    bool fill_pictures(const server_task & t, std::FILE * f, std::vector<int32_t> & ids, std::string & err) {
+        const size_t n = t.tokens.size();
+        ids.reserve(n);
+        slot.image_keys.clear();
+        for (size_t i = 0; i < n;) {
+            if (t.tokens[i] != LLAMA_TOKEN_NULL) {
+                ids.push_back(t.tokens[i]);
+                ++i;
+                continue;
+            }
+            const mtmd_input_chunk * ch = image_chunk(t, i);
+            if (ch == nullptr) {
+                err = "only pictures are supported, not audio or video";
+                return false;
+            }
+            const auto rows = picture_rows(ch, t.id, (int) slot.image_keys.size() + 1, err);
+            if (rows == nullptr) {
+                return false;
+            }
+            if (!write_rows(f, *rows)) {
+                err = "short write to the pictures file";
+                return false;
+            }
+            ids.insert(ids.end(), (size_t) rows->n_tok, image_pad_id);
+            slot.image_keys.push_back(strata_frontend::PictureCache::engine_key(chunk_id(ch)));
+            i += (size_t) rows->n_tok;
+        }
+        return true;
+    }
+
+    // the image chunk at position i of the task's tokens, nullptr for anything else
+    static const mtmd_input_chunk * image_chunk(const server_task & t, size_t i) {
+        const mtmd_input_chunk * ch = nullptr;
+        try {
+            ch = t.tokens.find_chunk(i).get();
+        } catch (const std::exception &) {
+            return nullptr;
+        }
+        if (ch == nullptr || mtmd_input_chunk_get_type(ch) != MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+            return nullptr;
+        }
+        return ch;
+    }
+
+    // mtmd names a bitmap by the SHA-256 of its bytes; the chunk carries it (empty for a placeholder)
+    static std::string chunk_id(const mtmd_input_chunk * ch) {
+        const char * id = mtmd_input_chunk_get_id(ch);
+        return id == nullptr ? std::string() : std::string(id);
+    }
+
+    // one picture's rows: the cache's copy when the picture was seen before, else encoded now and remembered
+    strata_frontend::PictureCache::Rows picture_rows(const mtmd_input_chunk * ch, int task_id, int index, std::string & err) {
+        const std::string key = chunk_id(ch);
+        if (auto hit = pictures.find(key)) {
+            SRV_INF("task %d: picture %d: %d rows (%dx%d) from the cache\n", task_id, index, hit->n_tok, hit->nx, hit->ny);
+            return hit;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        strata_frontend::PictureRows rows;
+        if (!encode_rows(ch, index, rows, err)) {
+            return nullptr;
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        SRV_INF("task %d: picture %d: %d rows (%dx%d) encoded in %.0f ms on the %s\n", task_id, index, rows.n_tok, rows.nx, rows.ny, ms,
+                p_mmproj_gpu ? "GPU" : "CPU");
+        return pictures.put(key, std::move(rows));
+    }
+
+    // the projector's output for one chunk
+    bool encode_rows(const mtmd_input_chunk * ch, int index, strata_frontend::PictureRows & rows, std::string & err) {
+        const int32_t n_tok = (int32_t) mtmd_input_chunk_get_n_tokens(ch);
+        if (mtmd_encode_chunk(mctx, ch) != 0) {
+            err = "the vision encoder failed";
+            return false;
+        }
+        const float * embd = mtmd_get_output_embd(mctx);
+        const mtmd_image_tokens * it = mtmd_input_chunk_get_tokens_image(ch);
+        if (embd == nullptr || it == nullptr || n_tok < 1) {
+            err = "the vision encoder returned nothing";
+            return false;
+        }
+        if (!picture_grid(it, n_tok, rows.nx, rows.ny)) {
+            err = string_format("picture %d: %d rows are not a grid (tiled encoders are not supported)", index, n_tok);
+            return false;
+        }
+        rows.n_tok = n_tok;
+        rows.width = vision_width;
+        rows.embd.assign(embd, embd + (size_t) n_tok * (size_t) vision_width);
+        return true;
+    }
+
+    // the grid from the decoder positions of the last row (strata-vision does the same)
+    static bool picture_grid(const mtmd_image_tokens * it, int32_t n_tok, int32_t & nx, int32_t & ny) {
+        const mtmd_decoder_pos last = mtmd_image_tokens_get_decoder_pos(it, 0, (size_t) n_tok - 1);
+        nx = (int32_t) last.x + 1;
+        ny = (int32_t) last.y + 1;
+        if (n_tok > 1 && nx == n_tok && ny == n_tok) {
+            ny = 1;
+        }
+        return (int64_t) nx * ny == n_tok;
+    }
+
+    // one strata-vision record: the header, then the rows
+    static bool write_rows(std::FILE * f, const strata_frontend::PictureRows & r) {
+        const int32_t hdr[5] = {0x31455653, r.n_tok, r.nx, r.ny, r.width};
+        if (std::fwrite(hdr, sizeof hdr, 1, f) != 1) {
+            return false;
+        }
+        return std::fwrite(r.embd.data(), sizeof(float), r.embd.size(), f) == r.embd.size();
     }
 
     void cancel_current() {
@@ -1176,6 +1253,10 @@ bool strata_context::start_engine(const common_params & params, const std::strin
         argv.push_back(a);
     }
     return impl->engine.start(engine_exe, argv, err);
+}
+
+void strata_context::set_picture_cache(size_t entries, size_t bytes) {
+    impl->pictures.configure(entries, bytes);
 }
 
 bool strata_context::load(common_params & params, std::string & err) {
