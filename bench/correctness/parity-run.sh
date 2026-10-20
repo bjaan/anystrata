@@ -3,8 +3,11 @@
 # through ctest (one directory per test under parity/, with stdout+stderr and the exit code); the hand-run poly_*
 # programs after. Reconfigures first so iq_parity registers now that numpy is present.
 set -u
-cd ~/us2-build || exit 1
-R=~/us2-results/correctness/parity; mkdir -p $R
+# Paths (the defaults are the homelab VM's; set them for another machine): US2_MODELS, the directory holding
+# qwen36/<file>.gguf (required); US2_BUILD, the UnbiasedStrata tree with build/bin (default: this script's
+# repository); US2_RESULTS, where results go (default ~/us2-results/correctness).
+cd "${US2_BUILD:-$(cd "$(dirname "$0")/../.." && pwd)}" || exit 1
+R=${US2_RESULTS:-$HOME/us2-results/correctness}/parity; mkdir -p $R
 make configure CMAKE_EXTRA=-DSTRATA_BUILD_TESTS=ON CUDA_ARCHS=86 > $R/reconfigure.log 2>&1
 cmake --build build -j 8 --target iq_parity >> $R/reconfigure.log 2>&1; echo "iq_parity build exit $?" >> $R/reconfigure.log
 ctest --test-dir build -N > $R/ctest-list.txt 2>&1
@@ -18,9 +21,10 @@ for t in $A; do
   echo "$t: exit $(cat $d/exit.txt) $(grep -oE "[0-9]+% tests passed|Passed|Failed|Not Run|Timeout" $d/ctest.txt | head -2 | tr '\n' ' ')"
 done
 # hand-run programs (section 2.2 "hand")
-Q3=/mnt/ds4/unbiased-strata/qwen36/Qwen3.6-35B-A3B-UD-Q3_K_M.gguf; IQ4=/mnt/ds4/unbiased-strata/qwen36/Qwen3.6-35B-A3B-UD-IQ4_XS.gguf
+M=${US2_MODELS:?set US2_MODELS to the directory holding qwen36/}/qwen36
+Q3=$M/Qwen3.6-35B-A3B-UD-Q3_K_M.gguf; IQ4=$M/Qwen3.6-35B-A3B-UD-IQ4_XS.gguf
 run() { n=$1; shift; d=$R/$n; mkdir -p $d; echo "$*" > $d/command.sh; timeout 3600 "$@" > $d/stdout.txt 2> $d/stderr.txt; echo $? > $d/exit.txt; echo "$n: exit $(cat $d/exit.txt), $(wc -l < $d/stdout.txt) stdout lines"; }
-B=~/us2-build/build/bin
+B=$PWD/build/bin
 run poly_route_test $B/poly_route_test
 run poly_norm_q8_test $B/poly_norm_q8_test
 run poly_gemm_small_test $B/poly_gemm_small_test

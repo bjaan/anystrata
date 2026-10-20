@@ -4,9 +4,18 @@ the real-text set, .answer.ids. Tokenizer: llama-tokenize from the reference bui
 tokenizer gives the same ids: checked on prompt 1, 2026-10-18). Chat prompts use Qwen's ChatML; thinking off = empty
 <think> block, as tools/qwen35/parity_prompts.ids."""
 import json, os, pathlib, subprocess, sys
-ROOT = pathlib.Path.home() / 'us2-results/correctness'
+# Paths (the defaults are the homelab VM's; set them for another machine): US2_MODELS, the directory holding
+# qwen36/<file>.gguf (required); US2_BUILD, the UnbiasedStrata tree with build/bin (default: this script's
+# repository); US2_RESULTS, where results go (default ~/us2-results/correctness).
+def _models():
+    m = os.environ.get('US2_MODELS')
+    if not m:
+        sys.exit('set US2_MODELS to the directory holding qwen36/')
+    return pathlib.Path(m)
+BUILD = pathlib.Path(os.environ.get('US2_BUILD') or pathlib.Path(__file__).resolve().parents[2])
+ROOT = pathlib.Path(os.environ.get('US2_RESULTS') or pathlib.Path.home() / 'us2-results/correctness')
 TOK = pathlib.Path.home() / 'llamacpp-ref/build/bin/llama-tokenize'
-MODEL = '/mnt/ds4/unbiased-strata/qwen36/Qwen3.6-35B-A3B-UD-Q3_K_M.gguf'
+MODEL = str(_models() / 'qwen36/Qwen3.6-35B-A3B-UD-Q3_K_M.gguf')
 SRC = ROOT / 'inputs-src'; OUT = ROOT / 'inputs'
 
 def tokenize(text):
@@ -29,7 +38,7 @@ def write(setname, seq, prompt, answer=None, n_answer=None):
     print(setname, seq, meta)
 
 # short chat: upstream's 10 prompts, 128 answer tokens
-ref_ids = [list(map(int, l.split(','))) for l in open(pathlib.Path.home() / 'us2-build/tools/qwen35/parity_prompts.ids') if l.strip()]
+ref_ids = [list(map(int, l.split(','))) for l in open(BUILD / 'tools/qwen35/parity_prompts.ids') if l.strip()]
 for i, q in enumerate(json.load(open(SRC / 'short.json'))):
     ids = tokenize(chat(q, False))
     assert ids == ref_ids[i], (i, ids, ref_ids[i])   # the retokenized prompt must equal upstream's file

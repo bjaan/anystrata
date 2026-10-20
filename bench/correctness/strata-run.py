@@ -26,11 +26,20 @@ them on the card no decode miss happens and pin = pin2 = pint4 = pincpu = pingpu
                 computed on the GPU (T0 against pin: a fetched expert equals a cached one) Writes strata/<arm>/<seq>.pos.tsv, .scored.tsv (rows aligned to the answer),
 .engine.log, .done.txt, command.sh."""
 import os, pathlib, subprocess, sys, time
-sys.path.insert(0, str(pathlib.Path.home() / 'us2-build/tools/qwen35'))
+# Paths (the defaults are the homelab VM's; set them for another machine): US2_MODELS, the directory holding
+# qwen36/<file>.gguf (required); US2_BUILD, the UnbiasedStrata tree with build/bin (default: this script's
+# repository); US2_RESULTS, where results go (default ~/us2-results/correctness).
+def _models():
+    m = os.environ.get('US2_MODELS')
+    if not m:
+        sys.exit('set US2_MODELS to the directory holding qwen36/')
+    return pathlib.Path(m)
+BUILD = pathlib.Path(os.environ.get('US2_BUILD') or pathlib.Path(__file__).resolve().parents[2])
+ROOT = pathlib.Path(os.environ.get('US2_RESULTS') or pathlib.Path.home() / 'us2-results/correctness')
+sys.path.insert(0, str(BUILD / 'tools/qwen35'))
 from q36_harness import Eng
-ROOT = pathlib.Path.home() / 'us2-results/correctness'
-EXE = str(pathlib.Path.home() / 'us2-build/build/bin/strata')
-M = '/mnt/ds4/unbiased-strata'
+EXE = str(BUILD / 'build/bin/strata')
+M = str(_models())
 BASE = ['--pack', f'{M}/pack-iq3-xxs', '--native', f'{M}/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf',
         '--ple-gguf', f'{M}/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf',
         '--expert-profile', f'{M}/pack-iq3-xxs/expert-profile.bin', '--resident-experts', '--prefill', 'auto',
