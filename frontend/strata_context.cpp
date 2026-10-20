@@ -5,6 +5,7 @@
 
 #include "strata_context.hpp"
 #include "engine.hpp"
+#include "literals.hpp"
 
 #include "server-common.h"
 #include "server-task.h"
@@ -179,6 +180,10 @@ struct strata_context_impl {
     int32_t               vision_width = 0;  // the projector's output width, checked against the model's embedding
     int32_t               image_pad_id = -1; // the token whose runs in the ids the engine replaces with picture rows
     bool                  p_mmproj_gpu = false;
+
+    // the texts of the vocabulary's control tokens and marker-like added tokens: inside a message they are text
+    // (literals.hpp, USTRAT-14)
+    strata_frontend::Literals literals;
 
     server_chat_params           chat_params;
     std::map<std::string, bool>  chat_caps;
@@ -439,6 +444,13 @@ struct strata_context_impl {
             err = "--mmproj-gpu: this build's ggml has no GPU backend; the encoder can only run on the CPU";
             return false;
         }
+        // mtmd's default logger writes every level to stderr, its debug line add_text() among them: the whole
+        // rendered prompt, once per request, into the journal (USTRAT-14). Through the common log instead, where
+        // debug lines need the server's verbosity raised.
+        mtmd_log_set([](ggml_log_level level, const char * text, void *) {
+            if (level == GGML_LOG_LEVEL_DEBUG && common_log_get_verbosity_thold() < LOG_DEFAULT_DEBUG) return;
+            common_log_add(common_log_main(), level, "%s", text);
+        }, nullptr);
         mtmd_context_params cp = mtmd_context_params_default();
         // the request parser (server-common) replaces each image_url part by a marker that is random per process
         // (get_media_marker); mtmd must look for that same marker, as server-context.cpp sets it
@@ -867,10 +879,117 @@ struct strata_context_impl {
         };
     }
 
+    // ---- the literals of a request (literals.hpp) ----------------------------------------------------------------
+
+    // the control tokens' texts and the marker-like added tokens' texts, from the vocabulary
+    void init_literals() {
+        std::vector<std::string> texts;
+        const int32_t n = llama_vocab_n_tokens(vocab);
+        for (int32_t id = 0; id < n; ++id) {
+            const llama_token_attr attr = llama_vocab_get_attr(vocab, id);
+            const char * text = llama_vocab_get_text(vocab, id);
+            if (text == nullptr || *text == '\0') continue;
+            if (attr & LLAMA_TOKEN_ATTR_CONTROL) {
+                texts.emplace_back(text);
+            } else if ((attr & LLAMA_TOKEN_ATTR_USER_DEFINED) && strata_frontend::Literals::marker_like(text)) {
+                texts.emplace_back(text);
+            }
+        }
+        literals = strata_frontend::Literals::from_texts(std::move(texts));
+        LOG_INF("literals: %zu control-token texts are text inside a message%s\n", literals.tags.size(),
+                literals.think_open.empty() ? "" : " (an assistant message keeps a leading <think> block)");
+    }
+
+    // the first UTF-8 character boundary at or after the middle of `s`; 0 when `s` is one character
+    static size_t utf8_half(const std::string & s) {
+        size_t cut = s.size() / 2;
+        while (cut < s.size() && ((unsigned char) s[cut] & 0xC0) == 0x80) ++cut;
+        return cut < s.size() ? cut : 0;
+    }
+
+    // Text inside a plain span, tokenized as text. parse_special=false keeps the control tokens as text; an added
+    // token the tokenizer matches regardless (USER_DEFINED: <think>, <tool_call> in Qwen's vocabulary) is split in
+    // two and each half tokenized again, until no piece is one. A one-character added token is that character.
+    void tokenize_plain(const std::string & text, llama_tokens & out) const {
+        for (llama_token t : common_tokenize(vocab, text, false, false)) {
+            const llama_token_attr attr = llama_vocab_get_attr(vocab, t);
+            if ((attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) == 0) {
+                out.push_back(t);
+                continue;
+            }
+            const std::string piece = common_token_to_piece(vocab, t, true);
+            const size_t cut = utf8_half(piece);
+            if (cut == 0) { // one character: that character
+                out.push_back(t);
+                continue;
+            }
+            tokenize_plain(piece.substr(0, cut), out);
+            tokenize_plain(piece.substr(cut), out);
+        }
+    }
+
+    // the rendered prompt tokenized: the plain spans (literals.hpp) as text, the rest with specials parsed and the
+    // media markers resolved, as process_mtmd_prompt / tokenize_input_prompts do for a prompt without plain spans
+    server_tokens tokenize_prompt(const std::string & prompt, const std::vector<std::pair<size_t, size_t>> & plain,
+                                  const std::vector<raw_buffer> & files) const {
+        server_tokens out(llama_tokens{}, mctx != nullptr);
+        const bool add_bos = llama_vocab_get_add_bos(vocab);
+        if (add_bos) {
+            out.push_back(llama_vocab_bos(vocab));
+        }
+        const std::string marker = mctx != nullptr ? std::string(get_media_marker()) : std::string();
+        size_t next_file = 0;
+        auto special_segment = [&](const std::string & seg) {
+            if (seg.empty()) return;
+            size_t n_media = 0;
+            if (!marker.empty()) {
+                for (size_t p = seg.find(marker); p != std::string::npos; p = seg.find(marker, p + marker.size())) ++n_media;
+            }
+            if (n_media == 0) {
+                for (llama_token t : common_tokenize(vocab, seg, false, true)) out.push_back(t);
+                return;
+            }
+            if (next_file + n_media > files.size()) {
+                throw std::invalid_argument("the prompt has more media markers than files");
+            }
+            const std::vector<raw_buffer> sub(files.begin() + (long) next_file, files.begin() + (long) (next_file + n_media));
+            next_file += n_media;
+            server_tokens part = process_mtmd_prompt(mctx, seg, sub, init_opt);
+            // mtmd adds the BOS this prompt already has
+            size_t i = (add_bos && part.size() > 0 && part[0] == llama_vocab_bos(vocab)) ? 1 : 0;
+            while (i < part.size()) {
+                if (part[i] == LLAMA_TOKEN_NULL) {
+                    const mtmd_input_chunk * chunk = part.find_chunk(i).get();
+                    out.push_back(chunk);
+                    i += mtmd_input_chunk_get_n_tokens(chunk);
+                } else {
+                    out.push_back(part[i]);
+                    ++i;
+                }
+            }
+        };
+        size_t pos = 0;
+        llama_tokens plain_toks;
+        for (const auto & span : plain) {
+            special_segment(prompt.substr(pos, span.first - pos));
+            plain_toks.clear();
+            tokenize_plain(prompt.substr(span.first, span.second - span.first), plain_toks);
+            for (llama_token t : plain_toks) out.push_back(t);
+            pos = span.second;
+        }
+        special_segment(prompt.substr(pos));
+        if (next_file != files.size()) {
+            throw std::invalid_argument("the prompt has fewer media markers than files");
+        }
+        return out;
+    }
+
     // mirrors handle_completions_impl in server-context.cpp without the parts the engine has no use for
-    // (n_cmpl > 1, prompt logging, message spans for checkpoints)
+    // (n_cmpl > 1, prompt logging, message spans for checkpoints). `plain`: the prompt's byte spans that are text
+    // (a control token's text inside a message, literals.hpp)
     std::unique_ptr<res_generator> handle_completions(const server_http_req & req, const json & data,
-                                                      const std::vector<raw_buffer> & files, task_response_type res_type) {
+                                                      const std::vector<raw_buffer> & files, task_response_type res_type,
+                                                      const std::vector<std::pair<size_t, size_t>> & plain = {}) {
         auto res = create_response();
         auto completion_id = gen_chatcmplid();
         auto & rd = res->rd;
@@ -883,7 +1002,9 @@ struct strata_context_impl {
             const auto & prompt = data.at("prompt");
 
             std::vector<server_tokens> inputs;
-            if (res_type != TASK_RESPONSE_TYPE_NONE && mctx != nullptr) {
+            if (!plain.empty() && prompt.is_string()) {
+                inputs.push_back(tokenize_prompt(prompt.get<std::string>(), plain, files));
+            } else if (res_type != TASK_RESPONSE_TYPE_NONE && mctx != nullptr) {
                 inputs.push_back(process_mtmd_prompt(mctx, prompt.get<std::string>(), files, init_opt));
             } else {
                 inputs = tokenize_input_prompts(vocab, mctx, prompt, true, true, init_opt);
@@ -1083,6 +1204,7 @@ bool strata_context::load(common_params & params, std::string & err) {
         return false;
     }
     I.vocab      = llama_model_get_vocab(I.model);
+    I.init_literals();
     I.model_path = params.model.path;
     I.model_name = params.model_alias.empty() ? file_stem(params.model.path) : *params.model_alias.begin();
 
@@ -1231,11 +1353,30 @@ void strata_context::init_routes(server_http_context & http) {
         return res;
     };
 
-    auto post_chat_completions = [I](const server_http_req & req) {
+    // a control token's text inside a message stays text (literals.hpp): marked before the template renders,
+    // unmarked after, and the spans it covered are tokenized as text
+    auto parse_chat = [I](json & body, std::vector<raw_buffer> & files, std::vector<std::pair<size_t, size_t>> & plain) {
+        bool marked = false;
+        if (body.contains("messages")) {
+            json * tools = body.contains("tools") ? &body.at("tools") : nullptr;
+            marked = I->literals.mark_request(body.at("messages"), tools);
+        }
+        json data = oaicompat_chat_params_parse(body, I->chat_params, files);
+        if (marked) {
+            std::string prompt = data.at("prompt").get<std::string>();
+            plain = I->literals.unmark(prompt);
+            data["prompt"] = std::move(prompt);
+            SRV_INF("%zu control-token texts inside the messages are sent as text\n", plain.size());
+        }
+        return data;
+    };
+
+    auto post_chat_completions = [I, parse_chat](const server_http_req & req) {
         std::vector<raw_buffer> files;
+        std::vector<std::pair<size_t, size_t>> plain;
         json body = json::parse(req.body);
-        json body_parsed = oaicompat_chat_params_parse(body, I->chat_params, files);
-        return I->handle_completions(req, body_parsed, files, TASK_RESPONSE_TYPE_OAI_CHAT);
+        json body_parsed = parse_chat(body, files, plain);
+        return I->handle_completions(req, body_parsed, files, TASK_RESPONSE_TYPE_OAI_CHAT, plain);
     };
 
     auto post_completions_oai = [I](const server_http_req & req) {
@@ -1250,11 +1391,12 @@ void strata_context::init_routes(server_http_context & http) {
         return I->handle_completions(req, body, files, TASK_RESPONSE_TYPE_NONE);
     };
 
-    auto post_apply_template = [I](const server_http_req & req) {
+    auto post_apply_template = [I, parse_chat](const server_http_req & req) {
         auto res = I->create_response();
         std::vector<raw_buffer> files;
+        std::vector<std::pair<size_t, size_t>> plain;
         json body = json::parse(req.body);
-        json data = oaicompat_chat_params_parse(body, I->chat_params, files);
+        json data = parse_chat(body, files, plain);
         res->ok({{ "prompt", std::move(data.at("prompt")) }});
         return res;
     };

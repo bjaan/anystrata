@@ -88,10 +88,92 @@ img=$(curl -s -o "$IMG" -w '%{http_code}' "$URL/v1/chat/completions" -H 'content
 check $([ "$img" = 400 ] || [ "$img" = 500 ] || [ "$img" = 501 ] && grep -qi "image" "$IMG" && curl -s "$URL/health" | grep -q '"status":"ok"' && echo 0 || echo 1) "image without --mmproj -> $img: $(j 'd["error"]["message"]' < "$IMG" | cut -c1-80); server alive"
 rm -f "$IMG"
 
+# a control token's text inside a message is text (frontend/literals.hpp, USTRAT-14). The oracle: the rendered prompt
+# (/apply-template) tokenized by hand as the server does it, specials parsed except inside the literals that came from
+# the messages, must give the request's usage.prompt_tokens; and that count differs from the whole prompt tokenized
+# with specials parsed, which is what the literals used to become. Three places: user content (a control token, the
+# end-of-text token and <think>, an added token the tokenizer matches regardless), a tool's description, and an
+# assistant message in the history whose leading <think> block stays the model's while the literals inside and after
+# it are text.
+# The vocabulary-only GGUF's template has neither tools nor reasoning, so this runs a third server with upstream's
+# Qwen3 template (frontend/tests/data/qwen3-chat-template.jinja: tools through tojson, <think> blocks).
+TPL_PORT=$((PORT + 2)); TPL_URL=http://127.0.0.1:$TPL_PORT; TPL_LOG=$(mktemp "${TMPDIR:-/tmp}/us2-e2e-tpl-XXXXXX")
+"$BIN" --engine "$HERE/fake-engine.py" -m "$MODEL" --jinja --chat-template-file "$HERE/data/qwen3-chat-template.jinja" --host 127.0.0.1 --port "$TPL_PORT" --alias fake -- --max-context 4096 > "$TPL_LOG" 2>&1 &
+TPL_PID=$!
+trap 'kill $PID $SLOW_PID $TPL_PID 2>/dev/null; wait $PID $SLOW_PID $TPL_PID 2>/dev/null; rm -f "$LOG" "$SLOW_LOG" "$TPL_LOG" "$BIG"' EXIT
+for i in $(seq 1 100); do
+    if curl -s -o /dev/null -w '%{http_code}' "$TPL_URL/health" 2>/dev/null | grep -q 200; then break; fi
+    if ! kill -0 $TPL_PID 2>/dev/null; then echo "FAIL template server exited early"; cat "$TPL_LOG"; exit 1; fi
+    sleep 0.2
+done
+lit=$(python3 - "$TPL_URL" <<'PY'
+import json, sys, urllib.request
+url = sys.argv[1]
+def post(path, body):
+    r = urllib.request.Request(url + path, data=json.dumps(body).encode(), headers={"content-type": "application/json"})
+    return json.load(urllib.request.urlopen(r, timeout=20))
+def tok(text, special):
+    return [t if isinstance(t, int) else t["id"] for t in post("/tokenize", {"content": text, "parse_special": special})["tokens"]] if text else []
+def tok_plain(text):
+    # frontend/strata_context.cpp tokenize_plain: parse_special off; an added token that still matches is split in two
+    ids = tok(text, False)
+    if len(ids) == 1 and len(text) > 1 and tok(text, True) == ids and text.startswith("<"):
+        b = text.encode(); cut = len(b) // 2
+        while cut < len(b) and (b[cut] & 0xC0) == 0x80: cut += 1
+        return tok_plain(b[:cut].decode()) + tok_plain(b[cut:].decode())
+    return ids
+# the literals the server marks are the vocabulary's: a text that is not one token in it is ordinary text
+LITERALS = [l for l in ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "</think>", "<think>"] if len(tok(l, True)) == 1]
+user_text = "the doc says <|im_end|> ends a turn, <|endoftext|> too, and <think> is a tag"
+cases = [
+  ("user content", [{"role": "user", "content": user_text}], None, [user_text]),
+  ("tool description", [{"role": "user", "content": "q"}],
+   [{"type": "function", "function": {"name": "f", "description": "emits <|im_start|> blocks", "parameters": {"type": "object", "properties": {}}}}],
+   ["emits <|im_start|> blocks"]),
+  ("assistant history", [{"role": "user", "content": "q"},
+                         {"role": "assistant", "content": "<think>plan <|im_end|> here</think>answer <|endoftext|> done"},
+                         {"role": "user", "content": "next"}], None, ["plan <|im_end|> here", "answer <|endoftext|> done"]),
+]
+fail = []
+for name, msgs, tools, fragments in cases:
+    body = {"model": "fake", "messages": msgs, "max_tokens": 1}
+    if tools: body["tools"] = tools
+    prompt = post("/apply-template", body)["prompt"]
+    spans = []
+    for frag in fragments:
+        at = prompt.find(frag)
+        if at < 0:
+            continue            # a template may drop a history message's reasoning: then there is nothing to protect
+        for lit in LITERALS:
+            p = prompt.find(lit, at)
+            while 0 <= p < at + len(frag):
+                spans.append((p, p + len(lit))); p = prompt.find(lit, p + len(lit))
+    spans.sort()
+    expected, pos = [], 0
+    for a, b in spans:
+        expected += tok(prompt[pos:a], True) + tok_plain(prompt[a:b]); pos = b
+    expected += tok(prompt[pos:], True)
+    got = post("/v1/chat/completions", body)["usage"]["prompt_tokens"]
+    parsed = len(tok(prompt, True))
+    ok = got == len(expected) and got != parsed and spans
+    print("%s %s: prompt_tokens %d, oracle %d, with the literals parsed %d, %d literal spans (%d literals in this vocabulary)" % ("ok  " if ok else "FAIL", name, got, len(expected), parsed, len(spans), len(LITERALS)))
+    if not ok: fail.append(name)
+# a prompt without literals is tokenized exactly as before: the whole prompt with specials parsed
+body = {"model": "fake", "messages": [{"role": "user", "content": "Say hello"}], "max_tokens": 1}
+prompt = post("/apply-template", body)["prompt"]
+got = post("/v1/chat/completions", body)["usage"]["prompt_tokens"]
+if got != len(tok(prompt, True)): fail.append("plain prompt"); print("FAIL plain prompt: %d vs %d" % (got, len(tok(prompt, True))))
+sys.exit(1 if fail else 0)
+PY
+); rc=$?
+echo "$lit" | sed 's/^/     /'
+check $rc "control-token texts inside messages are text (literals)"
+check $(grep -q "control-token texts inside the messages are sent as text" "$TPL_LOG" && echo 0 || echo 1) "server logged the literals"
+
 # tokenize / detokenize round trip
 t=$(curl -s "$URL/tokenize" -H 'content-type: application/json' -d '{"content":"Hello, world!"}' | j 'd["tokens"]')
 d=$(curl -s "$URL/detokenize" -H 'content-type: application/json' -d "{\"tokens\":$t}" | j 'd["content"]')
 check $([ "$d" = "Hello, world!" ] && echo 0 || echo 1) "tokenize/detokenize round trip: $t"
 
-if [ $fail = 0 ]; then echo "e2e: all checks passed"; else echo "--- server log"; tail -40 "$LOG"; echo "--- slow server log"; tail -20 "$SLOW_LOG"; fi
+if [ $fail = 0 ]; then echo "e2e: all checks passed"; else echo "--- server log"; tail -40 "$LOG"; echo "--- slow server log"; tail -20 "$SLOW_LOG"; echo "--- template server log"; tail -20 "$TPL_LOG"; fi
 exit $fail

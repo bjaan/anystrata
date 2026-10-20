@@ -2169,6 +2169,12 @@ if(STRATA_FRONTEND AND STRATA_NATIVE_EXPERTS)
   add_executable(engine_test EXCLUDE_FROM_ALL frontend/tests/engine_test.cpp)
   target_include_directories(engine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/frontend)
   target_compile_features(engine_test PRIVATE cxx_std_20)
+
+  # The literal marking (frontend/literals.hpp) over llama.cpp's vendored nlohmann json, which has the same interface
+  # as common_json: no model, no llama.cpp library.
+  add_executable(literals_test EXCLUDE_FROM_ALL frontend/tests/literals_test.cpp)
+  target_include_directories(literals_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/frontend ${STRATA_GGML_DIR}/vendor)
+  target_compile_features(literals_test PRIVATE cxx_std_20)
 endif()
 
 if(STRATA_BUILD_TESTS)
