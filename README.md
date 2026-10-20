@@ -77,6 +77,8 @@ With pictures, add `--mmproj /models/mmproj-F16.gguf` (the projector from the sa
 start, encodes each picture with llama.cpp's mtmd and hands the rows to the engine over upstream's `GENI`
 protocol. A picture is at most 300 rows by default (upstream's installer's CPU setting; `--image-max-tokens`
 changes it), which read a 1920x1080 dashboard correctly in 15 s of encoding on a Ryzen 7 1700.
+Flash-Next through `strata` takes the same `--mmproj` (its own BF16 projector) and also needs `--vision` after the
+`--`, or the engine refuses the rows ("this engine was started without --vision"); checked on the 4090, 2026-10-20.
 
 **Qwen3.8-Flash-Next GSQ-RCO IQ3_XXS** (`strata`; the two GGUF shards, the pack directory made from shard 1, the MTP
 draft directory). On the 24 GB card:
