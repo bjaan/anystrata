@@ -115,9 +115,10 @@ def post(path, body):
 def tok(text, special):
     return [t if isinstance(t, int) else t["id"] for t in post("/tokenize", {"content": text, "parse_special": special})["tokens"]] if text else []
 def tok_plain(text):
-    # frontend/strata_context.cpp tokenize_plain: parse_special off; an added token that still matches is split in two
+    # frontend/strata_context.cpp tokenize_plain: parse_special off; an added token that still matches (one of the
+    # literals: the halves are ordinary text) is split in two
     ids = tok(text, False)
-    if len(ids) == 1 and len(text) > 1 and tok(text, True) == ids and text.startswith("<"):
+    if len(ids) == 1 and text in LITERALS:
         b = text.encode(); cut = len(b) // 2
         while cut < len(b) and (b[cut] & 0xC0) == 0x80: cut += 1
         return tok_plain(b[:cut].decode()) + tok_plain(b[cut:].decode())
