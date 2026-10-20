@@ -62,7 +62,8 @@ unbiased-strata --engine <strata|strata-poly|path> -m <model.gguf> [llama-server
 option (`--host`, `--port`, `--api-key`, `--alias`, `--temp`, `--top-k`, `--top-p`, `--min-p`,
 `--reasoning-format`, `--chat-template-kwargs`, `--sse-ping-interval`, ...); everything after `--` goes to the
 engine, which is started as a child process with `--serve` added and spoken to over its line protocol
-([docs/BACKENDS.md](docs/BACKENDS.md)). The server answers `/v1/chat/completions` (streaming and not), `/v1/models`,
+([docs/BACKENDS.md](docs/BACKENDS.md)). Where the model ends up (GPU cache, pinned RAM, SSD) and the three expert
+modes: [docs/MEMORY_LAYOUT.md](docs/MEMORY_LAYOUT.md). The server answers `/v1/chat/completions` (streaming and not), `/v1/models`,
 `/health`, `/props`, `/tokenize`, `/detokenize`, as llama.cpp's server does, one request at a time.
 
 ```
@@ -100,8 +101,9 @@ build/bin/unbiased-strata --engine build/bin/strata \
 
 `strata-poly` reads a GGUF as it is. `strata` needs a pack directory and an MTP draft directory made once, offline
 except for the draft download, with upstream's tools (`tools/requirements.txt`: numpy, regex; `gguf-py` comes from the
-submodule). This is what upstream's installer ran; it has not been re-run in this fork, which used the pack and MTP
-directory upstream's installer made on 2026-10-05 (`docs/MODEL-FILES.md`).
+submodule). This is what upstream's installer ran. Re-run in this fork on 2026-10-20 on three hosts; the MTP directory
+came out byte-identical each time, so it is published, with the commands and hashes, at
+https://huggingface.co/robertkarl/UnbiasedStrataPacks: copy it instead of fetching and quantizing.
 
 ```
 python tools/iq_pack.py --gguf <shard1> --out <pack>             # --compat-bf16 for Unsloth files
