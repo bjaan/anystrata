@@ -30,6 +30,11 @@ cmake -S vulkan -B build-vulkan && cmake --build build-vulkan && ctest --test-di
   spellings change: `blockIdx*blockDim+threadIdx` -> `gl_GlobalInvocationID.x`, and 16-bit storage becomes
   packed `uint` + `unpackHalf2x16` the way llama.cpp's own Vulkan `*_packed32` block structs do.
 
+* `dequant_s2_vk_parity` — **PASS, 262,144 elements, 0 mismatches at ZERO tolerance** (4096 blocks).
+  `dequant_s2.comp` is `cuda/dequant_s2.cu` line by line — the decode S2 experts ride on, the tree's own
+  header calls "the single hottest decode in the engine"; bit-exactness is the CUDA side's rule because
+  `(code - 1)` in the integer domain then ONE multiply cannot round.
+
 ## What the backend provides
 
 `src/runtime/vk_device.cpp` / `vk_runtime.cpp` + `include/strata/vulkan_runtime.hpp`:
