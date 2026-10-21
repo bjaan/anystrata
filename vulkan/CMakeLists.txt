@@ -33,13 +33,27 @@ add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
 
 find_package(Vulkan REQUIRED)
 
-# glslc: on PATH, else the SDK's usual places. Every .comp in src/kernels compiles to a .spv next to the build
-# tree and is embedded into strata_vk_kernels as a byte array by vulkan/tools/embed_spv.py (no downloads).
+# Front-end selection: the kernels' .comp files compile to .spv next to the build tree and are embedded into
+# strata_vk_kernels as a byte array by vulkan/tools/embed_spv.py (no downloads). We prefer a VENDORED glslang
+# build if one exists (the llama.cpp fork at third_party/llama.cpp was expected to carry thirdparty/glslang; it
+# does not — its .gitmodules is empty and no gitlinks are tracked, so it cannot be `submodule update`d; see
+# vulkan/PORT-NOTES.md). Failing that, the system glslc. Both are driven through tools/vk-glslc.sh, a shim that
+# accepts the glslc-style invocation and translates to glslangValidator's CLI when that front-end is selected.
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/spv)
+find_program(GLSLANG_VENDORED NAMES glslangValidator PATHS ~build-glslang/glslang NO_DEFAULT_PATH)
 find_program(GLSLC NAMES glslc glslc.bat PATHS /usr/bin /usr/local/bin ENV PATH)
-if(NOT GLSLC)
-  message(FATAL_ERROR "glslc not found (spirv-tools package); the .comp kernels cannot be built")
+if(GLSLANG_VENDORED)
+  set(GLSLC_TOOL ${GLSLANG_VENDORED})
+  set(GLSLC_MODE glslang)
+  message(STATUS "vk kernel compiler: vendored glslangValidator ${GLSLANG_VENDORED}")
+elseif(GLSLC)
+  set(GLSLC_TOOL ${GLSLC})
+  set(GLSLC_MODE glslc)
+  message(STATUS "vk kernel compiler: system glslc ${GLSLC}")
+else()
+  message(FATAL_ERROR "neither a vendored glslangValidator nor glslc (spirv-tools package) found; the .comp kernels cannot be built")
 endif()
+set(VK_GLSLC ${CMAKE_CURRENT_SOURCE_DIR}/tools/vk-glslc.sh)
 
 # ---- the runtime: device, arena, queue, buffers, the compat headers the ../src host files compile against
 add_library(strata_vk_runtime STATIC
@@ -61,9 +75,10 @@ function(strata_vk_kernel name)
   set(comp ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/${name}.comp)
   set(spv  ${CMAKE_CURRENT_BINARY_DIR}/spv/${name}.spv)
   add_custom_command(OUTPUT ${spv}
-    COMMAND ${GLSLC} --target-env=vulkan1.0 -O ${comp} -o ${spv}
-    DEPENDS ${comp}
-    COMMENT "glslc ${name}.comp")
+    COMMAND ${CMAKE_COMMAND} -E env VK_GLSLC_MODE=${GLSLC_MODE} VK_GLSLC_TOOL=${GLSLC_TOOL}
+            ${VK_GLSLC} --target-env=vulkan1.0 -O ${comp} -o ${spv}
+    DEPENDS ${comp} ${VK_GLSLC}
+    COMMENT "vk-glslc(${GLSLC_MODE}) ${name}.comp")
   set(inc ${CMAKE_CURRENT_BINARY_DIR}/spv/${name}.spv.h)
   add_custom_command(OUTPUT ${inc}
     COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${spv} ${inc} ${name}
