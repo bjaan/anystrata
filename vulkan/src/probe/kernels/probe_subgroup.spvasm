@@ -1,0 +1,57 @@
+; probe_subgroup.spvasm - wave32 semantics on wave64 hardware: the module runs at a FORCED 32-wide
+; subgroup (VkPipelineShaderStageRequiredSubgroupSizeCreateInfo, applied by kernel_load's force flag).
+; result = subgroup width (from the ballot mask's popcount: 32) * 10 + 1 when
+; subgroupShuffleXor(1,16) reads lane 16's value 2. Expect 321.
+OpCapability Shader
+OpCapability GroupNonUniform
+OpCapability GroupNonUniformBallot
+OpCapability GroupNonUniformShuffle
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %buf
+OpExecutionMode %main LocalSize 64 1 1
+OpDecorate %buf_t Block
+OpMemberDecorate %buf_t 0 Offset 0
+OpDecorate %buf DescriptorSet 0
+OpDecorate %buf Binding 0
+%void = OpTypeVoid
+%fnty = OpTypeFunction %void
+%bool = OpTypeBool
+%u32 = OpTypeInt 32 0
+%i32 = OpTypeInt 32 1
+%v4u = OpTypeVector %u32 4
+%buf_t = OpTypeStruct %i32
+%sptr = OpTypePointer StorageBuffer %buf_t
+%iptr = OpTypePointer StorageBuffer %i32
+%buf = OpVariable %sptr StorageBuffer
+%c0 = OpConstant %u32 0
+%scope = OpConstant %u32 3
+%ci1 = OpConstant %i32 1
+%cu16 = OpConstant %u32 16
+%ci10 = OpConstant %i32 10
+%ci2 = OpConstant %i32 2
+%ci0 = OpConstant %i32 0
+%true = OpConstantTrue %bool
+%main = OpFunction %void None %fnty
+%entry = OpLabel
+%ballot = OpGroupNonUniformBallot %v4u %scope %true
+%b0 = OpCompositeExtract %u32 %ballot 0
+%b1 = OpCompositeExtract %u32 %ballot 1
+%b2 = OpCompositeExtract %u32 %ballot 2
+%b3 = OpCompositeExtract %u32 %ballot 3
+%p0 = OpBitCount %u32 %b0
+%p1 = OpBitCount %u32 %b1
+%p2 = OpBitCount %u32 %b2
+%p3 = OpBitCount %u32 %b3
+%q01 = OpIAdd %u32 %p0 %p1
+%q23 = OpIAdd %u32 %p2 %p3
+%q = OpIAdd %u32 %q01 %q23
+%s = OpBitcast %i32 %q
+%shfl = OpGroupNonUniformShuffleXor %i32 %scope %ci1 %cu16
+%eq = OpIEqual %bool %shfl %ci1
+%one = OpSelect %i32 %eq %ci1 %ci0
+%acc = OpIMul %i32 %s %ci10
+%res = OpIAdd %i32 %acc %one
+%ac = OpAccessChain %iptr %buf %c0
+OpStore %ac %res
+OpReturn
+OpFunctionEnd

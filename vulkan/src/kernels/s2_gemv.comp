@@ -1,0 +1,55 @@
+// vulkan/src/kernels/s2_gemv.comp - the S2 GEMV, one thread per output row.
+//
+// The line-by-line translation of src/kernels/cuda/s2_gemv.cu: same naive phase-2 shape (dequantize on
+// the fly, FP32 accumulation inside the row, no shared memory), the same integer-domain (code - 1), the
+// same group scale, the same activation. The two CUDA-only spellings change:
+//   blockIdx.x*blockDim.x+threadIdx.x     -> gl_GlobalInvocationID.x (local_size_x = 128, the .cu's threads)
+//   __ushort_as_half(xb[j])               -> unpackHalf2x16 of a packed uint pair; the buffer is bound as
+//                                            uint[] because GLSL's std430 has no 16-bit scalar in this
+//                                            toolchain's baseline (llama.cpp's Vulkan shaders pack the same
+//                                            way in its *_packed32 block structs).
+
+// GLSL: the tree keeps shaders bare of #version; tools (embed/glslc) pass --target-env, but glslc wants the directive in the source.
+#version 450
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) buffer X  { uint  xs[]; }  bx;   // fp16 activations, 2 packed per uint
+layout(std430, binding = 1) buffer C  { uint  cs[]; }  bc;   // S2 codes, 4 bytes per uint
+layout(std430, binding = 2) buffer S  { float ss[]; }  bs;   // fp32 group scales (one per 64 elements)
+layout(std430, binding = 3) buffer Y  { float ys[]; }  by;   // fp32 out
+
+layout(push_constant) uniform PC { uint n_in; uint n_out; } pc;
+
+void main() {
+    uint o = gl_GlobalInvocationID.x;
+    if (o >= pc.n_out) return;
+
+    uint nb = pc.n_in / 64u;
+    uint cbase = o * nb * 4u;      // uints: 16 code bytes per block
+    uint sbase = o * nb;
+
+    float acc = 0.0;
+    for (uint b = 0; b < nb; ++b) {
+        const float d = bs.ss[sbase + b];
+        uint cb = cbase + b * 4u;
+        uint xb = b * 32u;         // uints: 64 halfs per block
+        for (uint w = 0; w < 4u; ++w) {
+            const uint cw = bc.cs[cb + w];
+            for (uint bb = 0; bb < 4u; ++bb) {
+                const uint codeb = (cw >> (bb * 8u)) & 255u;
+                const uint j0 = w * 16u + bb * 4u;
+                for (uint k = 0; k < 4u; ++k) {
+                    const uint jj = j0 + k;
+                    const uint code = (codeb >> (k * 2u)) & 3u;
+                    const uint pack = bx.xs[xb + (jj >> 1u)];
+                    const float a = ((jj & 1u) == 0u) ? unpackHalf2x16(pack).x : unpackHalf2x16(pack).y;
+                    // (code - 1) in the INTEGER domain, then the group scale, then the activation: the
+                    // same order as the CUDA kernel and the CPU reference, so the two differ only by
+                    // floating-point contraction.
+                    acc += float(int(code) - 1) * d * a;
+                }
+            }
+        }
+    }
+    by.ys[o] = acc;
+}

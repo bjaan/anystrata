@@ -63,6 +63,17 @@ build: configure
 	cmake --build $(BUILD_DIR) -j $(JOBS) --target $(TARGETS)
 	@echo "built:"; ls -1 $(BUILD_DIR)/bin/strata $(BUILD_DIR)/bin/strata-poly $(BUILD_DIR)/bin/strata-dsv41 $(BUILD_DIR)/bin/libstrata_kq.so $(BUILD_DIR)/bin/unbiased-strata
 
+# The Vulkan engine (docs/VULKAN.md): the BC-250 backend, its own build tree (sycl/'s shape). Needs a
+# Vulkan loader + headers, glslc and spirv-as; no CUDA, no ROCm.
+.PHONY: vulkan vulkan-test
+vulkan:
+	cmake -S . -B $(BUILD_DIR)-vk -DSTRATA_ENABLE_VULKAN=ON -DCMAKE_BUILD_TYPE=Release \
+	      -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=$(abspath $(BUILD_DIR))-vk/bin
+	cmake --build $(BUILD_DIR)-vk -j $(JOBS)
+
+vulkan-test: vulkan
+	ctest --test-dir $(BUILD_DIR)-vk --output-on-failure
+
 # The front end alone, without CUDA: for a laptop or a CI box. Needs only a C++20 compiler and CMake.
 .PHONY: frontend
 frontend:

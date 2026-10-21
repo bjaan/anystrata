@@ -1,0 +1,38 @@
+; probe_dot.spvasm - dp4a through VK_KHR_shader_integer_dot_product (OpUDot), hand-assembled:
+; this distro's glslc frontend predates GL_EXT_shader_integer_dot_product, so the probe module
+; comes from spirv-as instead (verified with spirv-val at build time). result = UDot(1,2,3,4 . 1,1,1,1) = 10.
+OpCapability Shader
+OpCapability DotProduct
+OpCapability DotProductInputAll
+OpCapability DotProductInput4x8Bit
+OpCapability DotProductInput4x8BitPacked
+OpExtension "SPV_KHR_integer_dot_product"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %buf
+OpExecutionMode %main LocalSize 64 1 1
+OpDecorate %buf_t Block
+OpMemberDecorate %buf_t 0 Offset 0
+OpDecorate %buf DescriptorSet 0
+OpDecorate %buf Binding 0
+%void = OpTypeVoid
+%fnty = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%v4u = OpTypeVector %u32 4
+%buf_t = OpTypeStruct %u32
+%sptr = OpTypePointer StorageBuffer %buf_t
+%uptr = OpTypePointer StorageBuffer %u32
+%buf = OpVariable %sptr StorageBuffer
+%u0 = OpConstant %u32 0
+%u1 = OpConstant %u32 1
+%u2 = OpConstant %u32 2
+%u3 = OpConstant %u32 3
+%u4 = OpConstant %u32 4
+%va = OpConstantComposite %v4u %u1 %u2 %u3 %u4
+%vb = OpConstantComposite %v4u %u1 %u1 %u1 %u1
+%main = OpFunction %void None %fnty
+%entry = OpLabel
+%dot = OpUDot %u32 %va %vb
+%ac = OpAccessChain %uptr %buf %u0
+OpStore %ac %dot
+OpReturn
+OpFunctionEnd

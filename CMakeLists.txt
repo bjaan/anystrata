@@ -20,6 +20,20 @@ if(STRATA_ENABLE_SYCL)
   add_subdirectory(sycl)
   return()
 endif()
+# EXPERIMENTAL: the Vulkan engine (docs/VULKAN.md), the port for GPUs ROCm does not serve - the BC-250's
+# gfx1013 (RADV) first. Its own project that takes the engine's sources from src/, the sycl/ shape: nothing
+# in the CUDA/HIP trees changes. First increment: the runtime, the device probe and the S2 GEMV; the plan
+# for the rest of the kernels is in that page.
+option(STRATA_ENABLE_VULKAN "EXPERIMENTAL: build the Vulkan engine from vulkan/ - docs/VULKAN.md" OFF)
+if(STRATA_ENABLE_VULKAN)
+  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_SYCL)
+    message(FATAL_ERROR "STRATA_ENABLE_VULKAN is a separate backend; leave the CUDA/HIP/SYCL options off")
+  endif()
+  message(WARNING "STRATA_ENABLE_VULKAN: the Vulkan engine is experimental (docs/VULKAN.md)")
+  enable_testing()
+  add_subdirectory(vulkan)
+  return()
+endif()
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
 # issue #31: release builds keep a PDB beside the exe (not shipped in it), so a minidump from a stalled engine can
 # be read back to the exact source line
