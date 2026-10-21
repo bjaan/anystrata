@@ -38,3 +38,15 @@ therefore **not closed**, and:
 **Verification after the wrapper change:** `cmake -S vulkan -B build-vk && cmake --build build-vk -j2 &&
 ctest --test-dir build-vk` — 3/3 green (`vk_device_probe`, `s2_gemv_vk_parity`, `dequant_s2_vk_parity`).
 The CUDA/HIP trees under `src/` and `include/strata/` are untouched.
+
+## .spvasm authoring rules (learned assembling probe kernels on this box)
+
+1. A StorageBuffer array member needs an explicit `OpMemberDecorate ... ArrayStride`
+   (no `scalarBlockLayout` on RADV here); a Workgroup array must NOT have one
+   (implicit layout).
+2. At `--target-env vulkan1.2`, `spirv-val` demands Workgroup `OpVariable`s listed
+   in the `OpEntryPoint` interface (contrary to the usual "only descriptor objects"
+   rule).
+3. SSA ids must be unique — no re-assigning through the same `%id`.
+4. `maxComputeSharedMemorySize` = 65536 on gfx1013 (measured): the RDNA3 HIP-port
+   kernels' 64 KiB LDS budget fits exactly, with no headroom above it.
