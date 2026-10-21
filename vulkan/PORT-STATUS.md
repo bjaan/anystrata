@@ -131,6 +131,12 @@ header helpers, one row per header) | `n/a` (decision `n/a`).
    fp16 paths **1e-3**. Never loosen a bound to make a port pass; if it
    cannot pass at the bound, the translation is wrong.
 
+## cublas CPU fallback (Task 1.1)
+
+| entry point | header | .cu file(s) | in-tree parity test | CUDA-only constructs | decision | state |
+|---|---|---|---|---|---|---|
+| dense GEMM family (cublasSgemm/GemmEx/GemmStridedBatchedEx/SgemmStridedBatched/Hgemm) | cublas_v2.h (vulkan_compat) | src/prefill/gemm.cu, src/poly/kernels.cu, src/qwen35/q36_engine.cu | gemm_f32_parity.cpp, gemm_bf16_parity.cpp | cublas handle + device operands | host-free **speed-todo**: vk_blas.cpp runs a plain blocked CPU GEMM (correct, fp32 accumulation, staged arena round-trips per operand); Phase 3 (Task 3.1) replaces it with the dequant+GEMM `.comp` family | compiled-unchanged (CPU fallback green in vk_compat_smoke: Sgemm + GemmEx fp16-in/fp32-out bit-match the host reference) |
+
 ## Model-demanded order
 
 Task 1.4 fills this table with the trap/kernel names from the first

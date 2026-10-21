@@ -50,3 +50,62 @@ The CUDA/HIP trees under `src/` and `include/strata/` are untouched.
 3. SSA ids must be unique — no re-assigning through the same `%id`.
 4. `maxComputeSharedMemorySize` = 65536 on gfx1013 (measured): the RDNA3 HIP-port
    kernels' 64 KiB LDS budget fits exactly, with no headroom above it.
+
+## vulkan_compat (Task 1.1): the CUDA runtime + cuBLAS names, on strata::vk
+
+`vulkan/include/strata/vulkan_compat/` mirrors `include/strata/platform/hip_compat/`: headers named exactly
+like the CUDA ones (`cuda_runtime.h`, `cuda.h`, `cublas_v2.h`, `cuda_fp16.h`, `cuda_bf16.h`,
+`driver_types.h`, `vector_types.h`, `math_constants.h`, `cublasLt.h`), all thin entries onto the one mapping
+header `strata_vk.h`, placed BEFORE the include path by the `strata_vk_compat` INTERFACE target.  Unlike
+hip_compat (a macro table onto hip's real runtime) this layer implements the semantics itself on
+`strata::vk` primitives; inline state where it is cheap (events, last-error), `vulkan/src/runtime/vk_blas.cpp`
+where a .cpp is allowed (the only new source file outside the headers).
+
+**Device-pointer contract.** A CUDA "device pointer" is the arena offset plus a fixed 64-byte bias, cast to
+`void*` (`strata_vk_compat::off/wrap`; the bias keeps offset-0 allocations distinguishable from `nullptr`,
+which host code tests after a fresh cudaMalloc).  Launchers holding a host-side `void*` device pointer
+convert with `strata_vk_offset(p)`.  All compat copies/memsets strip the bias before calling
+`strata::vk::copy_h2d/copy_d2h/fill_d`, which take the raw arena offset cast to `void*` (the existing
+convention in vk_runtime.cpp).
+
+**Mapped (measured roster from the src greps):** cudaMalloc/Async/Free/FreeAsync (bump arena, no-op free —
+the DeviceArena rule), cudaMemcpy(Async)/Memcpy2D(Async) incl. D2D (host-scratch walk; correct, unoptimized),
+cudaMemset(Async), cudaHostAlloc/cudaMallocHost/cudaFreeHost (aligned host RAM; the staged copies read it
+directly on UMA), cudaHostRegister/Unregister (tracked, succeed: nothing to pin against on this box),
+cudaMemGetInfo (heap budget minus arena used), streams (Create/CreateWithFlags/CreateWithPriority/Destroy/
+Synchronize/Query/WaitEvent/IsCapturing/LaunchHostFunc — one queue, submissions are synchronous, so
+Query=done and WaitEvent=no-op are honest), events (pair-based host-clock timing per the plan: record = queue
+drain + stamp; ElapsedTime = the real interval; Query/Synchronize = success),
+cudaDeviceSynchronize/GetLastError(clears)/PeekAtLastError/GetErrorString/GetErrorName,
+cudaGet/SetDevice(Count), cudaSetDeviceFlags, cudaInitDevice, cudaGetDeviceProperties/cudaDeviceGetAttribute
+(name, gcnArchName="gfx1013", major/minor=10/1 family code, totalGlobalMem, sharedMemPerBlock=64K,
+warpSize=32, maxThreadsPerBlock; multiProcessorCount/l2CacheSize are 0 until the Task-1.3 twin surfaces them),
+cudaDeviceGetStreamPriorityRange, cudaDriverGetVersion(12040)/RuntimeGetVersion, cudaFuncSetAttribute
+(no-op; no device-function objects exist), cudaFuncGetName (not supported), CUDART_VERSION=12040 chosen so
+the engine's CUDA-13 gates (cudaMemcpyBatchAsync, cudaGraphGetEdges_v2) compile OUT, cudaGetDriverEntryPoint
+(ByName*) answers "symbol not found" — the documented cuMem* VMM feature-detect in vmm.cpp/expert_cache.cpp
+falls back to its plain tier (not a trap: those call sites branch on it), dim3 + vector types + make_*,
+__half/__nv_bfloat16 with the tree's own f16_bits.hpp/bf16_bits.hpp conversions transcribed verbatim,
+CUBLAS_* on the CPU fallback (below).
+
+**Trapped (print their name and abort — never fake):** the cudaGraph* family
+(StreamBeginCapture/EndCapture, GraphInstantiate(+WithFlags), GraphLaunch, GraphUpload, GraphDestroy,
+GraphExecDestroy, GraphGetNodes, GraphGetEdges(_v2), GraphNodeGetType, GraphKernelNodeGetParams) —
+"strata-vk: cudaGraphX not ported; run with --no-graphs".  graph.cpp's twins land in Task 1.4/Phase 4.
+cudaMemcpyToSymbol/FromSymbol and cudaMemcpyPeer(Async)/cudaDeviceEnablePeerAccess: NOT aborts — they set
+cudaErrorNotSupported and cudaGetErrorString names the gap (no device-symbol image exists in this backend;
+multi-GPU is out of scope); cudaMemcpyDefault errors the same way rather than guess a direction.
+cudaHostGetDevicePointer returns an error naming the Task-1.3 twins (every engine call site around it has a
+fallback branch); a fake alias could not exist here since arena memory is never host-mapped by vk_runtime.
+
+**cuBLAS:** `cublas_v2.h` declares the used surface (Create/Destroy/SetStream/GetStream/SetWorkspace/
+SetMathMode, Sgemm, SgemmStridedBatched, GemmEx, GemmStridedBatchedEx, Hgemm); `vk_blas.cpp` runs a plain
+blocked CPU GEMM — operands fetched from the arena through the staged copies, fp32 accumulation for every
+CUDA_R_16F/16BF/32F mix, results written back. **speed-todo** (PORT-STATUS "cublas CPU fallback" row):
+Phase 3's Task 3.1 replaces it with the dequant+GEMM `.comp` family.  A straddling operand span surfaces as
+CUBLAS_STATUS_EXECUTION_FAILED with the runtime's named message, never a silent zero.
+
+**Compile proof:** `vk_compat_smoke` (ctest, green) compiles the REAL host files `src/core/layout.cpp` +
+`src/core/weights.cpp` unchanged — cudaMalloc/cudaMemcpy/cudaHostAlloc/cudaFreeHost/cudaDeviceSynchronize all
+resolve against the compat headers with no CUDA toolkit on the box — then exercises an arena round-trip and
+the cublas fallback (Sgemm and GemmEx fp16-in/fp32-out) against host references.

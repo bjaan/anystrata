@@ -65,10 +65,18 @@ target_include_directories(strata_vk_runtime PUBLIC
 target_link_libraries(strata_vk_runtime PUBLIC Vulkan::Vulkan)
 
 # ---- vk_compat: the CUDA-shaped surface (cudaMalloc -> arena, cudaMemcpyAsync -> queue copies,
-# cudaStream_t -> VkQueue wrapper, cudaEvent_t -> timeline semaphore) for ../src's host translation units.
+# cudaStream_t -> stream sync, cudaEvent_t -> host-clock timing, cublas -> the CPU fallback in vk_blas.cpp)
+# for ../src's host translation units.  BEFORE so these win over any CUDA toolkit headers on the path, the
+# way hip_compat does in the HIP build (CMakeLists.txt:166).
+add_library(strata_vk_blas STATIC src/runtime/vk_blas.cpp)
+target_include_directories(strata_vk_blas PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/vulkan_compat
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${STRATA_ROOT}/include)
+target_link_libraries(strata_vk_blas PUBLIC strata_vk_runtime)
 add_library(strata_vk_compat INTERFACE)
-target_include_directories(strata_vk_compat INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/vulkan_compat)
-target_link_libraries(strata_vk_compat INTERFACE strata_vk_runtime)
+target_include_directories(strata_vk_compat BEFORE INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/vulkan_compat)
+target_link_libraries(strata_vk_compat INTERFACE strata_vk_runtime strata_vk_blas)
 
 # ---- the kernels: each .comp -> .spv -> an embedded array + a host launcher .vk.cpp
 function(strata_vk_kernel name)
@@ -152,3 +160,17 @@ add_executable(dequant_s2_vk_parity src/tests/dequant_s2_vk_parity.cpp)
 target_include_directories(dequant_s2_vk_parity PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(dequant_s2_vk_parity PRIVATE strata_vk_kernel_dequant_s2 strata_vk_runtime strata_vk_compat)
 add_test(NAME dequant_s2_vk_parity COMMAND dequant_s2_vk_parity --selftest)
+
+# ---- Task 1.1's compile proof: TWO real engine host files (src/core/layout.cpp, src/core/weights.cpp -
+# they call cudaMalloc/cudaMemcpy/cudaHostAlloc straight through <cuda_runtime.h>) compiled UNCHANGED
+# against vulkan_compat, plus a smoke main that exercises the arena round-trip and the cublas CPU fallback.
+# No CUDA toolkit is on this box: if this links, the compat surface is real.  device.cu/pinned.cu/graph.cpp
+# are NOT in this target - their Vulkan twins arrive in Task 1.3.
+add_executable(vk_compat_smoke
+  src/tests/vk_compat_smoke.cpp
+  ${STRATA_ROOT}/src/core/layout.cpp
+  ${STRATA_ROOT}/src/core/weights.cpp
+  ${STRATA_ROOT}/src/platform/memory.cpp)
+target_include_directories(vk_compat_smoke PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(vk_compat_smoke PRIVATE strata_vk_compat)
+add_test(NAME vk_compat_smoke COMMAND vk_compat_smoke)

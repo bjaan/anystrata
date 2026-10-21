@@ -1,0 +1,245 @@
+// vulkan/src/runtime/vk_blas.cpp - the cublas_v2.h surface on a plain blocked CPU GEMM.
+//
+// CORRECTNESS FIRST (the plan, Task 1.1 Step 3): Phase 3's dequant+GEMM kernels replace this; speed is the
+// PORT-STATUS `host(free)` todo.  What is implemented here: the exact column-major contract cuBLAS states
+// (C = alpha*op(A)*op(B) + beta*C), fp32 accumulation for every operand mix the tree passes
+// (CUDA_R_32F / CUDA_R_16F / CUDA_R_16BF in, fp32 or the operand type out), and strided batching.
+//
+// Operand pointers are arena device pointers under the compat contract (offset + kPtrBias, see strata_vk.h):
+// each matrix is fetched through the runtime's staged copies into a host block, multiplied, and written back
+// the same way.  A span the copy layer refuses (crossing an arena piece) surfaces as
+// CUBLAS_STATUS_EXECUTION_FAILED carrying the runtime's named message - never a silent zero.
+//
+// The 16-bit conversions are the tree's own tested transcriptions (cuda_fp16.h carries f16_bits.hpp's
+// converter verbatim; bf16 mirrors bf16_bits.hpp), so a host reference GEMM and this one round identically.
+#include "strata/vulkan_compat/cublas_v2.h"
+#include "strata/vulkan_compat/cuda_bf16.h"
+#include "strata/vulkan_runtime.hpp"
+
+#include <cstdio>
+#include <cstring>
+#include <stdexcept>
+#include <vector>
+
+namespace {
+
+struct Handle {
+    cudaStream_t stream = nullptr;
+    void* workspace = nullptr;
+    size_t ws_bytes = 0;
+};
+
+constexpr std::uintptr_t kPtrBias = 64;   // MUST match strata_vk.h (offset+bias device pointers)
+constexpr size_t kTile = 256;             // host-block tile (K-panel); correctness path, not a tuned GEMM
+
+size_t elem_bytes(cudaDataType_t t) {
+    switch (t) {
+        case CUDA_R_32F:  return 4;
+        case CUDA_R_16F: case CUDA_R_16BF: return 2;
+        default: return 0;
+    }
+}
+
+// device span -> host buffer (staged copies; throws with a named reason if the span crosses a piece)
+void fetch(const void* p, float* dst, size_t count, cudaDataType_t t, cudaStream_t s) {
+    const size_t bytes = count * elem_bytes(t);
+    std::vector<uint8_t> raw(bytes);
+    const std::uintptr_t arena = (std::uintptr_t) p - kPtrBias;   // compat handle -> raw arena offset
+    if (t == CUDA_R_32F) {
+        strata::vk::copy_d2h(dst, (void*) arena, bytes, s);
+        return;
+    }
+    strata::vk::copy_d2h(raw.data(), (void*) arena, bytes, s);
+    for (size_t i = 0; i < count; ++i) {
+        if (t == CUDA_R_16F) {
+            uint16_t bits; std::memcpy(&bits, raw.data() + 2 * i, 2);
+            dst[i] = __half2float(__ushort_as_half(bits));
+        } else {   // CUDA_R_16BF
+            uint16_t bits; std::memcpy(&bits, raw.data() + 2 * i, 2);
+            dst[i] = __bfloat162float(__ushort_as_bfloat16(bits));
+        }
+    }
+}
+void store(void* p, const float* src, size_t count, cudaDataType_t t, cudaStream_t s) {
+    const size_t bytes = count * elem_bytes(t);
+    std::vector<uint8_t> raw;
+    const float* out = src;
+    if (t != CUDA_R_32F) {
+        raw.resize(bytes);
+        for (size_t i = 0; i < count; ++i) {
+            uint16_t bits;
+            if (t == CUDA_R_16F) bits = __half_as_ushort(__float2half(src[i]));
+            else bits = __bfloat16_as_ushort(__float2bfloat16(src[i]));
+            std::memcpy(raw.data() + 2 * i, &bits, 2);
+        }
+        out = nullptr;
+    }
+    strata::vk::copy_h2d((void*)((std::uintptr_t) p - kPtrBias),   // compat handle -> raw arena offset
+                 out ? (const void*) out : (const void*) raw.data(), bytes, s);
+}
+// Read a value at a host float-block position back into the operand type C wants (accumulate-then-store path).
+float load_scalar(const void* p, cudaDataType_t t, size_t i) {
+    if (t == CUDA_R_32F) { float f; std::memcpy(&f, (const char*)p + 4 * i, 4); return f; }
+    uint16_t bits; std::memcpy(&bits, (const char*)p + 2 * i, 2);
+    return t == CUDA_R_16F ? __half2float(__ushort_as_half(bits))
+                           : __bfloat162float(__ushort_as_bfloat16(bits));
+}
+void store_scalar(void* p, cudaDataType_t t, size_t i, float v) {
+    if (t == CUDA_R_32F) { std::memcpy((char*)p + 4 * i, &v, 4); return; }
+    uint16_t bits = t == CUDA_R_16F ? __half_as_ushort(__float2half(v))
+                                    : __bfloat16_as_ushort(__float2bfloat16(v));
+    std::memcpy((char*)p + 2 * i, &bits, 2);
+}
+
+// op(X) element (i, j) of a (k?)-x-n matrix held column-major with leading dim ld:
+//   OP_N:   X[i + j*ld]      (k x n)
+//   OP_T:   X[j + i*ld]      (n x k stored, read transposed)
+inline size_t at(cublasOperation_t op, int i, int j, int ld) {
+    return op == CUBLAS_OP_N ? (size_t) i + (size_t) j * ld : (size_t) j + (size_t) i * ld;
+}
+
+// One strided-batch member.  A/B come from device, C read/updated on device.  m x n output, K the inner.
+cublasStatus_t gemm_one(Handle& h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
+                        float alpha, const void* A, cudaDataType At, int lda,
+                        const void* B, cudaDataType Bt, int ldb,
+                        float beta, void* C, cudaDataType Ct, int ldc) {
+    if (m <= 0 || n <= 0) return CUBLAS_STATUS_SUCCESS;
+    if (!A || !B || !C) return CUBLAS_STATUS_INVALID_VALUE;
+    if (ta != CUBLAS_OP_N && ta != CUBLAS_OP_T) return CUBLAS_STATUS_INVALID_VALUE;
+    if (tb != CUBLAS_OP_N && tb != CUBLAS_OP_T) return CUBLAS_STATUS_INVALID_VALUE;
+    if (!elem_bytes(At) || !elem_bytes(Bt) || !elem_bytes(Ct)) return CUBLAS_STATUS_NOT_SUPPORTED;
+    if (At != CUDA_R_32F && At != CUDA_R_16F && At != CUDA_R_16BF) return CUBLAS_STATUS_NOT_SUPPORTED;
+    // cuBLAS's contract: OP_N stores m x k (lda >= m); OP_T stores k x m (lda >= k).
+    const long long ar = ta == CUBLAS_OP_N ? m : k, br = tb == CUBLAS_OP_N ? k : n;
+    if ((long long) lda < ar || (long long) ldb < br || (long long) ldc < m) return CUBLAS_STATUS_INVALID_VALUE;
+
+    // Blocked: one column-panel of C at a time (bounded host buffers); A and B fetched whole.  Correctness-
+    // shaped, not a tuned GEMM - the Phase-3 kernels replace it.
+    try {
+        const size_t acount = (size_t)(ta == CUBLAS_OP_N ? (long long)lda * k : (long long)lda * m);
+        const size_t bcount = (size_t)(tb == CUBLAS_OP_N ? (long long)ldb * n : (long long)ldb * k);
+        std::vector<float> fa(acount), fb(bcount);
+        fetch(A, fa.data(), acount, At, h.stream);
+        fetch(B, fb.data(), bcount, Bt, h.stream);
+
+        for (int j0 = 0; j0 < n; j0 += (int) kTile) {
+            const int jn = n - j0 < (int) kTile ? n - j0 : (int) kTile;
+            // read the C panel (device, column-major rows [0,m) of cols [j0, j0+jn))
+            std::vector<float> crows((size_t) m * jn);
+            for (int jj = 0; jj < jn; ++jj) {
+                const size_t count = (size_t) m;
+                std::vector<float> col(count);
+                fetch((const char*) C + (size_t)(j0 + jj) * (size_t) ldc * elem_bytes(Ct),
+                      col.data(), count, Ct, h.stream);
+                for (int i = 0; i < m; ++i) crows[(size_t) i * jn + jj] = beta * col[i];
+            }
+            for (int i = 0; i < m; ++i)
+                for (int jj = 0; jj < jn; ++jj) {
+                    float acc = 0.f;
+                    for (int kk = 0; kk < k; ++kk)
+                        acc += fa[at(ta, i, kk, lda)] * fb[at(tb, kk, j0 + jj, ldb)];
+                    crows[(size_t) i * jn + jj] += alpha * acc;
+                }
+            // write the panel back (column-major: one column at a time)
+            for (int jj = 0; jj < jn; ++jj) {
+                std::vector<float> col(m);
+                for (int i = 0; i < m; ++i) col[i] = crows[(size_t) i * jn + jj];
+                store((char*) C + (size_t)(j0 + jj) * (size_t) ldc * elem_bytes(Ct),
+                      col.data(), (size_t) m, Ct, h.stream);
+            }
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "strata-vk cublas: %s\n", e.what());
+        return CUBLAS_STATUS_EXECUTION_FAILED;
+    }
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+}  // namespace
+
+extern "C" {
+
+cublasStatus_t cublasCreate_v2(cublasHandle_t* handle) {
+    if (!handle) return CUBLAS_STATUS_INVALID_VALUE;
+    *handle = new Handle{};
+    return CUBLAS_STATUS_SUCCESS;
+}
+cublasStatus_t cublasDestroy_v2(cublasHandle_t handle) { delete (Handle*) handle; return CUBLAS_STATUS_SUCCESS; }
+cublasStatus_t cublasSetStream_v2(cublasHandle_t handle, cudaStream_t stream) {
+    if (!handle) return CUBLAS_STATUS_NOT_INITIALIZED;
+    ((Handle*) handle)->stream = stream;
+    return CUBLAS_STATUS_SUCCESS;
+}
+cublasStatus_t cublasGetStream_v2(cublasHandle_t handle, cudaStream_t* stream) {
+    if (!handle || !stream) return CUBLAS_STATUS_INVALID_VALUE;
+    *stream = ((Handle*) handle)->stream;
+    return CUBLAS_STATUS_SUCCESS;
+}
+// The workspace is a device pointer in the CUDA build; the CPU GEMM allocates its own host tiles, so the
+// handle keeps the value (rebind() resets it) but never uses it.
+cublasStatus_t cublasSetWorkspace_v2(cublasHandle_t handle, void* workspace, size_t bytes) {
+    if (!handle) return CUBLAS_STATUS_NOT_INITIALIZED;
+    Handle* h = (Handle*) handle;
+    h->workspace = workspace; h->ws_bytes = bytes;
+    return CUBLAS_STATUS_SUCCESS;
+}
+cublasStatus_t cublasSetMathMode(cublasHandle_t, unsigned) { return CUBLAS_STATUS_SUCCESS; }  // always ordered fp32
+cublasStatus_t cublasGetMathMode(cublasHandle_t, unsigned* m) { if (m) *m = CUBLAS_DEFAULT_MATH; return CUBLAS_STATUS_SUCCESS; }
+
+cublasStatus_t cublasSgemm_v2(cublasHandle_t handle, cublasOperation_t ta, cublasOperation_t tb,
+                              int m, int n, int k, const float* alpha, const float* A, int lda,
+                              const float* B, int ldb, const float* beta, float* C, int ldc) {
+    if (!handle) return CUBLAS_STATUS_NOT_INITIALIZED;
+    return gemm_one(*(Handle*) handle, ta, tb, m, n, k, *alpha, A, CUDA_R_32F, lda, B, CUDA_R_32F, ldb,
+                    *beta, C, CUDA_R_32F, ldc);
+}
+cublasStatus_t cublasSgemmStridedBatched(cublasHandle_t handle, cublasOperation_t ta, cublasOperation_t tb,
+                                         int m, int n, int k, const float* alpha, const float* A, int lda,
+                                         long long strideA, const float* B, int ldb, long long strideB,
+                                         const float* beta, float* C, int ldc, long long strideC, int batchCount) {
+    if (!handle) return CUBLAS_STATUS_NOT_INITIALIZED;
+    for (int b = 0; b < batchCount; ++b) {
+        cublasStatus_t s = gemm_one(*(Handle*) handle, ta, tb, m, n, k, *alpha,
+                                    A + strideA * b, CUDA_R_32F, lda, B + strideB * b, CUDA_R_32F, ldb,
+                                    *beta, C + strideC * b, CUDA_R_32F, ldc);
+        if (s != CUBLAS_STATUS_SUCCESS) return s;
+    }
+    return CUBLAS_STATUS_SUCCESS;
+}
+cublasStatus_t cublasGemmEx(cublasHandle_t handle, cublasOperation_t ta, cublasOperation_t tb,
+                            int m, int n, int k, const void* alpha, const void* A, cudaDataType Atype, int lda,
+                            const void* B, cudaDataType Btype, int ldb, const void* beta, void* C,
+                            cudaDataType Ctype, int ldc, cublasComputeType_t computeType, cublasGemmAlgo_t) {
+    if (!handle) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (computeType != CUBLAS_COMPUTE_32F && computeType != CUBLAS_COMPUTE_32F_FAST_TF32)
+        return CUBLAS_STATUS_NOT_SUPPORTED;      // fp64/integer compute types: the tree never asks for them
+    float a = load_scalar(alpha, CUDA_R_32F, 0), b = load_scalar(beta, CUDA_R_32F, 0);
+    return gemm_one(*(Handle*) handle, ta, tb, m, n, k, a, A, Atype, lda, B, Btype, ldb, b, C, Ctype, ldc);
+}
+cublasStatus_t cublasGemmStridedBatchedEx(cublasHandle_t handle, cublasOperation_t ta, cublasOperation_t tb,
+                                          int m, int n, int k, const void* alpha, const void* A,
+                                          cudaDataType Atype, int lda, long long strideA, const void* B,
+                                          cudaDataType Btype, int ldb, long long strideB, const void* beta,
+                                          void* C, cudaDataType Ctype, int ldc, long long strideC,
+                                          int batchCount, cublasComputeType_t ct, cublasGemmAlgo_t algo) {
+    if (!handle) return CUBLAS_STATUS_NOT_INITIALIZED;
+    const size_t ea = elem_bytes(Atype), eb = elem_bytes(Btype), ec = elem_bytes(Ctype);
+    if (!ea || !eb || !ec) return CUBLAS_STATUS_NOT_SUPPORTED;
+    for (int b2 = 0; b2 < batchCount; ++b2) {
+        cublasStatus_t s = cublasGemmEx(handle, ta, tb, m, n, k, alpha,
+                                        (const char*) A + strideA * b2 * (long long) ea, Atype, lda,
+                                        (const char*) B + strideB * b2 * (long long) eb, Btype, ldb,
+                                        beta, (char*) C + strideC * b2 * (long long) ec, Ctype, ldc, ct, algo);
+        if (s != CUBLAS_STATUS_SUCCESS) return s;
+    }
+    return CUBLAS_STATUS_SUCCESS;
+}
+cublasStatus_t cublasHgemm(cublasHandle_t handle, cublasOperation_t ta, cublasOperation_t tb,
+                           int m, int n, int k, const __half* alpha, const __half* A, int lda,
+                           const __half* B, int ldb, const __half* beta, __half* C, int ldc) {
+    if (!handle) return CUBLAS_STATUS_NOT_INITIALIZED;
+    return gemm_one(*(Handle*) handle, ta, tb, m, n, k, __half2float(*alpha), A, CUDA_R_16F, lda,
+                    B, CUDA_R_16F, ldb, __half2float(*beta), C, CUDA_R_16F, ldc);
+}
+
+}  // extern "C"
