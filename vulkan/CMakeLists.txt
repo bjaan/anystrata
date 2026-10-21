@@ -117,8 +117,25 @@ add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_dot.spv.h
 add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_subgroup.spv.h
   COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_probe_sg_spv} ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_subgroup.spv.h probe_subgroup
   DEPENDS ${_probe_sg_spv})
+set(_probe_wg_spv   ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_wg64k.spv)
+set(_probe_span_spv ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_spans.spv)
+add_custom_command(OUTPUT ${_probe_wg_spv}
+  COMMAND ${SPIRV_AS} --target-env vulkan1.2 ${CMAKE_CURRENT_SOURCE_DIR}/src/probe/kernels/probe_wg64k.spvasm -o ${_probe_wg_spv}
+  COMMAND ${SPIRV_VAL} --target-env vulkan1.2 ${_probe_wg_spv}
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/probe/kernels/probe_wg64k.spvasm)
+add_custom_command(OUTPUT ${_probe_span_spv}
+  COMMAND ${SPIRV_AS} --target-env vulkan1.2 ${CMAKE_CURRENT_SOURCE_DIR}/src/probe/kernels/probe_spans.spvasm -o ${_probe_span_spv}
+  COMMAND ${SPIRV_VAL} --target-env vulkan1.2 ${_probe_span_spv}
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/probe/kernels/probe_spans.spvasm)
+add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_wg64k.spv.h
+  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_probe_wg_spv} ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_wg64k.spv.h probe_wg64k
+  DEPENDS ${_probe_wg_spv})
+add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_spans.spv.h
+  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_probe_span_spv} ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_spans.spv.h probe_spans
+  DEPENDS ${_probe_span_spv})
 add_executable(vk_device_probe src/probe/device_probe.cpp
-  ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_dot.spv.h ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_subgroup.spv.h)
+  ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_dot.spv.h ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_subgroup.spv.h
+  ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_wg64k.spv.h ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_spans.spv.h)
 target_include_directories(vk_device_probe PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/spv)
 target_link_libraries(vk_device_probe PRIVATE strata_vk_runtime)
 enable_testing()

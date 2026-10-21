@@ -1,0 +1,80 @@
+; probe_wg64k.spvasm - the 64 KiB workgroup-shared LDS the RDNA3 HIP-port kernels assume: a Workgroup
+; OpVariable of 16384 x i32 (exactly maxComputeSharedMemorySize on the BC-250's RADV). 256 threads each
+; write 64 elements (wg[idx] = idx*7+1), OpControlBarrier (Workgroup scope), then every thread reads
+; wg[0], wg[8192], wg[16383] and stores 1 (all match) / 0 (any wrong) to out[tid]. Expect all 256 outs = 1.
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %buf %gli %wg
+OpExecutionMode %main LocalSize 256 1 1
+OpDecorate %gli BuiltIn LocalInvocationIndex
+OpDecorate %buf_t Block
+OpMemberDecorate %buf_t 0 Offset 0
+OpDecorate %buf DescriptorSet 0
+OpDecorate %buf Binding 0
+OpDecorate %outarr ArrayStride 4
+%void = OpTypeVoid
+%fnty = OpTypeFunction %void
+%bool = OpTypeBool
+%u32 = OpTypeInt 32 0
+%i32 = OpTypeInt 32 1
+%pin = OpTypePointer Input %u32
+%c0 = OpConstant %i32 0
+%cu0 = OpConstant %u32 0
+%c1 = OpConstant %i32 1
+%c7 = OpConstant %i32 7
+%c256 = OpConstant %i32 256
+%cu256 = OpConstant %u32 256
+%c64 = OpConstant %i32 64
+%c8192 = OpConstant %i32 8192
+%c16383 = OpConstant %i32 16383
+%c16384u = OpConstant %u32 16384
+%e57345 = OpConstant %i32 57345        ; 8192*7+1
+%e114682 = OpConstant %i32 114682      ; 16383*7+1
+%cw = OpConstant %u32 2                ; ScopeWorkgroup
+%wgarr = OpTypeArray %i32 %c16384u
+%wgptr = OpTypePointer Workgroup %wgarr
+%wgeptr = OpTypePointer Workgroup %i32
+%wg = OpVariable %wgptr Workgroup
+%outarr = OpTypeArray %i32 %cu256
+%buf_t = OpTypeStruct %outarr
+%bufptr = OpTypePointer StorageBuffer %buf_t
+%belem = OpTypePointer StorageBuffer %i32
+%buf = OpVariable %bufptr StorageBuffer
+%gli = OpVariable %pin Input
+%main = OpFunction %void None %fnty
+%entry = OpLabel
+%tid = OpLoad %u32 %gli
+%ti = OpBitcast %i32 %tid
+OpBranch %loop
+%loop = OpLabel
+%kc = OpPhi %i32 %c0 %entry %kn %body
+%cond = OpSLessThan %bool %kc %c64
+OpLoopMerge %merged %body None
+OpBranchConditional %cond %body %merged
+%body = OpLabel
+%k256 = OpIMul %i32 %kc %c256
+%idx = OpIAdd %i32 %k256 %ti
+%val0 = OpIMul %i32 %idx %c7
+%val = OpIAdd %i32 %val0 %c1
+%wp = OpAccessChain %wgeptr %wg %idx
+OpStore %wp %val
+%kn = OpIAdd %i32 %kc %c1
+OpBranch %loop
+%merged = OpLabel
+OpControlBarrier %cw %cw %cu0
+%q0 = OpAccessChain %wgeptr %wg %c0
+%w0 = OpLoad %i32 %q0
+%eq0 = OpIEqual %bool %w0 %c1
+%q1 = OpAccessChain %wgeptr %wg %c8192
+%w1 = OpLoad %i32 %q1
+%eq1 = OpIEqual %bool %w1 %e57345
+%q2 = OpAccessChain %wgeptr %wg %c16383
+%w2 = OpLoad %i32 %q2
+%eq2 = OpIEqual %bool %w2 %e114682
+%and01 = OpLogicalAnd %bool %eq0 %eq1
+%and = OpLogicalAnd %bool %and01 %eq2
+%res = OpSelect %i32 %and %c1 %c0
+%op = OpAccessChain %belem %buf %cu0 %tid
+OpStore %op %res
+OpReturn
+OpFunctionEnd

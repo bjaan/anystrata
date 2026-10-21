@@ -13,10 +13,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 
 #include "probe_dot.spv.h"
 #include "probe_subgroup.spv.h"
+#include "probe_wg64k.spv.h"
+#include "probe_spans.spv.h"
 using namespace strata;
 
 int main() {
@@ -46,7 +49,57 @@ int main() {
     vk::copy_d2h(&val2, (void*)(uintptr_t)out2, 4, nullptr);
     std::printf("probe: forced-32 subgroup kernel: got %d (expect 321): %s\n", val2, val2 == 321 ? "OK" : "FAIL");
 
-    const bool pass = (val == 10) && (val2 == 321);
+    // ---- C: 64 KiB workgroup-shared array: a 16384 x i32 Workgroup OpVariable (exactly this driver's
+    // maxComputeSharedMemorySize = 65536, the LDS budget the RDNA3 HIP-port kernels assume) written by
+    // 256 threads, barrier, read back in-kernel: every thread checks wg[0], wg[8192], wg[16383] and
+    // stores 1/0. The pipeline compiles AND executes only if the driver grants the full 64 KiB.
+    vk::Kernel kwg = vk::kernel_load("probe_wg64k", probe_wg64k_spv, probe_wg64k_spv_len, 1, 0, 256, false);
+    uint64_t out3 = a.alloc(256 * 4);
+    { const uint64_t sz3[1] = {1024}; vk::kernel_launch_sized(kwg, 1, &out3, sz3, 1, nullptr); }
+    std::vector<int> wg_res(256, -1);
+    vk::copy_d2h(wg_res.data(), (void*)(uintptr_t)out3, 256 * 4, nullptr);
+    int cval = 1;
+    for (int r : wg_res) if (r != 1) { cval = 0; break; }
+    std::printf("probe: 64K workgroup array: got %d (expect 1): %s\n", cval, cval == 1 ? "OK" : "FAIL");
+
+    // ---- D: far-apart arena spans. Two 600 MiB regions - over RADV's 512 MiB max allocation, so each
+    // chains into 2 pieces (512 MiB + ~86 MiB). Patterns are written at region A's offset 0 (first piece)
+    // and region B's (bytes - 4 KiB) (deep in the LAST piece of the chain): both copies and the kernel's
+    // piece-local sub-span bindings exercise piece_of() lookup at both ends of a chained region.
+    // Sub-check: an H2D copy that STRADDLES a piece boundary must throw with 'piece' in its message -
+    // that named rejection IS the design (the launcher/copy refuses instead of reading wrong bytes).
+    const uint64_t MiB = 1ull << 20;
+    const uint64_t region = 600 * MiB;
+    uint64_t ra = a.alloc(region);          // throws "out of VRAM" if the 256 MiB slack rule fails;
+    uint64_t rb = a.alloc(region);          // then rerun at 300 MiB each and note it (not needed on BC-250)
+    std::vector<int> patA(1024), patB(256);
+    for (size_t j = 0; j < patA.size(); j++) patA[j] = (int)(j * 3 + 7);
+    for (size_t j = 0; j < patB.size(); j++) patB[j] = 7000000 + (int)j;
+    vk::copy_h2d((void*)(uintptr_t)ra, patA.data(), 1024 * 4, nullptr);                    // head of piece 0
+    vk::copy_h2d((void*)(uintptr_t)(rb + region - 1024 * 4), patB.data(), 256 * 4, nullptr); // tail of last piece
+    bool straddle_rejected = false;
+    try {
+        int filler[1024]; for (size_t j = 0; j < 1024; j++) filler[j] = (int)j;
+        // half on piece 0, half on piece 1 of region A (512 MiB boundary)
+        vk::copy_h2d((void*)(uintptr_t)(ra + 512 * MiB - 1024), filler, 4096, nullptr);
+    } catch (const std::exception& e) {
+        straddle_rejected = std::strstr(e.what(), "piece") != nullptr;
+        std::printf("probe: piece-straddle copy rejected by name: %s\n", e.what());
+    }
+    // Kernel binds three piece-local sub-spans: patA (in A's first piece), patB (in B's last piece), out.
+    vk::Kernel ksp = vk::kernel_load("probe_spans", probe_spans_spv, probe_spans_spv_len, 3, 0, 256, false);
+    uint64_t out4 = a.alloc(1024 * 4);
+    { const uint64_t bufs[3] = {ra, rb + region - 4096, out4};
+      const uint64_t szs[3] = {4096, 1024, 4096};
+      vk::kernel_launch_sized(ksp, 4, bufs, szs, 3, nullptr); }
+    std::vector<int> span_res(1024, -1);
+    vk::copy_d2h(span_res.data(), (void*)(uintptr_t)out4, 1024 * 4, nullptr);
+    int spans = 1;
+    for (int r : span_res) if (r != 1) { spans = 0; break; }
+    const bool dval = spans && straddle_rejected;
+    std::printf("probe: far-apart arena spans + piece-straddle copy rejected: %s\n", dval ? "OK" : "FAIL");
+
+    const bool pass = (val == 10) && (val2 == 321) && (cval == 1) && dval;
     std::printf("vk_device_probe %s on %s\n", pass ? "PASS" : "FAIL", d.name.c_str());
     return pass ? 0 : 1;
 }

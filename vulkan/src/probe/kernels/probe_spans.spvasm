@@ -1,0 +1,86 @@
+; probe_spans.spvasm - far-apart arena spans read back by one kernel launch. Three storage buffers, each
+; bound to a piece-local sub-span of the arena (the launcher throws if a span crosses a piece):
+;   binding 0: patA  - 1024 i32, host pattern  patA[j]  = j*3 + 7        (written at the first region's 0)
+;   binding 1: patB  -  256 i32, host pattern  patB[j]  = 7000000 + j    (written near the last region's end)
+;   binding 2: out   - 1024 i32 check results.
+; 4 groups x 256 threads (LocalInvocationIndex): thread g checks
+;   out[g] = (patA[g]==g*3+7 && (g>=256 || patB[g]==7000000+g)) ? 1 : 0. Expect all 1024 outs = 1.
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %bufA %bufB %bufO %glid
+OpExecutionMode %main LocalSize 256 1 1
+OpDecorate %glid BuiltIn GlobalInvocationId
+OpDecorate %a_t Block
+OpMemberDecorate %a_t 0 Offset 0
+OpDecorate %bufA DescriptorSet 0
+OpDecorate %bufA Binding 0
+OpDecorate %b_t Block
+OpMemberDecorate %b_t 0 Offset 0
+OpDecorate %bufB DescriptorSet 0
+OpDecorate %bufB Binding 1
+OpDecorate %o_t Block
+OpMemberDecorate %o_t 0 Offset 0
+OpDecorate %bufO DescriptorSet 0
+OpDecorate %bufO Binding 2
+OpDecorate %a_arr ArrayStride 4
+OpDecorate %b_arr ArrayStride 4
+OpDecorate %o_arr ArrayStride 4
+%void = OpTypeVoid
+%fnty = OpTypeFunction %void
+%bool = OpTypeBool
+%u32 = OpTypeInt 32 0
+%i32 = OpTypeInt 32 1
+%v3u = OpTypeVector %u32 3
+%pin = OpTypePointer Input %v3u
+%glid = OpVariable %pin Input
+%cu0 = OpConstant %u32 0
+%c0 = OpConstant %i32 0
+%c1 = OpConstant %i32 1
+%c3 = OpConstant %i32 3
+%c7 = OpConstant %i32 7
+%c256 = OpConstant %i32 256
+%cu256 = OpConstant %u32 256
+%ci1024 = OpConstant %i32 1024
+%cu1024 = OpConstant %u32 1024
+%base_b = OpConstant %i32 7000000
+%true = OpConstantTrue %bool
+%a_arr = OpTypeArray %i32 %cu1024
+%b_arr = OpTypeArray %i32 %cu256
+%o_arr = OpTypeArray %i32 %cu1024
+%a_t = OpTypeStruct %a_arr
+%b_t = OpTypeStruct %b_arr
+%o_t = OpTypeStruct %o_arr
+%pi = OpTypePointer StorageBuffer %i32
+%aptr = OpTypePointer StorageBuffer %a_t
+%bptr = OpTypePointer StorageBuffer %b_t
+%optr = OpTypePointer StorageBuffer %o_t
+%bufA = OpVariable %aptr StorageBuffer
+%bufB = OpVariable %bptr StorageBuffer
+%bufO = OpVariable %optr StorageBuffer
+%main = OpFunction %void None %fnty
+%entry = OpLabel
+%gid = OpLoad %v3u %glid
+%gu = OpCompositeExtract %u32 %gid 0
+%gi = OpBitcast %i32 %gu
+%pa = OpAccessChain %pi %bufA %cu0 %gu
+%va = OpLoad %i32 %pa
+%ea0 = OpIMul %i32 %gi %c3
+%ea = OpIAdd %i32 %ea0 %c7
+%oka = OpIEqual %bool %va %ea
+%lt = OpSLessThan %bool %gi %c256
+OpSelectionMerge %selend None
+OpBranchConditional %lt %selbody %selend
+%selbody = OpLabel
+%pb = OpAccessChain %pi %bufB %cu0 %gu
+%vb = OpLoad %i32 %pb
+%eb = OpIAdd %i32 %base_b %gi
+%eqb = OpIEqual %bool %vb %eb
+OpBranch %selend
+%selend = OpLabel
+%okb = OpPhi %bool %true %entry %eqb %selbody
+%ok = OpLogicalAnd %bool %oka %okb
+%res = OpSelect %i32 %ok %c1 %c0
+%po = OpAccessChain %pi %bufO %cu0 %gu
+OpStore %po %res
+OpReturn
+OpFunctionEnd
