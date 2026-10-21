@@ -75,6 +75,7 @@ function(strata_vk_kernel name)
 endfunction()
 
 strata_vk_kernel(s2_gemv)
+strata_vk_kernel(dequant_s2)
 
 # ---- probe: asserts the device's Vulkan surface the port needs (dp4a executes, subgroups force to 32),
 # and prints the device line the engine logs at start. Its two modules come from spirv-as: this distro's
@@ -114,3 +115,8 @@ add_executable(s2_gemv_vk_parity src/tests/s2_gemv_vk_parity.cpp)
 target_include_directories(s2_gemv_vk_parity PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(s2_gemv_vk_parity PRIVATE strata_vk_kernel_s2_gemv strata_vk_runtime strata_vk_compat)
 add_test(NAME s2_gemv_vk_parity COMMAND s2_gemv_vk_parity --selftest)
+
+add_executable(dequant_s2_vk_parity src/tests/dequant_s2_vk_parity.cpp)
+target_include_directories(dequant_s2_vk_parity PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(dequant_s2_vk_parity PRIVATE strata_vk_kernel_dequant_s2 strata_vk_runtime strata_vk_compat)
+add_test(NAME dequant_s2_vk_parity COMMAND dequant_s2_vk_parity --selftest)

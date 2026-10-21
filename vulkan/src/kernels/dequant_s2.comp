@@ -1,0 +1,32 @@
+#version 450
+// vulkan/src/kernels/dequant_s2.comp - P2.S2's first naive kernel, Vulkan shape.
+//
+// The line-by-line translation of src/kernels/cuda/dequant_s2.cu: one thread per block of 64, the codes
+// read 4 per byte LSB-first, the -1 applied to the CODE in the INTEGER domain then ONE multiply - the form
+// that makes the decode bit-exact (docs/pack-format.md S3.1), so this kernel has no tolerance at all.
+// Codes arrive packed 4 bytes per uint (no 16/8-bit scalars in this baseline's std430 views).
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer C { uint  cs[]; } bc;   // 4 code bytes per uint
+layout(std430, binding = 1) buffer S { float ss[]; } bs;   // one fp32 scale per block
+layout(std430, binding = 2) buffer Y { float ys[]; } by;   // n_blocks * 64 out
+
+layout(push_constant) uniform PC { uint n_blocks; } pc;
+
+void main() {
+    uint b = gl_GlobalInvocationID.x;
+    if (b >= pc.n_blocks) return;
+    float d = bs.ss[b];
+    uint cb = b * 4u;                    // uints: 16 code bytes per block
+    uint yb = b * 64u;
+    for (uint w = 0; w < 4u; ++w) {
+        uint cw = bc.cs[cb + w];
+        for (uint bb = 0; bb < 4u; ++bb) {
+            uint codeb = (cw >> (bb * 8u)) & 255u;
+            for (uint k = 0; k < 4u; ++k) {
+                uint code = (codeb >> (k * 2u)) & 3u;
+                by.ys[yb + w * 16u + bb * 4u + k] = float(int(code) - 1) * d;
+            }
+        }
+    }
+}
