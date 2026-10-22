@@ -93,13 +93,13 @@ header helpers, one row per header) | `n/a` (decision `n/a`).
 | wait_flag_ge* / handoff_publish / wait_handoff / gpu_stamp / gpu_noop (device-side sync flags) | verify_kernels.hpp | src/kernels/cuda/verify_kernels.cu | verify_batch_parity.cpp | `asm volatile` (atomics/spin) | translate (GLSL atomics; ordered spin) | todo |
 | copy_rows_strided / copy_indexed / fetch_blobs / res_patch / rebase_ptrs / broadcast_streams / add_streams_broadcast / copy_i32_from_mapped_unless / copy_or_zero_from_mapped / copy_row_to_first / gather_rows / map_ids / embedding_gather_dev | verify_kernels.hpp | src/kernels/cuda/verify_kernels.cu | verify_parity.cpp, verify_batch_parity.cpp | `__shfl`, `__shared__`, `__ldg` | translate | todo |
 | launch_pdl / pdl_* (programmatic dependent launch) | pdl.hpp | (host launch glue; pdl helpers) | pdl_parity.cpp | cudaGraph, PDL (programmatic dependent launch) | n/a (NVIDIA PDL/graph feature — run with --no-graphs; the Vulkan port uses its own submission ordering) | n/a |
-| poly: gemv_kernel, dequant_q8_kernel | src/poly/kernels.cu (no include/strata header) | src/poly/kernels.cu | none (poly engine tests) | `__shared__`, `__constant__` | translate | todo |
+| poly: gemv_kernel, dequant_q8_kernel | src/poly/kernels.cu (no include/strata header) | src/poly/kernels.cu | none (poly engine tests) | `__shared__`, `__constant__` | translate | **gemv_kernel ported via the gemv_f32 launcher (Task 2.4): vulkan/src/poly/kernels/gemv.comp (5 workgroup-size variants), gemv_vk.cpp, unit poly_kernels_vk_parity BITWISE on 5 shapes; dequant_q8_kernel todo** |
 | poly: rms_norm, copy2 (launchers) | include/strata/poly/kernels.hpp | src/poly/kernels.cu | unit poly_kernels_vk_parity + model-run advance | `__shfl`, `__shared__` (rms_norm block_sum) | translate | **ported+parity-green** (vulkan/src/poly/kernels/{rms_norm,copy2}.comp, *_vk.cpp) |
 | poly: layer_norm_kernel, bf16_to_f32_kernel, store_f16_kernel/_at, store_q8_kernel/_at, add_bias_kernel, axpy_kernel, add_scaled_kernel, mul_sigmoid_kernel, softcap_kernel, likeliest_kernel | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | todo |
 | poly: hc_mix/read/post/head/mean kernels | src/poly/kernels.cu | src/poly/kernels.cu | hc_persist_parity.cpp (host-side contract) | `__shfl`, `__shared__` | translate | todo |
 | poly: kda_conv/_rows/_state, kda_step/gates/state/out kernels | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | todo |
 | poly: gdn_norm/gates/state/state_reg/out kernels | src/poly/kernels.cu | src/poly/kernels.cu | gdn_parity.cpp (host-side contract) | `__shfl`, `__shared__` | translate | todo |
-| poly: conv4_silu/_rows/_state, shortconv/_rows/_state kernels | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | todo |
+| poly: conv4_silu/_rows/_state, shortconv/_rows/_state kernels | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | **conv4_silu (all three kernels: walk/rows/state) ported (Task 2.4): vulkan/src/poly/kernels/conv4_silu.comp, conv4_state.comp, conv4_silu_vk.cpp, unit poly_kernels_vk_parity rel 5.9e-7 (tree tol 1e-5); shortconv todo** |
 | poly: swiglu_clamp/_rows, geglu/_rows kernels | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | none | translate | todo |
 | poly: dsa_keys/softmax, idx_store/pool/weigh, route_kernel, moe_sum_kernel | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | todo |
 | poly: attn_score/softmax/value/group/ungroup/softmax_block/scale, head_norm_rope kernels | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | `__shfl`, `__shared__`, `cp.async` (some paths), `asm volatile` | fp32-fallback for the cp.async/mma-attn paths; ordered-FP32 score/softmax otherwise | todo |
@@ -201,8 +201,8 @@ Re-run with `STRATA_VK_STUBS=log` enumerates the rest of the qwen35moe decode pa
 | 2 | `strata::poly::rms_norm` | poly: rms_norm_kernel — **PORTED (Task 2.1)** |
 | 3 | `strata::kernels::native_quantize_q8_1` | q8_1 (native_quantize_q8_1, …) — **PORTED (Task 2.1)** |
 | 4 | `strata::kernels::native_mmvq` | native_mmvq / _pair / _slots / _ids — **iq2_xxs (type 16) PORTED (Task 2.2)**; other types trap-by-name |
-| 5 | `strata::poly::gemv_f32` | poly: gemv_kernel |
-| 6 | `strata::poly::conv4_silu` | poly: conv4_silu/_rows/_state kernels |
+| 5 | `strata::poly::gemv_f32` | poly: gemv_kernel — **PORTED (Task 2.4)** |
+| 6 | `strata::poly::conv4_silu` | poly: conv4_silu/_rows/_state kernels — **PORTED (Task 2.4)** |
 | 7 | `strata::poly::gdn_step` | poly: gdn_norm/gates/state/state_reg/out kernels |
 | 8 | `strata::poly::axpy` | poly: axpy_kernel |
 | 9 | `strata::poly::swiglu_clamp` | poly: swiglu_clamp/_rows |
@@ -240,6 +240,20 @@ CONTRACTION LAW (this box): the CUDA native_mmvq.cu builds with --use_fast_math 
 -ffp-contract=off, so its exact dot semantics are fused; the device answers `sumf = fma(d8, dot*sc,
 sumf)` per i and the final pair as `fma(-dm_y, sumf_m, dm_x*sumf_d)` — the host reference mirrors
 exactly that (all other fusion orders differ on 108-321 outputs).
+
+**Halt point after Task 2.4 (2026-10-22):** `strata::poly::gdn_step` — demands #5 and #6 cleared in
+one gate run: gemv_f32 (gemv.comp, 5 workgroup-size variants 32..1024 matching the CUDA wrapper's
+`n_in >= 128 ? sum_threads(n_in) : 32` choice, grid dim3(n_out,rows) flattened) is **BITWISE**
+against the transcribed strided+shuffle-tree reference on all 5 tested shapes (worst rel 0.000e+00
+— and here, unlike the mmvq dots, the device does NOT contract `acc += w*x`: the plain fp32
+reference matches to the bit); conv4_silu — all three kernels (walk with snapshots, rows, state;
+conv4_silu.comp + conv4_state.comp + conv4_silu_vk.cpp with CUDA's CONV_ROWS=16 arm switch
+transcribed) — the window chain `s0*w0+s1*w1+s2*w2+v*w3` measures UNFUSED on this box (worst rel
+5.9e-7 vs the unfused host reference; an explicit OpExtInst Fma in the .spv lowers to identical
+values — RADV/GFX1013 turns FMA back into mul+add here), 2.9e-4 vs the fma arm, inside the tree's
+1e-5 gemv-family tol against the closer arm (never looser). ctest 10/10. Model load 126 s, halt
+moved #5 -> gdn_step (demand #7): the gate passed gemv_f32 and conv4_silu — gdn_step is what
+qwen35moe's recurrent layers ask for next.
 
 Phase-2 first picks by demand order: `copy2`, `rms_norm`, then the mmvq family
 (`native_quantize_q8_1`, `native_mmvq`) — matching the plan's expectation (quantize_act /

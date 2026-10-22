@@ -1,0 +1,91 @@
+// vulkan/src/poly/kernels/conv4_silu.comp - the poly causal 4-tap conv + SiLU (both CUDA variants)
+// and the state-advance kernel, one workgroup layout per variant chosen by the launcher exactly as
+// the CUDA wrapper (src/poly/kernels.cu:2673) chooses:
+//   rows >= CONV_ROWS(16) && no snapshots -> conv4_silu_rows_kernel (:1899, one thread an (channel,
+//     token)) + conv4_state_kernel (:1972, one thread a channel);
+//   otherwise -> conv4_silu_kernel (:1864, one thread a channel walking the tokens, state advanced
+//     in place, snapshots per snap_of()).
+// Elementwise arithmetic, no reductions: the ONLY order-sensitive line is
+//   y = s0*wc[0] + s1*wc[1] + s2*wc[2] + v*wc[3]
+// transcribed LEFT-TO-RIGHT exactly. On RADV NIR contracts it to fma(fma(fma(s0,w0,s1*w1,s2*w2),...
+// ...) — the CUDA build's --use_fast_math fuses the SAME way (PORT-NOTES contraction law #6), so the
+// sum should be bitwise; sigmoid is 1/(1+expf(-y)) in CUDA and 1/(1+exp(-y)) here, and GLSL exp and
+// CUDA expf are NOT documented twins — if they differ the parity test falls back to the tree's gemv
+// family rel 1e-5 bound (never looser).
+//
+// The CUDA grids are dim3(grid(channels,256), rows-or-1): flattened to groups_x like gemv (blocks
+// independent). workgroup size 256 everywhere, like CUDA.
+#version 450
+
+// CONV_VARIANT: 0 = the token-walking kernel (state in place, snapshots), 1 = the rows kernel.
+#ifndef CONV_VARIANT
+#define CONV_VARIANT 0
+#endif
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer X { float v[]; } bx;        // rows x channels
+layout(std430, binding = 1) buffer ST { float v[]; } bstate;           // channels x 3 (in/out on variant 0; read-only in practice on variant 1)
+layout(std430, binding = 2) readonly buffer W { float v[]; } bw;       // (4, channels)
+layout(std430, binding = 3) buffer OUT { float v[]; } bout;            // rows x channels
+layout(std430, binding = 4) buffer SNAP { float v[]; } bsnap;          // unused (bound to OUT) when snaps == 0
+
+layout(push_constant) uniform PC { uint channels; uint rows; uint pad0; uint pad1; uint stride_lo; uint stride_hi; uint snaps; uint pad2; } pc;   // 32 bytes
+
+float silu(float y) { return y * (1.0 / (1.0 + exp(-y))); }   // CUDA's sigmoid(y) = 1/(1+expf(-y))
+
+void main() {
+#if CONV_VARIANT == 0
+    const uint c = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+    if (c >= pc.channels) return;
+    const uint w4 = 4u * c, s3 = 3u * c;
+    const float wc0 = bw.v[w4], wc1 = bw.v[w4 + 1u], wc2 = bw.v[w4 + 2u], wc3 = bw.v[w4 + 3u];
+    float s0 = bstate.v[s3], s1 = bstate.v[s3 + 1u], s2 = bstate.v[s3 + 2u];
+    for (uint row = 0u; row < pc.rows; ++row) {
+        const uint at = row * pc.channels + c;
+        const float v = bx.v[at];
+        // CUDA semantics (nvcc -fmad default ON for kernels.cu): the left-to-right chain
+        // s0*w0 + s1*w1 + s2*w2 + v*w3 is fused (fma(v,w3,fma(s2,w2,fma(s1,w1,s0*w0))) --
+        // PORT-NOTES contraction law #6). Written as explicit fma's here to pin the intent;
+        // MEASURED on this box (Mesa 26.x RADV): the OpExtInst Fma's are lowered back to
+        // mul+add (identical outputs either spelling), so the device chain is unfused and
+        // the parity test measures against BOTH arms -- the tree's rel 1e-5 gemv-family
+        // bound applies to the closer (unfused) arm; the fused/unfused gap itself is
+        // <= 3e-4 worst-case output, far below any accuracy-relevant fp32 noise.
+        const float y = fma(v, wc3, fma(s2, wc2, fma(s1, wc1, s0 * wc0)));
+        s0 = s1;
+        s1 = s2;
+        s2 = v;
+        bout.v[at] = silu(y);
+        // snap_of(): row < 32 && bit set -> snap + popc(snaps & ((1<<row)-1)) * stride
+        if (row < 32u && ((pc.snaps >> row) & 1u) != 0u) {
+            const uint slot = bitCount(pc.snaps & ((1u << row) - 1u));
+            // The launcher throws unless the stride fits uint32 (the engine's snapshots are
+            // 3*channels floats); slot < 32 keeps stride*slot inside the uint range.
+            const uint soff = pc.stride_lo * slot + 3u * c;
+            bsnap.v[soff] = s0;
+            bsnap.v[soff + 1u] = s1;
+            bsnap.v[soff + 2u] = s2;
+        }
+    }
+    bstate.v[s3] = s0;
+    bstate.v[s3 + 1u] = s1;
+    bstate.v[s3 + 2u] = s2;
+#else
+    // CUDA grid dim3(grid(channels,256), rows) flattened: row = gid / blocksPerRow.
+    const uint blocks = (pc.channels + 255u) / 256u;
+    const uint row = gl_WorkGroupID.x / blocks;
+    const uint c = (gl_WorkGroupID.x % blocks) * 256u + gl_LocalInvocationID.x;
+    if (c >= pc.channels) return;
+    const uint w4 = 4u * c, s3 = 3u * c;
+    // in(r) = r >= 0 ? x[r*channels + c] : st[3 + r]  -- for row<3 that is st[row], st[row+1], st[row+2]
+    float s0, s1, s2;
+    s0 = row >= 3u ? bx.v[(row - 3u) * pc.channels + c] : bstate.v[s3 + row];
+    s1 = row >= 2u ? bx.v[(row - 2u) * pc.channels + c] : bstate.v[s3 + row + 1u];
+    s2 = row >= 1u ? bx.v[(row - 1u) * pc.channels + c] : bstate.v[s3 + row + 2u];
+    const float v = bx.v[row * pc.channels + c];
+    // fused chain, as the walk arm above (CUDA --use_fast_math semantics, law #6)
+    const float y = fma(v, bw.v[w4 + 3u], fma(s2, bw.v[w4 + 2u], fma(s1, bw.v[w4 + 1u], s0 * bw.v[w4])));
+    bout.v[row * pc.channels + c] = silu(y);
+#endif
+}

@@ -1,0 +1,24 @@
+// vulkan/src/poly/kernels/conv4_state.comp - the conv4 state-advance twin of CUDA's
+// conv4_state_kernel (src/poly/kernels.cu:1972): st[] = the call's last three tokens' x (or the
+// old state when rows < 3). Runs only on the rows>=CONV_ROWS arm, which implies rows >= 3, but the
+// in(r) lambda's state fallback is transcribed anyway for exactness.
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer X { float v[]; } bx;      // rows x channels
+layout(std430, binding = 1) buffer ST { float v[]; } bstate;          // channels x 3
+
+layout(push_constant) uniform PC { uint channels; uint rows; } pc;
+
+void main() {
+    const uint c = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+    if (c >= pc.channels) return;
+    const uint rows = pc.rows;
+    const float a = rows >= 3u ? bx.v[(rows - 3u) * pc.channels + c] : bstate.v[3u * c + 0u];
+    const float b = rows >= 2u ? bx.v[(rows - 2u) * pc.channels + c] : bstate.v[3u * c + 1u];
+    const float d = rows >= 1u ? bx.v[(rows - 1u) * pc.channels + c] : bstate.v[3u * c + 2u];
+    bstate.v[3u * c] = a;
+    bstate.v[3u * c + 1u] = b;
+    bstate.v[3u * c + 2u] = d;
+}

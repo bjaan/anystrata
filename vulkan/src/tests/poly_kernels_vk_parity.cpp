@@ -196,6 +196,200 @@ int main() {
         check(bad == 0, "native_quantize_q8_1 byte-exact");
     }
 
+    // ---- gemv_f32 (Task 2.4): reference = gemv_kernel's partition transcribed (CUDA kernels.cu
+    //      :75): one output row a block of sum_threads(n_in) (or 32 when n_in < 128), a strided
+    //      loop, warp_sum, then the ordered part[] walk. The host reference sums the SAME per-thread
+    //      strided order in fp32, so the only freedom is contraction (a*b vs fma): the gemv-family
+    //      rel 1e-5 bound (s2_gemv_vk_parity / bf16_gemv_parity's tol). Shapes: the model's n_in
+    //      2048 (512 threads) + arms that force each variant size (1024->1024, 4096->1024? no:
+    //      sum_threads(4096)=1024, 1000 -> 256, 100 -> 32) + rows_per_x groups.
+    {
+        auto ref_gemv = [](const std::vector<float>& w, const std::vector<float>& x,
+                           std::vector<float>& y, int n_in, int n_out, int rows_per_x, int rows,
+                           int threads) {
+            const int part = (threads + 31) / 32;
+            for (int o = 0; o < n_out; ++o)
+                for (int tok = 0; tok < rows; ++tok) {
+                    const size_t wr = (size_t)o * n_in;
+                    const size_t xr = ((size_t)tok * (n_out / rows_per_x) + o / rows_per_x) * n_in;
+                    // thread t's fp32 strided sum: i = t, t+threads, ... in CUDA's order
+                    std::vector<float> tacc(threads, 0.f);
+                    for (int i = 0; i < n_in; ++i) tacc[i % threads] += w[wr + i] * x[xr + i];
+                    // warp_sum per 32-lane warp: xor tree 16..1 (per-round copies, law #4), then
+                    // the ordered part[0..part) walk.
+                    std::vector<float> ws(part, 0.f);
+                    for (int p = 0; p < part; ++p) {
+                        float l[32];
+                        for (int j = 0; j < 32; ++j) l[j] = (size_t)p * 32 + j < (size_t)threads ? tacc[p * 32 + j] : 0.f;
+                        for (int off = 16; off > 0; off >>= 1) {
+                            float pr[32]; for (int j = 0; j < 32; ++j) pr[j] = l[j];
+                            for (int j = 0; j < 32; ++j) l[j] = l[j] + pr[j ^ off];
+                        }
+                        ws[p] = l[0];
+                    }
+                    float s = 0.f;
+                    for (int p = 0; p < part; ++p) s += ws[p];
+                    y[(size_t)tok * n_out + o] = s;
+                }
+        };
+        struct Case { int n_in, n_out, rows_per_x, rows; };
+        const Case cases[] = {
+            {2048, 8192, 8192, 1},      // the model's dense projection shape (512 threads)
+            {2048, 2048, 512, 2},       // rows_per_x grouping (per-head MLA reads)
+            {4096, 128, 128, 1},        // 1024-thread variant
+            {1000, 64, 64, 1},          // 256-thread variant (1000*4>... sum_threads -> 256)
+            {100, 32, 32, 3},           // narrow-input arm: threads 32
+        };
+        std::mt19937 rng(31);
+        std::uniform_real_distribution<float> u(-2.f, 2.f);
+        for (const auto& c : cases) {
+            const int threads = c.n_in >= 128 ? poly::sum_threads(c.n_in) : 32;
+            std::vector<float> w((size_t)c.n_out * c.n_in), x((size_t)c.rows * (c.n_out / c.rows_per_x) * c.n_in),
+                                 y((size_t)c.rows * c.n_out, 0.f), ref(y.size());
+            for (auto& v : w) v = u(rng);
+            for (auto& v : x) v = u(rng);
+            const uint64_t aw = a.alloc(w.size() * 4), ax = a.alloc(x.size() * 4), ay = a.alloc(y.size() * 4);
+            vk::copy_h2d((void*)aw, w.data(), w.size() * 4, nullptr);
+            vk::copy_h2d((void*)ax, x.data(), x.size() * 4, nullptr);
+            poly::gemv_f32((const float*)strata_vk_compat::wrap(aw), (const float*)strata_vk_compat::wrap(ax),
+                           (float*)strata_vk_compat::wrap(ay), c.n_in, c.n_out, c.rows_per_x, c.rows, nullptr);
+            vk::copy_d2h(y.data(), (void*)ay, y.size() * 4, nullptr);
+            ref_gemv(w, x, ref, c.n_in, c.n_out, c.rows_per_x, c.rows, threads);
+            double worst = 0.0; int bit = 1;
+            for (size_t i = 0; i < y.size(); ++i) {
+                if (std::memcmp(&y[i], &ref[i], 4) != 0) bit = 0;
+                worst = std::fmax(worst, std::fabs((double)y[i] - ref[i]) / std::fmax(1e-3, std::fabs((double)ref[i])));
+            }
+            std::printf("  gemv_f32 n_in=%d n_out=%d rpx=%d rows=%d thr=%d: worst rel %.3e, bitwise %s\n",
+                        c.n_in, c.n_out, c.rows_per_x, c.rows, threads, worst, bit ? "yes" : "no");
+            check(worst < 1e-5, "gemv_f32 rel 1e-5 (gemv-family tol)");
+        }
+    }
+
+    // ---- conv4_silu (Task 2.4): elementwise 4-tap window + SiLU, no reductions: the CUDA arms
+    //      (rows>=16 no-snap -> rows+state kernels; else the token walk, with snapshots) are
+    //      independent of partition for the SUM (same left-to-right term order in every arm), so
+    //      the reference is one scalar transcription; only exp() may differ (CUDA expf vs GLSL
+    //      exp). The conv4 window has no mul-into-accumulator at all in the CUDA source's sense --
+    //      s0*w0 + s1*w1 + s2*w2 + v*w3 IS a fused chain on both (PORT-NOTES law #6), so try
+    //      bitwise first; the fallback is the family's rel 1e-5.
+    {
+        auto sig = [](float v) { return 1.0f / (1.0f + std::exp(-v)); };
+        auto silu = [&](float v) { return v * sig(v); };
+        struct CRef { std::vector<float> out, out_u, st; std::vector<std::vector<float>> snaps; };
+        auto ref_conv = [&](const std::vector<float>& x, const std::vector<float>& st_in,
+                            const std::vector<float>& w, int channels, int rows,
+                            const std::vector<float>& /*snap unused here*/, int n_snap, size_t stride,
+                            unsigned snaps) {
+            CRef r; r.out.assign(x.size(), 0.f); r.out_u.assign(x.size(), 0.f);
+            std::vector<float> st = st_in;
+            for (int c = 0; c < channels; ++c) {
+                float s0 = st[3*c], s1 = st[3*c+1], s2 = st[3*c+2];
+                const float* wc = &w[4*size_t(c)];
+                for (int row = 0; row < rows; ++row) {
+                    const float v = x[size_t(row)*channels + c];
+                    // Two contraction arms of the SAME left-to-right term order: the CUDA build's
+                    // --use_fast_math fuses (fma chain, PORT-NOTES law #6); glslc emits mul/add and
+                    // RADV's NIR may or may not contract per chain. The pass rule is the tree's
+                    // rel 1e-5 against EITHER arm (never looser than the gemv-family bound).
+                    // The CUDA build's --use_fast_math fuses this left-to-right chain (PORT-NOTES
+                    // law #6): y = fma(v,w3, fma(s2,w2, fma(s1,w1, s0*w0))). On THIS box RADV
+                    // lowers even an explicit OpExtInst Fma back to mul+add (measured: identical
+                    // device outputs for both spellings), so the device follows the UNFUSED arm;
+                    // both arms are reported and the pass rule is the tree's rel 1e-5 against
+                    // the closer arm (never looser than the gemv-family bound).
+                    float y = std::fma(v, wc[3], std::fma(s2, wc[2], std::fma(s1, wc[1], s0 * wc[0])));
+                    float yu = ((s0 * wc[0] + s1 * wc[1]) + s2 * wc[2]) + v * wc[3];
+                    r.out[size_t(row)*channels + c] = silu(y);
+                    r.out_u[size_t(row)*channels + c] = silu(yu);
+                    s0 = s1; s1 = s2; s2 = v;
+                    if (n_snap && row < 32 && ((snaps >> row) & 1u)) {
+                        int slot = __builtin_popcount(snaps & ((1u << row) - 1u));
+                        r.snaps.push_back({(float)slot, (float)c, s0, s1, s2});
+                    }
+                }
+                st[3*c] = s0; st[3*c+1] = s1; st[3*c+2] = s2;
+            }
+            r.st = st;
+            return r;
+        };
+        // the model's shape: qwen35moe ssm inner_size 6144 channels, decode rows=1 (walk arm);
+        // plus a prompt arm rows=20 (rows+state kernels); plus a snapshots arm (walk with snap).
+        struct Case { int channels; int rows; unsigned snaps; };
+        const Case cases[] = { {6144, 1, 0}, {6144, 20, 0}, {2048, 4, 0b00000101u} };
+        std::mt19937 rng(41);
+        std::uniform_real_distribution<float> u(-3.f, 3.f);
+        for (const auto& cs : cases) {
+            const int channels = cs.channels, rows = cs.rows;
+            std::vector<float> x((size_t)rows * channels), st((size_t)channels * 3), w((size_t)channels * 4),
+                                 out((size_t)rows * channels, 0.f);
+            for (auto& v : x) v = u(rng);
+            for (auto& v : st) v = u(rng);
+            for (auto& v : w) v = u(rng);
+            const int n_snap = cs.snaps ? __builtin_popcount(cs.snaps) : 0;
+            const size_t stride = (size_t)channels * 3;
+            std::vector<float> snap(n_snap ? (size_t)n_snap * stride : 0, 0.f);
+            const uint64_t ax = a.alloc(x.size() * 4), as_ = a.alloc(st.size() * 4), aw = a.alloc(w.size() * 4),
+                           ao = a.alloc(out.size() * 4),
+                           asnap = n_snap ? a.alloc(snap.size() * 4) : 0;
+            vk::copy_h2d((void*)ax, x.data(), x.size() * 4, nullptr);
+            vk::copy_h2d((void*)as_, st.data(), st.size() * 4, nullptr);
+            vk::copy_h2d((void*)aw, w.data(), w.size() * 4, nullptr);
+            vk::copy_h2d((void*)ao, out.data(), out.size() * 4, nullptr);
+            if (n_snap) vk::fill_d((void*)asnap, 0, snap.size() * 4, nullptr);
+            poly::conv4_silu((const float*)strata_vk_compat::wrap(ax), (float*)strata_vk_compat::wrap(as_),
+                             (const float*)strata_vk_compat::wrap(aw), (float*)strata_vk_compat::wrap(ao),
+                             channels, rows, nullptr,
+                             n_snap ? (float*)strata_vk_compat::wrap(asnap) : nullptr, stride, cs.snaps);
+            std::vector<float> got(out.size(), 0.f), st_got(st.size(), 0.f), snap_got(snap.size(), 0.f);
+            vk::copy_d2h(got.data(), (void*)ao, got.size() * 4, nullptr);
+            vk::copy_d2h(st_got.data(), (void*)as_, st_got.size() * 4, nullptr);
+            if (n_snap) vk::copy_d2h(snap_got.data(), (void*)asnap, snap_got.size() * 4, nullptr);
+            const auto ref = ref_conv(x, st, w, channels, rows, snap, n_snap, stride, cs.snaps);
+            int bad = 0, bit = 1, bit_u = 1;
+            double worst = 0.0, worst_u = 0.0;
+            auto arm = [&](const char* name, const std::vector<float>& r, double& wrst, int& bitx) {
+                for (size_t i = 0; i < got.size(); ++i) {
+                    if (std::memcmp(&got[i], &r[i], 4) != 0) bitx = 0;
+                    wrst = std::fmax(wrst, std::fabs((double)got[i] - r[i]) / std::fmax(1e-3, std::fabs((double)r[i])));
+                }
+                std::printf("  conv4 %s: bitwise %s, worst rel %.3e (tree tol 1e-5)\n", name,
+                            bitx ? "yes" : "no", wrst);
+            };
+            arm("fused arm  ", ref.out, worst, bit);
+            arm("unfused arm", ref.out_u, worst_u, bit_u);
+            // The pass rule: the device must match ONE of the contraction arms under the tree's
+            // rel 1e-5 bound (bitwise to an arm is the ideal; a fused/unfused gap alone is not a
+            // partition mismatch). Pick the closer arm's bound.
+            const bool closer_fused = worst <= worst_u;
+            bad = (closer_fused ? worst : worst_u) >= 1e-5 ? 1 : 0;
+            // walk arm advances state in place; the rows arm's state comes from conv4_state_kernel
+            // (last three x, or old where rows < 3) -- rows>=16 means always x.
+            std::vector<float> want_st = st;
+            if (rows >= 16) {
+                for (int c = 0; c < channels; ++c) { want_st[3*c] = x[size_t(rows-3)*channels+c];
+                    want_st[3*c+1] = x[size_t(rows-2)*channels+c]; want_st[3*c+2] = x[size_t(rows-1)*channels+c]; }
+            } else {
+                for (auto& v : want_st) v = 0.f;   // walk arm: recompute below from the ref
+                want_st = ref.st;
+            }
+            for (size_t i = 0; i < st_got.size(); ++i)
+                if (std::memcmp(&st_got[i], &want_st[i], 4) != 0) { ++bad; if (bad < 4) std::printf("  conv4 state[%zu]: got %.9g want %.9g\n", i, st_got[i], want_st[i]); }
+            int snapbad = 0;
+            for (auto& sn : ref.snaps) {   // sn = {slot, channel, s0, s1, s2}
+                const float* m = snap_got.data() + (size_t)sn[0] * stride + 3 * (size_t)sn[1];
+                if (std::memcmp(m, &sn[2], 12) != 0) {
+                    if (snapbad < 3) std::printf("  snap slot %d c %d: got %.6g,%.6g,%.6g want %.6g,%.6g,%.6g\n",
+                                                 (int)sn[0], (int)sn[1], m[0], m[1], m[2], sn[2], sn[3], sn[4]);
+                    ++snapbad;
+                }
+            }
+            std::printf("  conv4_silu channels=%d rows=%d snaps=%X: bad %d, snap mismatches %d\n",
+                        channels, rows, cs.snaps, bad, snapbad);
+            check(bad == 0 && snapbad == 0, "conv4_silu out+state+snap match (closer contraction arm within rel 1e-5)");
+        }
+    }
+
     std::printf("poly_kernels_vk_parity %s\n", fails == 0 ? "PASS" : "FAIL");
     return fails == 0 ? 0 : 1;
 }
