@@ -204,7 +204,7 @@ Re-run with `STRATA_VK_STUBS=log` enumerates the rest of the qwen35moe decode pa
 | 5 | `strata::poly::gemv_f32` | poly: gemv_kernel — **PORTED (Task 2.4)** |
 | 6 | `strata::poly::conv4_silu` | poly: conv4_silu/_rows/_state kernels — **PORTED (Task 2.4)** |
 | 7 | `strata::poly::gdn_step` | poly: gdn_norm/gates/state/state_reg/out kernels — **PORTED (Task 2.5)** |
-| 7b | `strata::kernels::native_mmvq` type 14 (IQ2_S) | native_mmvq family — the model's NEW halt (the pre-digested #8 axpy guess did not hold: qwen35moe's shared-expert/dense mmvq path asks type 14 next) |
+| 7b | `strata::kernels::native_mmvq` type 14 (Q6_K) | native_mmvq family — the model's NEW halt (the pre-digested #8 axpy guess did not hold: qwen35moe's shared-expert/dense mmvq path asks type 14 = Q6_K next) |
 | 8 | `strata::poly::axpy` | poly: axpy_kernel |
 | 9 | `strata::poly::swiglu_clamp` | poly: swiglu_clamp/_rows |
 | 10 | `strata::poly::mul_sigmoid` | poly: mul_sigmoid_kernel |
@@ -256,7 +256,7 @@ values — RADV/GFX1013 turns FMA back into mul+add here), 2.9e-4 vs the fma arm
 moved #5 -> gdn_step (demand #7): the gate passed gemv_f32 and conv4_silu — gdn_step is what
 qwen35moe's recurrent layers ask for next.
 
-**Halt point after Task 2.5 (2026-10-23):** `strata::kernels::native_mmvq type 14` (IQ2_S) — the
+**Halt point after Task 2.5 (2026-10-23):** `strata::kernels::native_mmvq type 14` (Q6_K) — the
 pre-digested guess (#8 axpy) did NOT hold: gdn_step cleared, and the model's next demand is the
 mmvq family's third type (the table's #4 row: iq2_xxs=16 and q5_k=13 ported; 14 now demanded
 before any poly elementwise). gdn_step ported as the five-kernel chain of src/poly/kernels.cu
