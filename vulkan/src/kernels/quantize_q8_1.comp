@@ -1,0 +1,92 @@
+// vulkan/src/poly/kernels/quantize_q8_1.comp - the q8_1 activation quantizer.
+//
+// The line-by-line translation of src/kernels/cuda/native_mmvq.cu's native_quantize_q8_1_kernel
+// (lines 169-184) with warp_max (161-167), warp_sum (153-158) and include/strata/kernels/
+// q8_1_finite.hpp: one thread an element i, one warp (32) a Q8_1 block:
+//   amax = warp_max(fabsf(xi))  xor tree 16,8,4,2,1        -> subgroupShuffleXor(max) same order
+//   sum  = warp_sum(xi)                                    -> same order
+//   d    = q8_1_finite(amax / 127.0f)                      -> fabs>65504 ? copysign(65504,v) : v
+//   q    = amax==0 ? 0 : clamp(roundf(xi/d), +-127)        -> GLSL round() ties away from zero like
+//                                                            CUDA roundf(); plain / (no fast-math here)
+//   y[i/32].qs[i%32] = q                                   byte lane of the block's qs word
+//   i%32==0: y[i/32].ds = half2(f16(d), f16(sum))          packHalf2x16's (x=low) == make_half2 order
+// Q81Block is 36 bytes (static_assert native_mmvq.cu:130): word 0 = ds, words 1..8 = qs[0..31].
+// glslc's baseline rejects ubyte arrays in std430 (PORT-NOTES), so qs lives as uint words: the
+// 4 lanes of a byte-column cooperate - lane j%4==0 gathers its 3 successors' q bits with
+// shuffleXor(1), (2), (3) (register reads, no memory RMW race) and writes the whole word.
+//
+// force_subgroup32 = true in the launcher: the CUDA body assumes warp 32 (n_in % 32 == 0 keeps
+// whole warps past the early return, so with 32-wide subgroups every shuffle partner is active).
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+layout(local_size_x = 256) in;   // QUANT_THREADS
+
+layout(std430, binding = 0) readonly buffer X { float v[]; } bx;
+layout(std430, binding = 1) buffer Y { uint v[]; } by;   // 9 uints a Q81Block
+
+layout(push_constant) uniform PC { uint n_total; } pc;
+
+// CUDA copysignf, spelled for GLSL (no copysign builtin): the branch is only taken when
+// abs(v) > 65504, where v is finite and its sign is well defined.
+float q8_1_finite(float v) { return abs(v) > 65504.0 ? (v < 0.0 ? -65504.0 : 65504.0) : v; }
+
+// f32 -> f16 bits, round-to-nearest-even over the finite range (the CUDA __float2half rule).
+uint f16_rn_bits(float f) {
+    const uint b = floatBitsToUint(f);
+    const uint sign = (b >> 16u) & 0x8000u;
+    int exp = int((b >> 23u) & 0xFFu) - 127 + 15;
+    uint man = b & 0x7FFFFFu;
+    if (exp >= 31) return sign | 0x7C00u;                 // overflow -> infinity
+    if (exp <= 0) {                                       // subnormal/underflow: shift-and-round
+        man |= 0x800000u;
+        const uint sh = uint(1 - exp) + 13u;              // dropped bits beyond the 10 kept
+        uint h = (sh >= 32u) ? 0u : (man >> sh);
+        const uint rem = (sh >= 32u) ? 0u : (man & ((1u << sh) - 1u));
+        if (sh < 32u && (rem > (1u << (sh - 1u)) || (rem == (1u << (sh - 1u)) && (h & 1u) != 0u))) h++;
+        return sign | h;
+    }
+    uint hman = man >> 13u; uint rem = man & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (hman & 1u) != 0u)) { hman++; if (hman == 0x400u) { hman = 0u; exp++; if (exp >= 31) return sign | 0x7C00u; } }
+    return sign | (uint(exp) << 10u) | hman;
+}
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n_total) return;   // n_total is a multiple of 32: only whole warps return
+    const float xi = bx.v[i];
+
+    float m = abs(xi);
+    float s = xi;
+    for (uint o = 16u; o > 0u; o >>= 1u) {
+        m = max(m, subgroupShuffleXor(m, o));
+        s += subgroupShuffleXor(s, o);
+    }
+
+    // RADV's fp32 / is NOT correctly rounded (SPIRV allows the reciprocal path; the SYCL port hit the
+    // same, docs/INTEL.md: quantize_act went from 303k mismatches to byte-exact once divide was made
+    // exact). Compute through the correctly-rounded double path and round ONCE to float: double
+    // rounding is wrong only with ~2^-29 probability and never for these operands in tests.
+    const float d = q8_1_finite(float(double(m) / 127.0));
+    uint qb;
+    if (m == 0.0) {
+        qb = 0u;
+    } else {
+        float qf = round(float(double(xi) / double(d)));   // same: exact divide, GLSL round == CUDA roundf
+        qf = qf > 127.0 ? 127.0 : (qf < -127.0 ? -127.0 : qf);
+        qb = uint(int(qf)) & 255u;
+    }
+
+    const uint j = i & 31u;           // the element's lane in its Q8_1 block
+    const uint w0 = (i >> 5u) * 9u;   // the block's first word (36 bytes = 9 uints)
+
+    const uint g1 = subgroupShuffleXor(qb, 1u);
+    const uint g2 = subgroupShuffleXor(qb, 2u);
+    const uint g3 = subgroupShuffleXor(qb, 3u);
+    if ((j & 3u) == 0u) by.v[w0 + 1u + (j >> 2u)] = qb | (g1 << 8u) | (g2 << 16u) | (g3 << 24u);
+    // packHalf2x16 TRUNCATES here (measured on RADV: 3.937008f -> 0x43DF, one ULP under RN 0x43E0,
+    // on every negative-magnitude block); CUDA __float2half is round-to-nearest-even. Encode RN by
+    // hand (finite inputs; ties to even), low half = d, high half = q8_1_finite(s), make_half2 order.
+    if (j == 0u) by.v[w0] = f16_rn_bits(d) | (f16_rn_bits(q8_1_finite(s)) << 16u);
+}

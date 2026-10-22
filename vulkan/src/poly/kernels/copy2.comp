@@ -1,0 +1,25 @@
+// vulkan/src/poly/kernels/copy2.comp - the poly staging copy, two vectors in one launch.
+//
+// The line-by-line translation of src/poly/kernels.cu's copy2_kernel (lines 859-864): the elements are
+// uint32 words (the CUDA wrapper casts x0..y1 to uint32_t* before launching), the thread id maps
+// 0..n0-1 onto the first pair and n0..n0+n1-1 onto the second. block 256 = the .cu's blockDim.
+//
+// The HOST side of the launcher decides which pairs actually reach this kernel: the engine's copy2
+// calls mix pinned host pointers and arena device pointers (CUDA's unified addressing lets its device
+// kernel read pinned memory; a Vulkan kernel cannot), so the launcher runs a kernel ONLY for pairs
+// whose four pointers are all arena-side and takes the runtime's staged copies for the rest.
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer X0 { uint v[]; } b0;
+layout(std430, binding = 1) buffer Y0 { uint v[]; } b1;
+layout(std430, binding = 2) buffer X1 { uint v[]; } b2;
+layout(std430, binding = 3) buffer Y1 { uint v[]; } b3;
+
+layout(push_constant) uniform PC { uint n0; uint n1; } pc;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i < pc.n0) b1.v[i] = b0.v[i];
+    else if (i - pc.n0 < pc.n1) b3.v[i - pc.n0] = b2.v[i - pc.n0];
+}

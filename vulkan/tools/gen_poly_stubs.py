@@ -110,6 +110,11 @@ void* blas_create(void* stream) {
 void blas_destroy(void* blas) { if (blas) cublasDestroy((cublasHandle_t) blas); }
 }"""}
     poly = [d for d in poly if d["qual"].rsplit("::", 1)[1] not in HOST]
+    # PORTED: entry points with a real Vulkan launcher (mirrors gen_stubs.py's rule; the launcher
+    # file named, so the exclusion is auditable).  Regenerate after porting one: add the name, re-run.
+    PORTED = {"copy2": "vulkan/src/poly/kernels/copy2_vk.cpp",
+              "rms_norm": "vulkan/src/poly/kernels/rms_norm_vk.cpp"}
+    poly = [d for d in poly if d["qual"].rsplit("::", 1)[1] not in PORTED]
     # every header contract function must appear; the ones WITH bodies (inline helpers) do not need traps
     with open(HDR) as f:
         hdr_text = f.read()

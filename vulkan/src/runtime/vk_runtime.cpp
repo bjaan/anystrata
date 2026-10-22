@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -176,7 +177,11 @@ Arena::Arena() {}
 Arena::~Arena() {}
 Arena& Arena::instance() { static Arena a; return a; }
 
-void* stream_create() { return nullptr; }
+// streams: the device has one queue, but native_mmvq's validate_stream() demands non-null stream
+// handles from the engine's cudaStreamCreateWithFlags sites - hand out distinct tokens so host code
+// keeps its CUDA-shaped discipline; all of them are the same queue underneath.
+std::atomic<uint64_t> g_stream_token{1};
+void* stream_create() { return (void*)(uintptr_t) g_stream_token.fetch_add(1); }
 void stream_destroy(void*) {}
 void stream_sync(void*) { RT(vkQueueWaitIdle((VkQueue)vk_default_queue())); }
 void device_sync() { RT(vkDeviceWaitIdle((VkDevice)vk_handle())); }

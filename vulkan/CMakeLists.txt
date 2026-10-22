@@ -80,11 +80,24 @@ target_link_libraries(strata_vk_compat INTERFACE strata_vk_runtime strata_vk_bla
 
 # ---- the kernels: each .comp -> .spv -> an embedded array + a host launcher .vk.cpp
 function(strata_vk_kernel name)
-  set(comp ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/${name}.comp)
+  cmake_parse_arguments(K "" "SRC_DIR;COMP;LAUNCHER" "" ${ARGN})
+  set(_srcdir ${K_SRC_DIR})
+  if(NOT _srcdir)
+    set(_srcdir ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels)
+  endif()
+  set(_comp ${K_COMP})
+  if(NOT _comp)
+    set(_comp ${name}.comp)
+  endif()
+  set(_launcher ${K_LAUNCHER})
+  if(NOT _launcher)
+    set(_launcher src/kernels/${name}_vk.cpp)
+  endif()
+  set(comp ${_srcdir}/${_comp})
   set(spv  ${CMAKE_CURRENT_BINARY_DIR}/spv/${name}.spv)
   add_custom_command(OUTPUT ${spv}
     COMMAND ${CMAKE_COMMAND} -E env VK_GLSLC_MODE=${GLSLC_MODE} VK_GLSLC_TOOL=${GLSLC_TOOL}
-            ${VK_GLSLC} --target-env=vulkan1.0 -O ${comp} -o ${spv}
+            ${VK_GLSLC} --target-env=vulkan1.3 -O ${comp} -o ${spv}
     DEPENDS ${comp} ${VK_GLSLC}
     COMMENT "vk-glslc(${GLSLC_MODE}) ${name}.comp")
   set(inc ${CMAKE_CURRENT_BINARY_DIR}/spv/${name}.spv.h)
@@ -92,13 +105,39 @@ function(strata_vk_kernel name)
     COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${spv} ${inc} ${name}
     DEPENDS ${spv}
     COMMENT "embed ${name}.spv")
-  add_library(strata_vk_kernel_${name} STATIC src/kernels/${name}_vk.cpp ${inc})
+  add_library(strata_vk_kernel_${name} STATIC ${_launcher} ${inc})
   target_include_directories(strata_vk_kernel_${name} PUBLIC ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
   target_link_libraries(strata_vk_kernel_${name} PUBLIC strata_vk_runtime)
 endfunction()
 
 strata_vk_kernel(s2_gemv)
 strata_vk_kernel(dequant_s2)
+
+# Task 2.1 (Phase 2): the model-demanded decode trio.  copy2 lives in src/poly/kernels/
+# (the poly namespace contract); rms_norm builds ONE launcher lib against four workgroup-size
+# variants (-DRMS_THREADS=N, matching the CUDA launcher's sum_threads(n) choice), compiled at
+# SPIR-V 1.3 for the subgroup shuffle chain.  native_quantize_q8_1 is the strata::kernels contract.
+set(_rms_spvs "")
+foreach(_n 128 256 512 1024)
+  set(_spv ${CMAKE_CURRENT_BINARY_DIR}/spv/rms_norm_${_n}.spv)
+  add_custom_command(OUTPUT ${_spv}
+    COMMAND ${CMAKE_COMMAND} -E env VK_GLSLC_MODE=${GLSLC_MODE} VK_GLSLC_TOOL=${GLSLC_TOOL}
+            ${VK_GLSLC} --target-env=vulkan1.3 -O -DRMS_THREADS=${_n}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels/rms_norm.comp -o ${_spv}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels/rms_norm.comp ${VK_GLSLC}
+    COMMENT "vk-glslc rms_norm.comp RMS_THREADS=${_n}")
+  set(_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/rms_norm_${_n}.spv.h)
+  add_custom_command(OUTPUT ${_inc}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} rms_norm_${_n}
+    DEPENDS ${_spv})
+  list(APPEND _rms_spvs ${_inc})
+endforeach()
+add_library(strata_vk_kernel_rms_norm STATIC src/poly/kernels/rms_norm_vk.cpp ${_rms_spvs})
+target_include_directories(strata_vk_kernel_rms_norm PUBLIC ${STRATA_ROOT}/include ${STRATA_ROOT}/src/poly ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
+target_link_libraries(strata_vk_kernel_rms_norm PUBLIC strata_vk_runtime strata_vk_compat)
+
+strata_vk_kernel(native_quantize_q8_1 COMP quantize_q8_1.comp LAUNCHER src/kernels/native_quantize_q8_1_vk.cpp)
+strata_vk_kernel(copy2 SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels LAUNCHER src/poly/kernels/copy2_vk.cpp)
 
 # ---- the trap roster (Task 1.2): every strata::kernels entry point the PORT-STATUS ledger still marks
 # `todo` gets a definition that names itself and stops the run (missing.cpp; the definitions are
@@ -191,6 +230,19 @@ add_executable(dequant_s2_vk_parity src/tests/dequant_s2_vk_parity.cpp)
 target_include_directories(dequant_s2_vk_parity PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(dequant_s2_vk_parity PRIVATE strata_vk_kernel_dequant_s2 strata_vk_runtime strata_vk_compat)
 add_test(NAME dequant_s2_vk_parity COMMAND dequant_s2_vk_parity --selftest)
+
+# Task 2.1: unit parity for the model-demanded trio (poly's copy2/rms_norm + the q8_1 quantizer).
+add_executable(poly_kernels_vk_parity src/tests/poly_kernels_vk_parity.cpp)
+target_include_directories(poly_kernels_vk_parity PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
+target_link_libraries(poly_kernels_vk_parity PRIVATE strata_vk_kernel_copy2 strata_vk_kernel_rms_norm strata_vk_kernel_native_quantize_q8_1 strata_vk_poly_kernels strata_vk_runtime strata_vk_compat strata_vk_stubs)   # stubs LAST: missing() for the poly trap lib; real launchers already resolved
+# strata_vk_poly_kernels supplies the host-defined sum_threads() the rms_norm launcher asks for; its
+# traps stay dormant here (the test calls only ported entry points).
+add_test(NAME poly_kernels_vk_parity COMMAND poly_kernels_vk_parity)
+
+# scratch diagnostic (not in ctest): one known Q8_1 block, raw bytes.
+add_executable(quant_dump src/tests/quant_dump.cpp)
+target_include_directories(quant_dump PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(quant_dump PRIVATE strata_vk_kernel_native_quantize_q8_1 strata_vk_runtime strata_vk_compat)
 
 # ---- Task 1.2's proof: the trap roster. Arm 1 (default): calling an unported entry point names it
 # and stops the run (exit 86) — checked by a shell wrapper so ctest sees both the name and the code.
@@ -295,6 +347,7 @@ add_executable(strata-poly-vk
 target_include_directories(strata-poly-vk PRIVATE ${STRATA_ROOT}/include ${STRATA_VK_GGML_DIR}/include)
 target_link_libraries(strata-poly-vk PRIVATE
   strata_vk_kernel_s2_gemv strata_vk_kernel_dequant_s2   # real launchers FIRST (link-order rule above)
+  strata_vk_kernel_copy2 strata_vk_kernel_rms_norm strata_vk_kernel_native_quantize_q8_1
   strata_vk_poly_kernels strata_vk_core
   ggml-cpu ggml-base
   strata_vk_compat strata_vk_stubs                      # stubs last: they only let the link complete

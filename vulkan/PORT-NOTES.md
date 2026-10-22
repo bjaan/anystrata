@@ -169,3 +169,22 @@ the arena-offset launchers would misread. `vk_doorbell_probe` (ctest) is the wit
 **Not needed after all** (predicted friction that did not appear): `cudaFuncSetAttribute`,
 `cudaOccupancy*`, `cudaMemcpyToSymbol` device-symbol sites, `__constant__` — the poly host files never
 reach them (they are in the .cu files, which stay uncompiled); dim3/vector types were already in place.
+
+## RADV arithmetic gotchas (Task 2.1, each measured on the BC-250)
+
+1. **`packHalf2x16` TRUNCATES on RADV** — `(3.937008f, -469.0f)` packs to `0x43DF` (one ULP under
+   the round-to-nearest-even `0x43E0`), and it was under on every magnitude-tested block. CUDA's
+   `__float2half` is RN. Any kernel storing fp16 through `packHalf2x16` is one-ULP-off from the CUDA
+   build at zero-tolerance; `quantize_q8_1.comp` carries an explicit `f16_rn_bits` (bit-twiddled RN,
+   finite range) for the two half fields of every Q8_1 block instead.
+2. **fp32 `/` is not correctly rounded here** (SPIRV allows the reciprocal path — the same trap the
+   SYCL port documented: quantize_act 303k mismatches until `-cl-fp32-correctly-rounded-divide-sqrt`).
+   Divides feeding a `round()` (q8_1's `xi / d`, `amax / 127`) go through `double` and back in the
+   kernels.
+3. `glslc`'s `&&` wants bool operands: `(x & 1u)` alone is a compile error — write `(x & 1u) != 0u`.
+4. The parity TEST's reference must model shuffle trees with a per-round copy (`p[j] = l[j]; l[j] =
+   l[j] + p[j^o]`); an in-place `l[j] += l[j^o]` clobbers values later lanes still read and sums the
+   warp wrong.
+5. Streams: `native_mmvq`'s `validate_stream()` REJECTS a null `cudaStream_t`; `stream_create()` now
+   hands out distinct non-null tokens (all the same queue underneath) so host code keeps CUDA-shaped
+   discipline and the validator passes.

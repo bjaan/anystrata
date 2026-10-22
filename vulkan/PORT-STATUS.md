@@ -43,7 +43,8 @@ header helpers, one row per header) | `n/a` (decision `n/a`).
 | iq_xmx_grouped | iq_kernels.hpp | src/kernels/cuda/iq_kernels.cu | native_grouped_parity.cpp | `mma` (matrix-instruction path) | fp32-fallback (docs/AMD_HIP.md: matrix instructions have an ordered-FP32 fallback; CMakeLists.txt tf32-mma fallback at sm_75) | todo |
 | native_expert_grouped / native_expert_layout (mode setters host-side) | iq_kernels.hpp | src/kernels/cuda/iq_kernels.cu | native_expert_parity.cpp, native_grouped_parity.cpp | `__shfl`, `__shared__` | translate | todo |
 | nvfp4 expert path | iq_kernels.hpp (cpu/nvfp4_*.hpp) | (nvfp4 — NVIDIA-only format) | nvfp4_expert_gpu_parity.cpp | NVIDIA nvfp4 format | n/a (nvfp4 is an NVIDIA-only format; gfx1013 has no path) | n/a |
-| q8_1 (native_quantize_q8_1, add_rms_norm_q8_1, swiglu_quantize_q8_1) | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | todo |
+| native_quantize_q8_1 | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu | (unit: poly_kernels_vk_parity.cpp; in-tree family tests cover the mmvq consumers) | `__shfl` (warp chains) | translate | **ported+parity-green** (vulkan/src/kernels/quantize_q8_1.comp, native_quantize_q8_1_vk.cpp) |
+| q8_1 (add_rms_norm_q8_1, swiglu_quantize_q8_1) | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | todo |
 | q4_0 / q5_0 / q8_0 (mmvq + f32 pair) | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | todo |
 | q4_k / q5_k / q6_k / q2_0 / q2_k / q3_k (mmvq + f32 pair) | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | todo |
 | iq4_xs / iq4_nl (mmvq + f32 pair) | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | todo |
@@ -92,7 +93,8 @@ header helpers, one row per header) | `n/a` (decision `n/a`).
 | copy_rows_strided / copy_indexed / fetch_blobs / res_patch / rebase_ptrs / broadcast_streams / add_streams_broadcast / copy_i32_from_mapped_unless / copy_or_zero_from_mapped / copy_row_to_first / gather_rows / map_ids / embedding_gather_dev | verify_kernels.hpp | src/kernels/cuda/verify_kernels.cu | verify_parity.cpp, verify_batch_parity.cpp | `__shfl`, `__shared__`, `__ldg` | translate | todo |
 | launch_pdl / pdl_* (programmatic dependent launch) | pdl.hpp | (host launch glue; pdl helpers) | pdl_parity.cpp | cudaGraph, PDL (programmatic dependent launch) | n/a (NVIDIA PDL/graph feature — run with --no-graphs; the Vulkan port uses its own submission ordering) | n/a |
 | poly: gemv_kernel, dequant_q8_kernel | src/poly/kernels.cu (no include/strata header) | src/poly/kernels.cu | none (poly engine tests) | `__shared__`, `__constant__` | translate | todo |
-| poly: rms_norm_kernel, layer_norm_kernel, bf16_to_f32_kernel, store_f16_kernel/_at, store_q8_kernel/_at, add_bias_kernel, axpy_kernel, copy2_kernel, add_scaled_kernel, mul_sigmoid_kernel, softcap_kernel, likeliest_kernel | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | todo |
+| poly: rms_norm, copy2 (launchers) | include/strata/poly/kernels.hpp | src/poly/kernels.cu | unit poly_kernels_vk_parity + model-run advance | `__shfl`, `__shared__` (rms_norm block_sum) | translate | **ported+parity-green** (vulkan/src/poly/kernels/{rms_norm,copy2}.comp, *_vk.cpp) |
+| poly: layer_norm_kernel, bf16_to_f32_kernel, store_f16_kernel/_at, store_q8_kernel/_at, add_bias_kernel, axpy_kernel, add_scaled_kernel, mul_sigmoid_kernel, softcap_kernel, likeliest_kernel | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | todo |
 | poly: hc_mix/read/post/head/mean kernels | src/poly/kernels.cu | src/poly/kernels.cu | hc_persist_parity.cpp (host-side contract) | `__shfl`, `__shared__` | translate | todo |
 | poly: kda_conv/_rows/_state, kda_step/gates/state/out kernels | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | todo |
 | poly: gdn_norm/gates/state/state_reg/out kernels | src/poly/kernels.cu | src/poly/kernels.cu | gdn_parity.cpp (host-side contract) | `__shfl`, `__shared__` | translate | todo |
@@ -194,9 +196,9 @@ Re-run with `STRATA_VK_STUBS=log` enumerates the rest of the qwen35moe decode pa
 
 | # | kernel demanded by the run | row above |
 |---|---|---|
-| 1 | `strata::poly::copy2` | poly: copy2_kernel (rms_norm/elementwise staging) |
-| 2 | `strata::poly::rms_norm` | poly: rms_norm_kernel |
-| 3 | `strata::kernels::native_quantize_q8_1` | q8_1 (native_quantize_q8_1, …) |
+| 1 | `strata::poly::copy2` | poly: copy2_kernel — **PORTED (Task 2.1)** |
+| 2 | `strata::poly::rms_norm` | poly: rms_norm_kernel — **PORTED (Task 2.1)** |
+| 3 | `strata::kernels::native_quantize_q8_1` | q8_1 (native_quantize_q8_1, …) — **PORTED (Task 2.1)** |
 | 4 | `strata::kernels::native_mmvq` | native_mmvq / _pair / _slots / _ids |
 | 5 | `strata::poly::gemv_f32` | poly: gemv_kernel |
 | 6 | `strata::poly::conv4_silu` | poly: conv4_silu/_rows/_state kernels |
@@ -213,6 +215,11 @@ Re-run with `STRATA_VK_STUBS=log` enumerates the rest of the qwen35moe decode pa
 
 (The log arm returns untouched outputs, so entries after #1 are the path's *shape*, not a
 guaranteed per-token sequence; the first trap, `copy2`, is exact — the default arm stops there.)
+
+**Halt point after Task 2.1 (2026-10-22):** `strata::kernels::native_mmvq` (demand #4) — the trio
+above cleared, 9/9 ctest, model load unaffected. NOTE the load time swung 82 s -> 332 s on this run
+(same command, same file; swap/THP noise on a 14 GiB box under desktop load) — the harness timing
+story, not a port regression: gate the port by the HALT POINT moving, not by load seconds.
 
 Phase-2 first picks by demand order: `copy2`, `rms_norm`, then the mmvq family
 (`native_quantize_q8_1`, `native_mmvq`) — matching the plan's expectation (quantize_act /

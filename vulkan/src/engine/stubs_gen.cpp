@@ -308,7 +308,6 @@ namespace strata::kernels { void native_qsa_score(const float * p0, const float 
 namespace strata::kernels { bool native_qsa_score_enabled() { strata::vk_engine::missing("strata::kernels::native_qsa_score_enabled"); return {}; } }
 namespace strata::kernels { void native_qsa_score_set_enabled(bool p0) { strata::vk_engine::missing("strata::kernels::native_qsa_score_set_enabled"); } }
 namespace strata::kernels { void native_qsa_set_enabled(bool p0) { strata::vk_engine::missing("strata::kernels::native_qsa_set_enabled"); } }
-namespace strata::kernels { void native_quantize_q8_1(const float * p0, void * p1, int p2, int p3, void * p4) { strata::vk_engine::missing("strata::kernels::native_quantize_q8_1"); } }
 namespace strata::kernels { void native_quantize_q8_1_il(const float * p0, void * p1, void * p2, int p3, int p4, void * p5) { strata::vk_engine::missing("strata::kernels::native_quantize_q8_1_il"); } }
 namespace strata::kernels { void native_rope_apply(const float * p0, float * p1, int p2, int p3, int p4, const RopeScaling & p5, const int * p6, void * p7) { strata::vk_engine::missing("strata::kernels::native_rope_apply"); } }
 namespace strata::kernels { bool native_rope_enabled() { strata::vk_engine::missing("strata::kernels::native_rope_enabled"); return {}; } }
