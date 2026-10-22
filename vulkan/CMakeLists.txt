@@ -214,6 +214,37 @@ add_custom_target(mmvq_q5_k.spv_h DEPENDS ${_q5k_inc})
 add_dependencies(strata_vk_kernel_native_mmvq mmvq_q5_k.spv_h)
 strata_vk_kernel(copy2 SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels LAUNCHER src/poly/kernels/copy2_vk.cpp)
 
+# Task 2.5: poly gdn_step — five CUDA kernels, one launcher lib. gdn_norm/gdn_out compile per dim
+# (32..256 in 32s: block_sum's part[] walk counts warps off blockDim.x, so the workgroup size IS
+# the fp contract, like the gemv sizes); gdn_state as plain + reg<1,2,4,8> variants (the CUDA
+# wrapper's switch (dim/WARP)), threads = columns*WARP = 1024 for every legal dim.
+set(_gdn_spvs "")
+macro(_gdn_variant comp out_name)   # ARGN = extra glslc -D flags
+  set(_spv ${CMAKE_CURRENT_BINARY_DIR}/spv/${out_name}.spv)
+  add_custom_command(OUTPUT ${_spv}
+    COMMAND ${CMAKE_COMMAND} -E env VK_GLSLC_MODE=${GLSLC_MODE} VK_GLSLC_TOOL=${GLSLC_TOOL}
+            ${VK_GLSLC} --target-env=vulkan1.3 -O ${ARGN}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels/${comp} -o ${_spv}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels/${comp} ${VK_GLSLC})
+  set(_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/${out_name}.spv.h)
+  add_custom_command(OUTPUT ${_inc}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} ${out_name}
+    DEPENDS ${_spv})
+  list(APPEND _gdn_spvs ${_inc})
+endmacro()
+foreach(_d 32 64 96 128 160 192 224 256)
+  _gdn_variant(gdn_norm.comp gdn_norm_${_d} -DGDNDIM=${_d})
+  _gdn_variant(gdn_out.comp gdn_out_${_d} -DGDNDIM=${_d})
+endforeach()
+_gdn_variant(gdn_gates.comp gdn_gates)
+_gdn_variant(gdn_state.comp gdn_state_plain -DGDN_VARIANT=0 -DGDNS_THREADS=1024)
+foreach(_p 1 2 4 8)
+  _gdn_variant(gdn_state.comp gdn_state_reg_${_p} -DGDN_VARIANT=1 -DGDNS_REG_PER=${_p} -DGDNS_THREADS=1024)
+endforeach()
+add_library(strata_vk_kernel_gdn STATIC src/poly/kernels/gdn_vk.cpp ${_gdn_spvs})
+target_include_directories(strata_vk_kernel_gdn PUBLIC ${STRATA_ROOT}/include ${STRATA_ROOT}/src/poly ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
+target_link_libraries(strata_vk_kernel_gdn PUBLIC strata_vk_runtime strata_vk_compat)
+
 # ---- the trap roster (Task 1.2): every strata::kernels entry point the PORT-STATUS ledger still marks
 # `todo` gets a definition that names itself and stops the run (missing.cpp; the definitions are
 # generated from the headers' exact signatures by vulkan/tools/gen_stubs.py -> src/engine/stubs_gen.cpp).
@@ -319,6 +350,12 @@ target_link_libraries(poly_kernels_vk_parity PRIVATE strata_vk_kernel_copy2 stra
 # strata_vk_poly_kernels supplies the host-defined sum_threads() the rms_norm launcher asks for; its
 # traps stay dormant here (the test calls only ported entry points).
 add_test(NAME poly_kernels_vk_parity COMMAND poly_kernels_vk_parity)
+
+# Task 2.5: gdn_step parity (host-reference transcription of the five-kernel chain, both arms).
+add_executable(poly_gdn_vk_parity src/tests/poly_gdn_vk_parity.cpp)
+target_include_directories(poly_gdn_vk_parity PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
+target_link_libraries(poly_gdn_vk_parity PRIVATE strata_vk_kernel_gdn strata_vk_poly_kernels strata_vk_runtime strata_vk_compat strata_vk_stubs)
+add_test(NAME poly_gdn_vk_parity COMMAND poly_gdn_vk_parity)
 
 # scratch diagnostic (not in ctest): one known Q8_1 block, raw bytes.
 add_executable(quant_dump src/tests/quant_dump.cpp)
@@ -430,7 +467,7 @@ target_link_libraries(strata-poly-vk PRIVATE
   strata_vk_kernel_s2_gemv strata_vk_kernel_dequant_s2   # real launchers FIRST (link-order rule above)
   strata_vk_kernel_copy2 strata_vk_kernel_rms_norm strata_vk_kernel_native_quantize_q8_1
   strata_vk_kernel_native_mmvq
-  strata_vk_kernel_gemv strata_vk_kernel_conv4_silu
+  strata_vk_kernel_gemv strata_vk_kernel_conv4_silu strata_vk_kernel_gdn
   strata_vk_poly_kernels strata_vk_core
   ggml-cpu ggml-base
   strata_vk_compat strata_vk_stubs                      # stubs last: they only let the link complete

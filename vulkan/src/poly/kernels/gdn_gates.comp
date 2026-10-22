@@ -1,0 +1,27 @@
+// vulkan/src/poly/kernels/gdn_gates.comp - gdn_step's gates, a translation of
+// src/poly/kernels.cu:2002 gdn_gates_kernel: one thread a (token, value head), flat 256-thread
+// blocks (grid(gates, 256) - no reductions, so the launch shape does not touch the numbers).
+//   g = alpha[at] + dt[h]
+//   alpha[at] = expf((g > 20 ? g : logf(1 + expf(g))) * a[h])     softplus, capped arm, then exp
+//   beta[at]  = sigmoid(beta[at]) = 1/(1+expf(-beta))
+// CUDA expf/logf are software (~1 ULP) and RADV's Exp/Log lowering differs at that level; the
+// parity tolerance is the tree's rel 1e-5 (conv4_silu's sigmoid precedent measured 5.9e-7).
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer ALPHA { float v[]; } balpha;   // rows*n_head, decay in place
+layout(std430, binding = 1) buffer BETA { float v[]; } bbeta;     // rows*n_head, share in place
+layout(std430, binding = 2) readonly buffer DT { float v[]; } bdt;      // n_head
+layout(std430, binding = 3) readonly buffer A { float v[]; } ba;        // n_head
+
+layout(push_constant) uniform PC { uint n_head; uint gates; } pc;
+
+void main() {
+    const uint at = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+    if (at >= pc.gates) return;
+    const uint h = at % pc.n_head;
+    const float g = balpha.v[at] + bdt.v[h];
+    balpha.v[at] = exp((g > 20.0 ? g : log(1.0 + exp(g))) * ba.v[h]);
+    bbeta.v[at] = 1.0 / (1.0 + exp(-bbeta.v[at]));
+}

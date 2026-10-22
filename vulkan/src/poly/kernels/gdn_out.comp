@@ -1,0 +1,38 @@
+// vulkan/src/poly/kernels/gdn_out.comp - gdn_step's last kernel: the output's RMS norm, its
+// o_norm weights and the silu(z) gate. A line-by-line translation of src/poly/kernels.cu:2118
+// gdn_out_kernel: one workgroup a (token, value head), size EXACTLY dim (<<<rows*n_head, dim>>>),
+// block_sum's part[] warp count again pinned via -DGDNDIM.
+//   os = block_sum(o*o)
+//   out[at] = o / sqrtf(os / float(dim) + norm_eps) * o_norm[threadIdx.x] * (gate * sigmoid(gate))
+// left-to-right: ((o/scale_rms) * o_norm) * (z * sigmoid(z)).
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+layout(local_size_x = GDNDIM) in;
+
+layout(std430, binding = 0) buffer OUT { float v[]; } bout;               // rows * dim*n_head, in place
+layout(std430, binding = 1) readonly buffer Z { float v[]; } bz;          // rows * dim*n_head
+layout(std430, binding = 2) readonly buffer ONORM { float v[]; } bon;     // dim
+
+layout(push_constant) uniform PC { uint dim; uint d_inner; uint eps_bits; uint pad0; } pc;
+
+shared float part[GDNDIM / 32];
+
+void main() {
+    const uint at = gl_WorkGroupID.x * pc.dim + gl_LocalInvocationID.x;
+    const float o = bout.v[at];
+    const float eps = uintBitsToFloat(pc.eps_bits);
+
+    float ss = o * o;
+    for (uint q = 16u; q > 0u; q >>= 1u) ss += subgroupShuffleXor(ss, q);
+    if ((gl_LocalInvocationID.x & 31u) == 0u) part[gl_LocalInvocationID.x >> 5u] = ss;
+    barrier();
+    float s = 0.0;
+    for (uint wkt = 0u; wkt < GDNDIM / 32u; ++wkt) s += part[wkt];
+    const float os = s;
+
+    const float gate = bz.v[at];
+    bout.v[at] = o / sqrt(os / float(pc.dim) + eps) * bon.v[gl_LocalInvocationID.x]
+               * (gate * (1.0 / (1.0 + exp(-gate))));
+}

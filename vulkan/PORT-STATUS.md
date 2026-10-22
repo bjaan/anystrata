@@ -98,7 +98,7 @@ header helpers, one row per header) | `n/a` (decision `n/a`).
 | poly: layer_norm_kernel, bf16_to_f32_kernel, store_f16_kernel/_at, store_q8_kernel/_at, add_bias_kernel, axpy_kernel, add_scaled_kernel, mul_sigmoid_kernel, softcap_kernel, likeliest_kernel | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | todo |
 | poly: hc_mix/read/post/head/mean kernels | src/poly/kernels.cu | src/poly/kernels.cu | hc_persist_parity.cpp (host-side contract) | `__shfl`, `__shared__` | translate | todo |
 | poly: kda_conv/_rows/_state, kda_step/gates/state/out kernels | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | todo |
-| poly: gdn_norm/gates/state/state_reg/out kernels | src/poly/kernels.cu | src/poly/kernels.cu | gdn_parity.cpp (host-side contract) | `__shfl`, `__shared__` | translate | todo |
+| poly: gdn_norm/gates/state/state_reg/out kernels | src/poly/kernels.cu | src/poly/kernels.cu | gdn_parity.cpp (host-side contract) | `__shfl`, `__shared__` | translate | **gdn_step PORTED (Task 2.5): gdn_norm.comp/gdn_gates.comp/gdn_state.comp (plain+reg<1,2,4,8>)/gdn_out.comp + gdn_vk.cpp; unit poly_gdn_vk_parity rel_l1 <= 1.6e-7 vs both contraction arms (tree tol 1e-5)** |
 | poly: conv4_silu/_rows/_state, shortconv/_rows/_state kernels | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | **conv4_silu (all three kernels: walk/rows/state) ported (Task 2.4): vulkan/src/poly/kernels/conv4_silu.comp, conv4_state.comp, conv4_silu_vk.cpp, unit poly_kernels_vk_parity rel 5.9e-7 (tree tol 1e-5); shortconv todo** |
 | poly: swiglu_clamp/_rows, geglu/_rows kernels | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | none | translate | todo |
 | poly: dsa_keys/softmax, idx_store/pool/weigh, route_kernel, moe_sum_kernel | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | todo |
@@ -203,7 +203,8 @@ Re-run with `STRATA_VK_STUBS=log` enumerates the rest of the qwen35moe decode pa
 | 4 | `strata::kernels::native_mmvq` | native_mmvq / _pair / _slots / _ids — **iq2_xxs (type 16) PORTED (Task 2.2)**; other types trap-by-name |
 | 5 | `strata::poly::gemv_f32` | poly: gemv_kernel — **PORTED (Task 2.4)** |
 | 6 | `strata::poly::conv4_silu` | poly: conv4_silu/_rows/_state kernels — **PORTED (Task 2.4)** |
-| 7 | `strata::poly::gdn_step` | poly: gdn_norm/gates/state/state_reg/out kernels |
+| 7 | `strata::poly::gdn_step` | poly: gdn_norm/gates/state/state_reg/out kernels — **PORTED (Task 2.5)** |
+| 7b | `strata::kernels::native_mmvq` type 14 (IQ2_S) | native_mmvq family — the model's NEW halt (the pre-digested #8 axpy guess did not hold: qwen35moe's shared-expert/dense mmvq path asks type 14 next) |
 | 8 | `strata::poly::axpy` | poly: axpy_kernel |
 | 9 | `strata::poly::swiglu_clamp` | poly: swiglu_clamp/_rows |
 | 10 | `strata::poly::mul_sigmoid` | poly: mul_sigmoid_kernel |
@@ -254,6 +255,28 @@ values — RADV/GFX1013 turns FMA back into mul+add here), 2.9e-4 vs the fma arm
 1e-5 gemv-family tol against the closer arm (never looser). ctest 10/10. Model load 126 s, halt
 moved #5 -> gdn_step (demand #7): the gate passed gemv_f32 and conv4_silu — gdn_step is what
 qwen35moe's recurrent layers ask for next.
+
+**Halt point after Task 2.5 (2026-10-23):** `strata::kernels::native_mmvq type 14` (IQ2_S) — the
+pre-digested guess (#8 axpy) did NOT hold: gdn_step cleared, and the model's next demand is the
+mmvq family's third type (the table's #4 row: iq2_xxs=16 and q5_k=13 ported; 14 now demanded
+before any poly elementwise). gdn_step ported as the five-kernel chain of src/poly/kernels.cu
+(:1988 norm, :2002 gates, :2017 state / :2058 state_reg<PER>, :2118 out) — gdn_norm.comp +
+gdn_out.comp compile per dim (32..256 in 32s: block_sum's part[] warp count IS the fp contract),
+gdn_state.comp as plain + reg<1,2,4,8> variants (the CUDA wrapper's `switch (dim / WARP)`,
+threads = columns*32 = 1024, one warp a column of the dim x dim state, the warp walking the
+tokens; snapshots per snap_of(), stride = rec_n_ = n_head*dim*dim floats), gdn_gates.comp
+elementwise. Shuffle trees force_subgroup32=false (offsets <= 16 stay warp-aligned, the rms_norm
+reasoning). Unit poly_gdn_vk_parity (new ctest): model shape dim=128 nh=32 kh=16 (the GGUF's
+ssm.state_size/group_count/time_step_rank) rows=1/5/8 + snapshots 0x41, plus dim=32/64 (reg arms)
+and 96 (plain arm) — the device matches the closer host arm at tree rel_l1 <= 1.6e-7 (worst
+ABSOLUTE deviation 7e-7 = ~4 ULP; exp/softplus/sqrt transcendental deltas dominate, contraction is
+secondary here), the tree's OWN metric (gdn_parity.cpp:88 rel_l1 = sum|d|/sum|ref|, tol 1e-5 at
+:202-203 — per-element rel with the 1e-3 floor is NOT the GDN row's bound: the RMS norm's
+1/sqrt(sum) divides small cells, so cancellation cells read 1e-4 per-element while the tensor's
+rel_l1 sits at 1e-7; never looser, it is the tree's number). NOT bitwise: the reg kernel's
+explicit __fma spellings vs RADV's lowering land between the arms (Task 2.4's measurement
+pattern; both arms tested, closer one governs). ctest 11/11. Model load 87 s; the gate cleared
+#7 and named `native_mmvq type 14` — demand 7b, port iq2_s before the poly elementwise trio.
 
 Phase-2 first picks by demand order: `copy2`, `rms_norm`, then the mmvq family
 (`native_quantize_q8_1`, `native_mmvq`) — matching the plan's expectation (quantize_act /

@@ -1,0 +1,136 @@
+// vulkan/src/poly/kernels/gdn_state.comp - gdn_step's state walk: the delta-rule update of every
+// value head's dim x dim state, one warp a COLUMN, the block walking the tokens. Translation of
+// src/poly/kernels.cu:2017 gdn_state_kernel (GDN_VARIANT=0) and :2058 gdn_state_reg_kernel<PER>
+// (GDN_VARIANT=1, PER = dim/32 register variant, -DGDNS_REG_PER=N). The CUDA wrapper (:2708) picks
+// reg<1>/<2>/<4>/<8> for dim/WARP = 1/2/4/8 and the plain kernel otherwise — the launcher mirrors
+// that switch EXACTLY; the reg kernel's comment ("The sums go in the same order, so the result is
+// the same to the bit") is what makes either arm a faithful reference for the other.
+//
+// Per column j of head h (warp w, lane l), each token row:
+//   sk = sum_{i=l; i<dim; i+=32} col[i] * dc * kn[i]        -> warp_sum (xor 16..1)
+//   d  = (v - sk) * share
+//   per i: n = col[i] * dc + kn[i] * d; col[i] = n; (snap[i] = n); o += n * qn[i]  -> warp_sum
+//   lane 0: out[row][h*dim + j] = o
+// Contraction law #6 (+ its Task-2.4 refinement): write the CUDA term order unfused for the plain
+// arm; the reg arm carries CUDA's explicit __fmul_rn/__fmaf_rn spellings, transcribed as fma() —
+// whether RADV keeps or lowers them is measured by the parity test against both host arms.
+// In the plain arm CUDA's `sk += col[i] * dc * kn[i]` compiles as acc = fmaf(col*dc, kn, acc) with
+// fmad ON; `sk = warp_sum(sk)` and the o-chain `o += n * qn[i]` likewise. The .comp below spells
+// what the reference host code will measure against; the launcher picks reg vs plain exactly as the
+// CUDA wrapper does, and dim=128 (the model) takes the reg<4> path.
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+#ifndef GDN_VARIANT
+#define GDN_VARIANT 0
+#endif
+#if GDN_VARIANT == 1
+#ifndef GDNS_REG_PER
+#define GDNS_REG_PER 4
+#endif
+#endif
+
+layout(local_size_x = GDNS_THREADS) in;   // = columns * 32 (the CUDA `threads`), e.g. 1024
+
+layout(std430, binding = 0) readonly buffer QKV { float v[]; } bqkv;      // rows x row_n (normed q,k; v untouched)
+layout(std430, binding = 1) readonly buffer DECAY { float v[]; } bdec;    // rows*n_head (alpha after gates)
+layout(std430, binding = 2) readonly buffer SHARE { float v[]; } bshr;    // rows*n_head (beta after gates)
+layout(std430, binding = 3) buffer S { float v[]; } bs;                   // n_head*dim*dim, updated
+layout(std430, binding = 4) buffer OUT { float v[]; } bout;               // rows * dim*n_head (pre-norm o)
+layout(std430, binding = 5) buffer SNAP { float v[]; } bsnap;             // unused when snaps==0 (bound to OUT)
+
+// dim, n_head, k_heads, rows, columns, stride_lo, stride_hi, snaps
+layout(push_constant) uniform PC {
+    uint dim; uint n_head; uint k_heads; uint rows;
+    uint columns; uint stride_lo; uint stride_hi; uint snaps;
+} pc;
+
+float warp_sum(float x) {
+    for (uint o = 16u; o > 0u; o >>= 1u) x += subgroupShuffleXor(x, o);
+    return x;
+}
+
+void main() {
+    const uint warps_per_block = GDNS_THREADS / 32u;
+    const uint per_head = pc.dim / warps_per_block;            // blocks a head
+    const uint h = gl_WorkGroupID.x / per_head;
+    const uint hk = h % pc.k_heads;
+    const uint j = (gl_WorkGroupID.x % per_head) * warps_per_block + gl_LocalInvocationID.x / 32u;
+    const uint lane = gl_LocalInvocationID.x & 31u;
+    if (j >= pc.dim) return;                                   // whole warp exits (as CUDA)
+    const uint keys = pc.dim * pc.k_heads, d_inner = pc.dim * pc.n_head;
+    const uint row_n = 2u * keys + d_inner;
+    const uint mine = (h * pc.dim + j) * pc.dim;
+    const uint cbase = mine;   // index into bs: mine + i
+
+#if GDN_VARIANT == 0
+    // gdn_state_kernel: the column lives in memory; a lane holds every 32nd value of it.
+    for (uint row = 0u; row < pc.rows; ++row) {
+        const uint x = row * row_n;
+        const uint qn = x + hk * pc.dim;
+        const uint kn = x + keys + hk * pc.dim;
+        const float v = bqkv.v[x + 2u * keys + h * pc.dim + j];
+        const float dc = bdec.v[row * pc.n_head + h];
+        float sk = 0.0;
+        for (uint i = lane; i < pc.dim; i += 32u)
+            sk += bs.v[cbase + i] * dc * bqkv.v[kn + i];       // CUDA: (col*dc)*kn then into the acc
+        sk = warp_sum(sk);
+        const float d = (v - sk) * bshr.v[row * pc.n_head + h];
+        float o = 0.0;
+        // snap_of(): stride fits uint32 (the launcher throws if not), so the slot offset is uint32
+        // arithmetic like conv4_silu.comp's.
+        uint m = 0xFFFFFFFFu;
+        if (row < 32u && ((pc.snaps >> row) & 1u) != 0u)
+            m = bitCount(pc.snaps & ((1u << row) - 1u)) * pc.stride_lo;
+        for (uint i = lane; i < pc.dim; i += 32u) {
+            const float n = bs.v[cbase + i] * dc + bqkv.v[kn + i] * d;
+            bs.v[cbase + i] = n;
+            if (m != 0xFFFFFFFFu) bsnap.v[m + mine + i] = n;
+            o += n * bqkv.v[qn + i];
+        }
+        o = warp_sum(o);
+        if (lane == 0u) bout.v[row * d_inner + h * pc.dim + j] = o;
+    }
+#else
+    // gdn_state_reg_kernel<GDNS_REG_PER>: the warp's column in registers (PER values a lane) for
+    // the whole walk; the products/sums spelled with CUDA's __fmul_rn/__fmaf_rn, transcribed as
+    // mul()/fma() exactly.
+    const uint dim = pc.dim;
+    float c[GDNS_REG_PER];
+    for (uint k = 0u; k < GDNS_REG_PER; ++k) c[k] = bs.v[cbase + lane + k * 32u];
+    for (uint row = 0u; row < pc.rows; ++row) {
+        // CUDA prefetches row+1's inputs while computing row (a latency trick; the reg kernel's
+        // comment: 'The sums go in the same order, so the result is the same to the bit'). The
+        // fetch is pure loads, so here each row's inputs are read at the top of its body: same
+        // values, same terms, same sums.
+        const uint fx = row * row_n;
+        float qa[GDNS_REG_PER], ka[GDNS_REG_PER];
+        for (uint k = 0u; k < GDNS_REG_PER; ++k) {
+            qa[k] = bqkv.v[fx + hk * dim + lane + k * 32u];
+            ka[k] = bqkv.v[fx + keys + hk * dim + lane + k * 32u];
+        }
+        const float va = bqkv.v[fx + 2u * keys + h * dim + j];
+        const float da = bdec.v[row * pc.n_head + h];
+        const float sa = bshr.v[row * pc.n_head + h];
+        float sk = 0.0;
+        for (uint k = 0u; k < GDNS_REG_PER; ++k) sk = fma(da * c[k], ka[k], sk);   // __fmaf_rn(__fmul_rn(da,c[k]), ka[k], sk)
+        sk = warp_sum(sk);
+        const float d = (va - sk) * sa;                                            // __fmul_rn(__fsub_rn(va,sk), sa)
+        float o = 0.0;
+        uint m = 0xFFFFFFFFu;
+        if (row < 32u && ((pc.snaps >> row) & 1u) != 0u)
+            m = bitCount(pc.snaps & ((1u << row) - 1u)) * pc.stride_lo;
+        for (uint k = 0u; k < GDNS_REG_PER; ++k) {
+            const uint i = lane + k * 32u;
+            const float n = fma(da, c[k], ka[k] * d);     // __fmaf_rn(da, c[k], __fmul_rn(ka[k], d))
+            c[k] = n;
+            if (m != 0xFFFFFFFFu) bsnap.v[m + mine + i] = n;
+            o = fma(n, qa[k], o);                          // __fmaf_rn(n, qa[k], o)
+        }
+        o = warp_sum(o);
+        if (lane == 0u) bout.v[row * d_inner + h * dim + j] = o;
+    }
+    for (uint k = 0u; k < GDNS_REG_PER; ++k) bs.v[cbase + lane + k * 32u] = c[k];
+#endif
+}

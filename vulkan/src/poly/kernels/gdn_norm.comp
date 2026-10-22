@@ -1,0 +1,54 @@
+// vulkan/src/poly/kernels/gdn_norm.comp - gdn_step's first kernel: the L2 of every key head's q and k,
+// a line-by-line translation of src/poly/kernels.cu:1988 gdn_norm_kernel with block_sum (:42) and
+// warp_sum (:34): one workgroup a (token, key head), workgroup size EXACTLY dim (the CUDA launch is
+// <<<rows*k_heads, dim>>>; the part[] walk's warp count is part of the fp contract, so the build
+// compiles -DGDNDIM=N for 32/64/128/256 like the gemv sizes).
+//   qs = block_sum(q*q), ks = block_sum(k*k)     xor tree 16..1 per warp (offsets <=16 never cross a
+//                                                32-lane aligned block even at subgroup 64 - the
+//                                                rms_norm reasoning), then part[0..dim/32) IN ORDER.
+//   *qp = q / sqrtf(qs + norm_eps) * (1.0f / sqrtf(float(dim)))   left-to-right: (q/sqrt)*invsqrt
+//   *kp = k / sqrtf(ks + norm_eps)
+// sqrtf: CUDA's is IEEE-correctly-rounded; gfx1013 V_sqrt_f32 is documented correctly-rounded too.
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+layout(local_size_x = GDNDIM) in;
+
+layout(std430, binding = 0) buffer QKV { float v[]; } bqkv;   // rows x row_n, norms applied in place
+
+layout(push_constant) uniform PC { uint dim; uint k_heads; uint row_n; uint eps_bits; } pc;
+
+shared float part[GDNDIM / 32];
+
+void main() {
+    const uint hk = gl_WorkGroupID.x % pc.k_heads;
+    const uint j = gl_LocalInvocationID.x;
+    const uint base = (gl_WorkGroupID.x / pc.k_heads) * pc.row_n;
+    const uint qp = base + hk * pc.dim + j;
+    const uint kp = base + pc.dim * pc.k_heads + hk * pc.dim + j;
+    const float q = bqkv.v[qp], k = bqkv.v[kp];
+    const float eps = uintBitsToFloat(pc.eps_bits);
+
+    // block_sum(q*q): one term a thread (blockDim.x == dim), warp_sum, ordered part walk.
+    float ss = q * q;
+    for (uint o = 16u; o > 0u; o >>= 1u) ss += subgroupShuffleXor(ss, o);
+    if ((j & 31u) == 0u) part[j >> 5u] = ss;
+    barrier();
+    float s = 0.0;
+    for (uint wkt = 0u; wkt < GDNDIM / 32u; ++wkt) s += part[wkt];
+    barrier();   // part is free again - the second block_sum writes it
+    const float qs = s;
+
+    ss = k * k;
+    for (uint o = 16u; o > 0u; o >>= 1u) ss += subgroupShuffleXor(ss, o);
+    if ((j & 31u) == 0u) part[j >> 5u] = ss;
+    barrier();
+    s = 0.0;
+    for (uint wkt = 0u; wkt < GDNDIM / 32u; ++wkt) s += part[wkt];
+    barrier();
+    const float ks = s;
+
+    bqkv.v[qp] = q / sqrt(qs + eps) * (1.0 / sqrt(float(pc.dim)));
+    bqkv.v[kp] = k / sqrt(ks + eps);
+}
