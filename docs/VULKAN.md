@@ -82,6 +82,8 @@ The route is proven by the S2 GEMV parity test; the work is applying it 321 kern
 4. **Engine binary**: a `strata-vk` target beside `strata`/`strata-poly`, same `--serve` GENI protocol, so the
    `unbiased-strata` front end and its picture cache are unchanged.
 
+A second measured baseline, 2026-10-22 (same build): **ukisai/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ2_XS** (a `qwen35`-arch DENSE+SSM 27B, 7.8 GiB) on this card: prefill 87/86 tok/s (512/2048), decode 15.5 tok/s. Five times slower than Qwen3.6-35B-A3B because it is dense — every 27B weight touches every token — while the 35B-A3B activates ~3B. Neither `strata-poly` nor any Strata engine runs the `qwen35`-27B architecture at all (the dispatch table at src/poly/engine.cpp:992 knows qwen35moe / glm5-next / gemma4 / deepseek4 / lfm2moe; `strata` knows qwen4exp = Flash-Next), so such a model today means llama.cpp's Vulkan backend. The lesson for this board: MoE models are the play on 24-40 CUs with 16 GiB unified.
+
 Measured baseline while the engine port proceeds — llama.cpp's **Vulkan** backend (the tree's own
 `third_party/llama.cpp` submodule, built with `-DGGML_VULKAN=1`) on this board, Qwen3.6-35B-A3B
 UD-IQ2_XXS `-ngl 99`: prefill 383-375 tok/s (512/2048), decode 76 tok/s, `fp16: 1, uma: 1, warp 32,
