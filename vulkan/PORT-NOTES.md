@@ -188,3 +188,14 @@ reach them (they are in the .cu files, which stay uncompiled); dim3/vector types
 5. Streams: `native_mmvq`'s `validate_stream()` REJECTS a null `cudaStream_t`; `stream_create()` now
    hands out distinct non-null tokens (all the same queue underneath) so host code keeps CUDA-shaped
    discipline and the validator passes.
+6. **glslc's default contraction IS active on RADV and matches the CUDA --use_fast_math fused dot.**
+   Task 2.3 (q5_k): the CUDA native_mmvq.cu builds with contraction ON (CMakeLists.txt:518-538:
+   `--use_fast_math`, no `-ffp-contract=off` for this file), so the exact tree dot semantics are
+   `sumf = fma(d8, dot*sc, sumf)` per accumulator step and `fma(-dm_y, sumf_m, dm_x*sumf_d)` for the
+   final `dm_x*sumf_d - dm_y*sumf_m` pair (the negated product folds in; `fma(dm_x, sumf_d,
+   -(dm_y*sumf_m))` differs). glslc does NOT emit OpFma itself (still OpFMul+OpFAdd), but RADV's NIR
+   contracts and lands on exactly the CUDA-fused result — the host reference must spell std::fma in
+   that order, and the unfused reference differs on ~290/908 outputs. The iq2_xxs dot passed unfused
+   only because it has no mul-into-accumulator pair to fuse.
+7. `shared` variables must be at global scope in GLSL (not inside main); and a `continue`/`return`
+   past a `barrier()` in a loop is divergent-barrier UB — guard the reduce arm with `if` instead.

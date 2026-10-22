@@ -140,6 +140,20 @@ strata_vk_kernel(native_quantize_q8_1 COMP quantize_q8_1.comp LAUNCHER src/kerne
 # Task 2.2: native_mmvq for IQ2_XXS (type 16) — the model's routed experts. The .spv embeds under
 # the entry point's name (native_mmvq.spv.h) so the launcher includes it like the others.
 strata_vk_kernel(native_mmvq COMP mmvq_iq2_xxs.comp LAUNCHER src/kernels/native_mmvq_vk.cpp)
+# Task 2.3: the Q5_K (type 13) variant rides in the SAME launcher lib: compile mmvq_q5_k.comp to
+# its own embedded .spv.h and add it as a source (the launcher includes both headers).
+set(_q5k_spv ${CMAKE_CURRENT_BINARY_DIR}/spv/mmvq_q5_k.spv)
+add_custom_command(OUTPUT ${_q5k_spv}
+  COMMAND ${CMAKE_COMMAND} -E env VK_GLSLC_MODE=${GLSLC_MODE} VK_GLSLC_TOOL=${GLSLC_TOOL}
+          ${VK_GLSLC} --target-env=vulkan1.3 -O ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/mmvq_q5_k.comp -o ${_q5k_spv}
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/mmvq_q5_k.comp ${VK_GLSLC}
+  COMMENT "vk-glslc(${GLSLC_MODE}) mmvq_q5_k.comp")
+set(_q5k_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/mmvq_q5_k.spv.h)
+add_custom_command(OUTPUT ${_q5k_inc}
+  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_q5k_spv} ${_q5k_inc} mmvq_q5_k
+  DEPENDS ${_q5k_spv})
+add_custom_target(mmvq_q5_k.spv_h DEPENDS ${_q5k_inc})
+add_dependencies(strata_vk_kernel_native_mmvq mmvq_q5_k.spv_h)
 strata_vk_kernel(copy2 SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels LAUNCHER src/poly/kernels/copy2_vk.cpp)
 
 # ---- the trap roster (Task 1.2): every strata::kernels entry point the PORT-STATUS ledger still marks

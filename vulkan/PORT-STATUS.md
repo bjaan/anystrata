@@ -49,7 +49,7 @@ header helpers, one row per header) | `n/a` (decision `n/a`).
 | q4_k / q5_k / q6_k / q2_0 / q2_k / q3_k (mmvq + f32 pair) | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | todo |
 | iq4_xs / iq4_nl (mmvq + f32 pair) | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | todo |
 | native_mmvq_pair / native_mmvq_slots / native_mmvq_ids | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | todo |
-| native_mmvq (iq2_xxs only; other types trap-by-name `native_mmvq type <n>`) | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu:3110 + iq_kernels.cu launch_mmvq<16> | native_mmvq_vk_parity.cpp (bitwise) | `__shfl` (warp_sum), `__vcmpne4/__vsub4/dp4a` (scalar-emulated), `iq2xxs_grid` (arena-uploaded table) | translate | **ported+parity-green** (vulkan/src/kernels/mmvq_iq2_xxs.comp, native_mmvq_vk.cpp) |
+| native_mmvq (iq2_xxs + q5_k; other types trap-by-name `native_mmvq type <n>`) | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu:3110 + iq_kernels.cu launch_mmvq<16> + native_q5_k_mmvq | native_mmvq_vk_parity.cpp (bitwise) | `__shfl` (warp_sum), `__vcmpne4/__vsub4/dp4a` (scalar-emulated), `iq2xxs_grid` (arena-uploaded table), fp contraction (the CUDA leg builds with --use_fast_math; the vk dot mirrors the fused order) | translate | **ported+parity-green** (vulkan/src/kernels/mmvq_iq2_xxs.comp, mmvq_q5_k.comp, native_mmvq_vk.cpp; iq-family row: format 16 iq2_xxs, format 13 q5_k. q6_k (14) not demanded by the model — traps by number) |
 | q8_1 interleave: native_quantize_q8_1_il / native_q8_1_interleave / native_mmvq_il / native_q8_1_il_cp | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | todo |
 | native_moe_combine / _multi / _hits / _multi_hits / _multi_hits_gated | native_moe.hpp | src/kernels/cuda/native_moe.cu | native_expert_parity.cpp, native_multi_parity.cpp | `__shared__`, `__ldg` | translate | todo |
 | moe_hit_grouped_s2 / _dev / _multi / _cpu_order, moe_hit_select / _multi, moe_hit_add, moe_grouped_s2, moe_group_resident (setters host-side) | s2_expert_grouped.hpp | src/kernels/cuda/s2_expert_grouped.cu | s2_expert_grouped_parity.cpp, native_grouped_parity.cpp, decode_cluster_parity.cpp | `__shfl`, `__shared__`, `__ldg` | translate | todo |
@@ -228,6 +228,18 @@ native_mmvq_vk_parity, 387/387 exact, 10/10 ctest): the 10496 routed experts (ty
 down) now COMPUTE on the GPU and the decode run advances to the Q5_K (type 13) matrices — a
 different format's mmvq entry, trap-by-name until its decoder is ported. Demand #4 row below reads
 "iq2_xxs ported; other types trap-by-name".
+
+**Halt point after Task 2.3 (2026-10-22):** `strata::poly::gemv_f32` — demand #4's Q5_K leg (type 13,
+the dense projections) is PORTED: STRATA_VK_TRACE_MMVQ13 shows exactly two calls per token (n_in 2048
+n_out 8192 / n_out 4096, ncols 1 -> SmallK=false ROWS=1). mmvq_q5_k.comp transcribes
+native_q5_k_mmvq_kernel's partition (both ROWS variants; ncols via the pinned multi_exact per-column
+equality) and q5_q8_dot/q5_q8_dot_impl word-exactly. native_mmvq_vk_parity is now 908/908 outputs
+BITWISE (5 q5_k shapes incl. both partitions + the iq2_xxs set), ctest 10/10. Q6_K (14) is not
+demanded by this model's decode and stays trap-by-number. Next stop: the poly-contract gemv_f32.
+CONTRACTION LAW (this box): the CUDA native_mmvq.cu builds with --use_fast_math and no
+-ffp-contract=off, so its exact dot semantics are fused; the device answers `sumf = fma(d8, dot*sc,
+sumf)` per i and the final pair as `fma(-dm_y, sumf_m, dm_x*sumf_d)` — the host reference mirrors
+exactly that (all other fusion orders differ on 108-321 outputs).
 
 Phase-2 first picks by demand order: `copy2`, `rms_norm`, then the mmvq family
 (`native_quantize_q8_1`, `native_mmvq`) — matching the plan's expectation (quantize_act /
