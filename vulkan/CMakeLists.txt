@@ -137,6 +137,9 @@ target_include_directories(strata_vk_kernel_rms_norm PUBLIC ${STRATA_ROOT}/inclu
 target_link_libraries(strata_vk_kernel_rms_norm PUBLIC strata_vk_runtime strata_vk_compat)
 
 strata_vk_kernel(native_quantize_q8_1 COMP quantize_q8_1.comp LAUNCHER src/kernels/native_quantize_q8_1_vk.cpp)
+# Task 2.2: native_mmvq for IQ2_XXS (type 16) — the model's routed experts. The .spv embeds under
+# the entry point's name (native_mmvq.spv.h) so the launcher includes it like the others.
+strata_vk_kernel(native_mmvq COMP mmvq_iq2_xxs.comp LAUNCHER src/kernels/native_mmvq_vk.cpp)
 strata_vk_kernel(copy2 SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels LAUNCHER src/poly/kernels/copy2_vk.cpp)
 
 # ---- the trap roster (Task 1.2): every strata::kernels entry point the PORT-STATUS ledger still marks
@@ -230,6 +233,12 @@ add_executable(dequant_s2_vk_parity src/tests/dequant_s2_vk_parity.cpp)
 target_include_directories(dequant_s2_vk_parity PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(dequant_s2_vk_parity PRIVATE strata_vk_kernel_dequant_s2 strata_vk_runtime strata_vk_compat)
 add_test(NAME dequant_s2_vk_parity COMMAND dequant_s2_vk_parity --selftest)
+
+# Task 2.2: bitwise parity for native_mmvq's IQ2_XXS path (host transcription of mmvq_kernel<16>).
+add_executable(native_mmvq_vk_parity src/tests/native_mmvq_vk_parity.cpp)
+target_include_directories(native_mmvq_vk_parity PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels ${CMAKE_CURRENT_BINARY_DIR}/spv)
+target_link_libraries(native_mmvq_vk_parity PRIVATE strata_vk_kernel_native_mmvq strata_vk_kernel_native_quantize_q8_1 strata_vk_runtime strata_vk_compat strata_vk_stubs)   # stubs LAST: the launcher's missing() trap for unported types; the real native_mmvq resolves from its kernel lib first
+add_test(NAME native_mmvq_vk_parity COMMAND native_mmvq_vk_parity --selftest)
 
 # Task 2.1: unit parity for the model-demanded trio (poly's copy2/rms_norm + the q8_1 quantizer).
 add_executable(poly_kernels_vk_parity src/tests/poly_kernels_vk_parity.cpp)
@@ -348,6 +357,7 @@ target_include_directories(strata-poly-vk PRIVATE ${STRATA_ROOT}/include ${STRAT
 target_link_libraries(strata-poly-vk PRIVATE
   strata_vk_kernel_s2_gemv strata_vk_kernel_dequant_s2   # real launchers FIRST (link-order rule above)
   strata_vk_kernel_copy2 strata_vk_kernel_rms_norm strata_vk_kernel_native_quantize_q8_1
+  strata_vk_kernel_native_mmvq
   strata_vk_poly_kernels strata_vk_core
   ggml-cpu ggml-base
   strata_vk_compat strata_vk_stubs                      # stubs last: they only let the link complete

@@ -28,7 +28,7 @@ LEDGER = os.path.join(ROOT, "vulkan", "PORT-STATUS.md")
 
 # ---- PORTED: entry points with a real Vulkan launcher — the PORT-STATUS
 # 'ported+parity-green' rows (s2_gemv, dequant_s2). These must NOT be trapped.
-PORTED = {"s2_gemv", "dequant_s2", "native_quantize_q8_1"}
+PORTED = {"s2_gemv", "dequant_s2", "native_quantize_q8_1", "native_mmvq"}
 
 # ---- HOST_DEFINED: defined without a trap in vulkan/src/engine/missing.cpp
 # (metal/src/engine/missing.cpp's pattern): the engine's host loop calls cvec()

@@ -48,7 +48,8 @@ header helpers, one row per header) | `n/a` (decision `n/a`).
 | q4_0 / q5_0 / q8_0 (mmvq + f32 pair) | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | todo |
 | q4_k / q5_k / q6_k / q2_0 / q2_k / q3_k (mmvq + f32 pair) | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | todo |
 | iq4_xs / iq4_nl (mmvq + f32 pair) | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | todo |
-| native_mmvq / native_mmvq_pair / native_mmvq_slots / native_mmvq_ids | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | todo |
+| native_mmvq_pair / native_mmvq_slots / native_mmvq_ids | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | todo |
+| native_mmvq (iq2_xxs only; other types trap-by-name `native_mmvq type <n>`) | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu:3110 + iq_kernels.cu launch_mmvq<16> | native_mmvq_vk_parity.cpp (bitwise) | `__shfl` (warp_sum), `__vcmpne4/__vsub4/dp4a` (scalar-emulated), `iq2xxs_grid` (arena-uploaded table) | translate | **ported+parity-green** (vulkan/src/kernels/mmvq_iq2_xxs.comp, native_mmvq_vk.cpp) |
 | q8_1 interleave: native_quantize_q8_1_il / native_q8_1_interleave / native_mmvq_il / native_q8_1_il_cp | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | todo |
 | native_moe_combine / _multi / _hits / _multi_hits / _multi_hits_gated | native_moe.hpp | src/kernels/cuda/native_moe.cu | native_expert_parity.cpp, native_multi_parity.cpp | `__shared__`, `__ldg` | translate | todo |
 | moe_hit_grouped_s2 / _dev / _multi / _cpu_order, moe_hit_select / _multi, moe_hit_add, moe_grouped_s2, moe_group_resident (setters host-side) | s2_expert_grouped.hpp | src/kernels/cuda/s2_expert_grouped.cu | s2_expert_grouped_parity.cpp, native_grouped_parity.cpp, decode_cluster_parity.cpp | `__shfl`, `__shared__`, `__ldg` | translate | todo |
@@ -199,7 +200,7 @@ Re-run with `STRATA_VK_STUBS=log` enumerates the rest of the qwen35moe decode pa
 | 1 | `strata::poly::copy2` | poly: copy2_kernel — **PORTED (Task 2.1)** |
 | 2 | `strata::poly::rms_norm` | poly: rms_norm_kernel — **PORTED (Task 2.1)** |
 | 3 | `strata::kernels::native_quantize_q8_1` | q8_1 (native_quantize_q8_1, …) — **PORTED (Task 2.1)** |
-| 4 | `strata::kernels::native_mmvq` | native_mmvq / _pair / _slots / _ids |
+| 4 | `strata::kernels::native_mmvq` | native_mmvq / _pair / _slots / _ids — **iq2_xxs (type 16) PORTED (Task 2.2)**; other types trap-by-name |
 | 5 | `strata::poly::gemv_f32` | poly: gemv_kernel |
 | 6 | `strata::poly::conv4_silu` | poly: conv4_silu/_rows/_state kernels |
 | 7 | `strata::poly::gdn_step` | poly: gdn_norm/gates/state/state_reg/out kernels |
@@ -220,6 +221,13 @@ guaranteed per-token sequence; the first trap, `copy2`, is exact — the default
 above cleared, 9/9 ctest, model load unaffected. NOTE the load time swung 82 s -> 332 s on this run
 (same command, same file; swap/THP noise on a 14 GiB box under desktop load) — the harness timing
 story, not a port regression: gate the port by the HALT POINT moving, not by load seconds.
+
+**Halt point after Task 2.2 (2026-10-22):** `strata::kernels::native_mmvq type 13` — demand #4's
+IQ2_XXS leg is PORTED (mmvq_iq2_xxs.comp + native_mmvq_vk.cpp, bitwise parity
+native_mmvq_vk_parity, 387/387 exact, 10/10 ctest): the 10496 routed experts (type 16 gate/up and
+down) now COMPUTE on the GPU and the decode run advances to the Q5_K (type 13) matrices — a
+different format's mmvq entry, trap-by-name until its decoder is ported. Demand #4 row below reads
+"iq2_xxs ported; other types trap-by-name".
 
 Phase-2 first picks by demand order: `copy2`, `rms_norm`, then the mmvq family
 (`native_quantize_q8_1`, `native_mmvq`) — matching the plan's expectation (quantize_act /

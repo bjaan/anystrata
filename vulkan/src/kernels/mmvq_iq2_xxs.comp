@@ -1,0 +1,114 @@
+// vulkan/src/kernels/mmvq_iq2_xxs.comp - native_mmvq for ggml_type 16 (IQ2_XXS).
+//
+// The line-by-line translation of src/kernels/cuda/iq_kernels.cu's launch_mmvq<16> default path
+// (mmvq_kernel<TY=16>, lines 679-692: block(32,4), grid ceil(n_out/4)) with Fmt<16> = {qk 256,
+// ipb 8, step 2} (line 609), row_dot (668-677), warp_sum (661-665) and vec_dot_iq2_xxs_q8_1
+// (101-125). The CUDA default for type 16 is the Split/multi kernel; iq_kernels.cu:699-701 states
+// every column of mmvq_kernel is BITWISE equal to the same column of mmvq_multi_kernel, so this
+// per-column transcription matches the CUDA answer bitwise (the parity test asserts it).
+//
+// Workgroup 128 = 4 subgroups of 32 (force_subgroup32 in the launcher; the tree's warp laws,
+// PORT-NOTES): subgroup lane = tid%32, subrow = tid/32; row = group*4 + subrow, so `row >= n_out`
+// returns whole subgroups and every shuffle partner stays active.
+//
+// block_iq2_xxs is 66 bytes (ggml-common.h:382: half d + uint16 qs[32]) - NOT 4-aligned per block,
+// and glslc rejects ushort/ubyte std430 arrays (PORT-NOTES), so W is uint words and every 16-bit
+// field is extracted with shift-and-mask (w16). block_q8_1 is 36 bytes = 9 words (quantize_q8_1.comp
+// wrote exactly this: word 0 = ds = pack(d, sum) low half d, words 1..8 = qs[0..31]).
+//
+// The CUDA SIMD ops are emulated exactly, 4 scalar byte lanes each (Phase 4 may vectorize):
+//   __vcmpne4(a,0)    per byte != 0 -> 0xFF else 0
+//   __vsub4(a,b)      per byte (a_i - b_i) & 0xFF (no cross-byte borrow)
+//   ggml_cuda_dp4a    signed byte-dot of 4 pairs into acc (exact int32; gfx1013 has no dp4a and the
+//                     probe's GL_EXT_shader_integer_dot_product route is the later optimization)
+//   sumi * ls / 8     C truncation toward zero, GLSL int / is not guaranteed for negatives
+//                     (PORT-NOTES "fp32 / feeding round()" lineage) -> trunc_div8 spelled by hand.
+// iq2xxs_grid (256 x uint64 = two packed int8x4 words) is bound as buffer 3: the launcher uploads
+// the ggml-common.h table to the arena once (the CPU build makes it static-per-TU; no linkable
+// symbol - see native_mmvq_vk.cpp).
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer W    { uint  v[]; } bw;   // IQ2_XXS blocks, 66 B each
+layout(std430, binding = 1) readonly buffer X    { uint  v[]; } bx;   // q8_1 columns, 36 B blocks
+layout(std430, binding = 2)           buffer Y    { float v[]; } by;   // ncols * n_out floats
+layout(std430, binding = 3) readonly buffer Grid { uvec2 v[]; } bg;   // iq2xxs_grid: (low32, high32)
+
+layout(push_constant) uniform PC { uint n_in; uint n_out; uint ncols; } pc;
+
+// one byte of W at byte offset B (blocks are 66 B = not 4-aligned, so 16-bit fields can straddle
+// two uint words: assemble byte-by-byte, never shift a word past its end)
+uint wb(uint B) { return (bw.v[B >> 2u] >> (8u * (B & 3u))) & 0xFFu; }
+// the uint16 at byte offset B of W
+uint w16(uint B) { return wb(B) | (wb(B + 1u) << 8u); }
+
+uint vcmpne4(uint a) {
+    uint r = 0u;
+    for (uint i = 0u; i < 4u; ++i)
+        r |= (((a >> (8u * i)) & 255u) != 0u ? 255u : 0u) << (8u * i);
+    return r;
+}
+uint vsub4(uint a, uint b) {
+    uint r = 0u;
+    for (uint i = 0u; i < 4u; ++i)
+        r |= (((a >> (8u * i)) - (b >> (8u * i))) & 255u) << (8u * i);
+    return r;
+}
+int sbyte(uint a, uint i) {
+    const uint b = (a >> (8u * i)) & 255u;
+    return b >= 128u ? int(b) - 256 : int(b);
+}
+int dp4a(int a, int b, int c) {
+    for (uint i = 0u; i < 4u; ++i) c += sbyte(uint(a), i) * sbyte(uint(b), i);
+    return c;
+}
+// C's sumi / 8 (truncation toward zero; sumi * ls can be negative, |x| << 2^31)
+int trunc_div8(int x) { return x >= 0 ? x / 8 : -( (-x) / 8 ); }
+
+// vec_dot_iq2_xxs_q8_1(bq2 = row block kbx, bq8_1 = x column + kbx*8 + iqs/2, iqs) - same ops, same order.
+float iq2_xxs_dot(uint b0, uint xw, uint kbx, uint iqs) {
+    const uint qs = b0 + kbx * 66u + 2u;            // d is the block's first 2 bytes
+    const uint p  = qs + 4u * iqs;
+    const uint q2    = w16(p)       | (w16(p + 2u) << 16u);
+    const uint aux32 = w16(p + 4u)  | (w16(p + 6u) << 16u);
+    const uint xw0 = xw + (kbx * 8u + iqs / 2u) * 9u;
+    int sumi = 0;
+    for (uint k0 = 0u; k0 < 8u; k0 += 2u) {
+        const uint au = k0 >> 1u;                                   // aux8[k0/2]: byte of q2
+        const uvec2 gp = bg.v[(q2 >> (8u * au)) & 255u];
+        const uint v = (aux32 >> (7u * au)) & 255u;                 // unpack_ksigns' uint8 input
+        const uint sgn = (v ^ ((uint(bitCount(v)) & 1u) << 7u)) * 0x01010101u;
+        const uint s0 = vcmpne4(sgn & 0x08040201u);
+        sumi = dp4a(int(vsub4(gp.x ^ s0, s0)), int(bx.v[xw0 + 1u + k0]), sumi);
+        const uint s1 = vcmpne4(sgn & 0x80402010u);
+        sumi = dp4a(int(vsub4(gp.y ^ s1, s1)), int(bx.v[xw0 + 1u + k0 + 1u]), sumi);
+    }
+    const uint ls = (aux32 >> 27u) | 1u;
+    sumi = trunc_div8(sumi * int(ls));
+    // __half2float(bq2->d) * __low2float(ds), then * sumi (same association as CUDA)
+    const float dw = unpackHalf2x16(w16(b0 + kbx * 66u)).x;
+    const float d8 = unpackHalf2x16(bx.v[xw0]).x;
+    return dw * d8 * float(sumi);
+}
+
+void main() {
+    const uint tid  = gl_GlobalInvocationID.x;
+    const uint lane = tid & 31u;
+    // CUDA row = blockIdx.x*4 + threadIdx.y: the subrow is the LOCAL 128-thread index / 32.
+    const uint row  = gl_WorkGroupID.x * 4u + ((tid & 127u) >> 5u);
+    if (row >= pc.n_out) return;                   // whole 32-lane subgroups leave together
+    const uint nb = pc.n_in / 256u;
+    const uint b0 = row * nb * 66u;
+    for (uint c = 0u; c < pc.ncols; ++c) {
+        const uint xw = c * nb * 72u;              // column c: nb*8 blocks x 9 words
+        float s = 0.0;
+        for (uint k = lane; k < nb * 8u; k += 32u)          // Fmt<16>: ipb 8, step 2
+            s += iq2_xxs_dot(b0, xw, k / 8u, 2u * (k % 8u));
+        for (uint o = 16u; o > 0u; o >>= 1u)                // warp_sum's xor tree, 16,8,4,2,1
+            s += subgroupShuffleXor(s, o);
+        if (lane == 0u) by.v[c * pc.n_out + row] = s;
+    }
+}

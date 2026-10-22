@@ -243,7 +243,6 @@ namespace strata::kernels { void native_iq4_nl_f32(const void * p0, const float 
 namespace strata::kernels { void native_iq4_nl_mmvq(const void * p0, const void * p1, float * p2, int p3, int p4, int p5, void * p6) { strata::vk_engine::missing("strata::kernels::native_iq4_nl_mmvq"); } }
 namespace strata::kernels { void native_iq4_xs_f32(const void * p0, const float * p1, void * p2, float * p3, int p4, int p5, int p6, void * p7) { strata::vk_engine::missing("strata::kernels::native_iq4_xs_f32"); } }
 namespace strata::kernels { void native_iq4_xs_mmvq(const void * p0, const void * p1, float * p2, int p3, int p4, int p5, void * p6) { strata::vk_engine::missing("strata::kernels::native_iq4_xs_mmvq"); } }
-namespace strata::kernels { void native_mmvq(int p0, const void * p1, const void * p2, float * p3, int p4, int p5, int p6, void * p7) { strata::vk_engine::missing("strata::kernels::native_mmvq"); } }
 namespace strata::kernels { int native_mmvq_b6_rows() { strata::vk_engine::missing("strata::kernels::native_mmvq_b6_rows"); return {}; } }
 namespace strata::kernels { bool native_mmvq_ids(int p0, const MmvqIds & p1, int p2, int p3, int p4, void * p5) { strata::vk_engine::missing("strata::kernels::native_mmvq_ids"); return {}; } }
 namespace strata::kernels { void native_mmvq_il(int p0, const void * p1, const void * p2, const void * p3, float * p4, int p5, int p6, int p7, void * p8) { strata::vk_engine::missing("strata::kernels::native_mmvq_il"); } }
