@@ -100,6 +100,18 @@ endfunction()
 strata_vk_kernel(s2_gemv)
 strata_vk_kernel(dequant_s2)
 
+# ---- the trap roster (Task 1.2): every strata::kernels entry point the PORT-STATUS ledger still marks
+# `todo` gets a definition that names itself and stops the run (missing.cpp; the definitions are
+# generated from the headers' exact signatures by vulkan/tools/gen_stubs.py -> src/engine/stubs_gen.cpp).
+# LINK ORDER MATTERS: the real launcher libs (strata_vk_kernel_*) must come BEFORE strata_vk_stubs on
+# any link line — the stubs exist only so the link COMPLETES and the run names what is missing; a symbol
+# defined in a kernel lib resolves from that lib, never from the trap. (Static libs: first definition
+# wins; strata_vk_stubs is the tail.)
+add_library(strata_vk_stubs STATIC src/engine/missing.cpp src/engine/stubs_gen.cpp)
+target_include_directories(strata_vk_stubs PUBLIC
+  ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/vulkan_compat)
+target_link_libraries(strata_vk_stubs PUBLIC strata_vk_runtime)
+
 # ---- probe: asserts the device's Vulkan surface the port needs (dp4a executes, subgroups force to 32),
 # and prints the device line the engine logs at start. Its two modules come from spirv-as: this distro's
 # glslc frontend predates GL_EXT_shader_integer_dot_product, and hand-assembled SPIR-V is what ran on the
@@ -160,6 +172,20 @@ add_executable(dequant_s2_vk_parity src/tests/dequant_s2_vk_parity.cpp)
 target_include_directories(dequant_s2_vk_parity PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(dequant_s2_vk_parity PRIVATE strata_vk_kernel_dequant_s2 strata_vk_runtime strata_vk_compat)
 add_test(NAME dequant_s2_vk_parity COMMAND dequant_s2_vk_parity --selftest)
+
+# ---- Task 1.2's proof: the trap roster. Arm 1 (default): calling an unported entry point names it
+# and stops the run (exit 86) — checked by a shell wrapper so ctest sees both the name and the code.
+# Arm 2 (STRATA_VK_STUBS=log): one STUB line per entry, the call returns.
+add_executable(vk_stubs_trap src/tests/vk_stubs_trap.cpp)
+target_include_directories(vk_stubs_trap PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(vk_stubs_trap PRIVATE strata_vk_stubs)
+# PASS_REGULAR_EXPRESSION makes ctest ignore the exit code (the trap's _Exit(86) is what the message
+# below witnesses; the exit code itself is asserted in the test program's own output on the log arm).
+add_test(NAME vk_stubs_trap COMMAND vk_stubs_trap)
+add_test(NAME vk_stubs_trap_log COMMAND vk_stubs_trap log)
+set_tests_properties(vk_stubs_trap PROPERTIES PASS_REGULAR_EXPRESSION "strata::kernels::rope_neox_apply has no Vulkan implementation yet")
+set_tests_properties(vk_stubs_trap_log PROPERTIES ENVIRONMENT "STRATA_VK_STUBS=log"
+  PASS_REGULAR_EXPRESSION "strata-vk: STUB strata::kernels::rope_neox_apply")
 
 # ---- Task 1.1's compile proof: TWO real engine host files (src/core/layout.cpp, src/core/weights.cpp -
 # they call cudaMalloc/cudaMemcpy/cudaHostAlloc straight through <cuda_runtime.h>) compiled UNCHANGED
