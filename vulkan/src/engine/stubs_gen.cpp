@@ -246,17 +246,14 @@ namespace strata::kernels { void native_iq4_xs_mmvq(const void * p0, const void 
 namespace strata::kernels { void native_mmvq(int p0, const void * p1, const void * p2, float * p3, int p4, int p5, int p6, void * p7) { strata::vk_engine::missing("strata::kernels::native_mmvq"); } }
 namespace strata::kernels { int native_mmvq_b6_rows() { strata::vk_engine::missing("strata::kernels::native_mmvq_b6_rows"); return {}; } }
 namespace strata::kernels { bool native_mmvq_ids(int p0, const MmvqIds & p1, int p2, int p3, int p4, void * p5) { strata::vk_engine::missing("strata::kernels::native_mmvq_ids"); return {}; } }
-namespace strata::kernels { bool native_mmvq_ids_supported(int p0) { strata::vk_engine::missing("strata::kernels::native_mmvq_ids_supported"); return {}; } }
 namespace strata::kernels { void native_mmvq_il(int p0, const void * p1, const void * p2, const void * p3, float * p4, int p5, int p6, int p7, void * p8) { strata::vk_engine::missing("strata::kernels::native_mmvq_il"); } }
 namespace strata::kernels { int native_mmvq_il_rows_for(int p0, int p1, int p2, int p3) { strata::vk_engine::missing("strata::kernels::native_mmvq_il_rows_for"); return {}; } }
-namespace strata::kernels { bool native_mmvq_il_supported(int p0, int p1, int p2) { strata::vk_engine::missing("strata::kernels::native_mmvq_il_supported"); return {}; } }
 namespace strata::kernels { void native_mmvq_il_tune(int p0) { strata::vk_engine::missing("strata::kernels::native_mmvq_il_tune"); } }
 namespace strata::kernels { bool native_mmvq_multi_exact() { strata::vk_engine::missing("strata::kernels::native_mmvq_multi_exact"); return {}; } }
 namespace strata::kernels { bool native_mmvq_pair(int p0, const void * p1, const void * p2, const void * p3, float * p4, float * p5, int p6, int p7, int p8, void * p9) { strata::vk_engine::missing("strata::kernels::native_mmvq_pair"); return {}; } }
 namespace strata::kernels { void native_mmvq_set_b6_rows(int p0) { strata::vk_engine::missing("strata::kernels::native_mmvq_set_b6_rows"); } }
 namespace strata::kernels { void native_mmvq_set_multi_exact(bool p0) { strata::vk_engine::missing("strata::kernels::native_mmvq_set_multi_exact"); } }
 namespace strata::kernels { bool native_mmvq_slots(int p0, const MmvqSlots & p1, int p2, int p3, int p4, void * p5) { strata::vk_engine::missing("strata::kernels::native_mmvq_slots"); return {}; } }
-namespace strata::kernels { bool native_mmvq_supported(int p0) { strata::vk_engine::missing("strata::kernels::native_mmvq_supported"); return {}; } }
 namespace strata::kernels { std::size_t native_mmvq_weight_bytes(int p0, int p1, int p2) { strata::vk_engine::missing("strata::kernels::native_mmvq_weight_bytes"); return {}; } }
 namespace strata::kernels { void native_moe_combine(const float * p0, const float * p1, const float * p2, float * p3, int64_t p4, int64_t p5, void * p6) { strata::vk_engine::missing("strata::kernels::native_moe_combine"); } }
 namespace strata::kernels { bool native_moe_combine_enabled() { strata::vk_engine::missing("strata::kernels::native_moe_combine_enabled"); return {}; } }
@@ -295,8 +292,6 @@ namespace strata::kernels { bool native_q8_0_packed_eligible(int p0, int p1) { s
 namespace strata::kernels { bool native_q8_0_packed_enabled() { strata::vk_engine::missing("strata::kernels::native_q8_0_packed_enabled"); return {}; } }
 namespace strata::kernels { void native_q8_0_packed_register(const void * p0, const void * p1, int p2, int p3) { strata::vk_engine::missing("strata::kernels::native_q8_0_packed_register"); } }
 namespace strata::kernels { void native_q8_0_packed_unregister(const void * p0) { strata::vk_engine::missing("strata::kernels::native_q8_0_packed_unregister"); } }
-namespace strata::kernels { std::size_t native_q8_1_bytes(int p0, int p1) { strata::vk_engine::missing("strata::kernels::native_q8_1_bytes"); return {}; } }
-namespace strata::kernels { std::size_t native_q8_1_il_bytes(int p0, int p1) { strata::vk_engine::missing("strata::kernels::native_q8_1_il_bytes"); return {}; } }
 namespace strata::kernels { void native_q8_1_interleave(const void * p0, void * p1, int p2, int p3, void * p4) { strata::vk_engine::missing("strata::kernels::native_q8_1_interleave"); } }
 namespace strata::kernels { bool native_qsa_enabled() { strata::vk_engine::missing("strata::kernels::native_qsa_enabled"); return {}; } }
 namespace strata::kernels { void native_qsa_gate_apply(const float * p0, const float * p1, float * p2, int p3, int p4, void * p5) { strata::vk_engine::missing("strata::kernels::native_qsa_gate_apply"); } }

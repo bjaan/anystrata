@@ -1,8 +1,13 @@
 // cuda.h for a Vulkan build: the driver-API types src/core/vmm.cpp spells in its (dlopen-resolved) VMM tier.
-// None of these FUNCTIONS exists here - vmm.cpp only names them in `decltype(&cuMemAddressReserve)`-style
-// member types and reaches them through cudaGetDriverEntryPoint, which reports "symbol not found" (see
-// strata_vk.h), so the VMM tier switches itself off and the arena fallback runs.  The declarations below are
-// never linked against: they exist so the TU parses.
+// vmm.cpp only names these in `decltype(&cuMemAddressReserve)`-style member types and reaches them through
+// cudaGetDriverEntryPoint, which reports "symbol not found" (see strata_vk.h), so the VMM tier switches
+// itself off and the arena fallback runs.  Task 1.4 adds a DIRECT caller: src/poly/engine.cpp's load()/
+// cover() call cuDeviceGet / cuDeviceGetAttribute / cuMem* without the entry-point dance (the CUDA build
+// links CUDA::cuda_driver for it). So the declarations became inline definitions answering CUDA's own
+// "not supported" convention: engine.cpp's probe (CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED
+// -> 0, error) leaves vmm_ false on its own terms, and the attention/expert caches take the plain
+// cudaMalloc (arena) path - the grow-never fallback the twins already carry. Nothing here ever reports
+// success, so a VMM path can never half-run.
 #pragma once
 
 #include <cstddef>
@@ -10,6 +15,7 @@
 
 typedef int CUresult;
 #define CUDA_SUCCESS 0
+#define CUDA_ERROR_NOT_SUPPORTED 801
 typedef int CUdevice;
 typedef uint64_t CUdeviceptr;
 typedef uint64_t CUmemGenericAllocationHandle;
@@ -31,20 +37,30 @@ typedef struct CUmemAllocationProp {
 } CUmemAllocationProp;
 typedef struct CUmemAccessDesc { CUmemLocation location; int flags; } CUmemAccessDesc;
 
-extern "C" {
 #ifndef CUDAAPI
 #define CUDAAPI
 #endif
-CUresult cuDeviceGet(CUdevice* device, int ordinal);
-CUresult cuGetErrorString(CUresult res, const char** str);
-CUresult cuGetErrorName(CUresult res, const char** str);
-CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t alignment, CUdeviceptr addr, unsigned long long flags);
-CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size);
-CUresult cuMemCreate(CUmemGenericAllocationHandle* handle, size_t size, const CUmemAllocationProp* prop, unsigned long long flags);
-CUresult cuMemRelease(CUmemGenericAllocationHandle handle);
-CUresult cuMemMap(CUdeviceptr ptr, size_t size, size_t offset, CUmemGenericAllocationHandle handle, unsigned long long flags);
-CUresult cuMemUnmap(CUdeviceptr ptr, size_t size);
-CUresult cuMemSetAccess(CUdeviceptr ptr, size_t size, const CUmemAccessDesc* desc, size_t count);
-CUresult cuDeviceGetAttribute(int* value, CUdevice_attribute attr, CUdevice dev);
-CUresult cuMemGetAllocationGranularity(size_t* granularity, const CUmemAllocationProp* prop, CUmemAllocationGranularity_flags option);
-}
+inline CUresult CUDAAPI cuDeviceGet(CUdevice*, int) { return CUDA_ERROR_NOT_SUPPORTED; }
+inline CUresult CUDAAPI cuGetErrorString(CUresult, const char** str) {
+    if (str) *str = "strata-vk: no CUDA driver: the VMM path is off (grow-never arena fallback)";
+    return CUDA_SUCCESS; }
+inline CUresult CUDAAPI cuGetErrorName(CUresult, const char** str) {
+    if (str) *str = "CUDA_ERROR_NOT_SUPPORTED";
+    return CUDA_SUCCESS; }
+inline CUresult CUDAAPI cuDeviceGetAttribute(int* value, CUdevice_attribute attr, CUdevice) {
+    if (value) *value = (attr == CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED) ? 0 : -1;
+    return CUDA_ERROR_NOT_SUPPORTED; }
+inline CUresult CUDAAPI cuMemAddressReserve(CUdeviceptr* ptr, size_t, size_t, CUdeviceptr, unsigned long long) {
+    if (ptr) *ptr = 0; return CUDA_ERROR_NOT_SUPPORTED; }
+inline CUresult CUDAAPI cuMemAddressFree(CUdeviceptr, size_t) { return CUDA_ERROR_NOT_SUPPORTED; }
+inline CUresult CUDAAPI cuMemCreate(CUmemGenericAllocationHandle* handle, size_t, const CUmemAllocationProp*, unsigned long long) {
+    if (handle) *handle = 0; return CUDA_ERROR_NOT_SUPPORTED; }
+inline CUresult CUDAAPI cuMemRelease(CUmemGenericAllocationHandle) { return CUDA_ERROR_NOT_SUPPORTED; }
+inline CUresult CUDAAPI cuMemMap(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle, unsigned long long) {
+    return CUDA_ERROR_NOT_SUPPORTED; }
+inline CUresult CUDAAPI cuMemUnmap(CUdeviceptr, size_t) { return CUDA_ERROR_NOT_SUPPORTED; }
+inline CUresult CUDAAPI cuMemSetAccess(CUdeviceptr, size_t, const CUmemAccessDesc*, size_t) {
+    return CUDA_ERROR_NOT_SUPPORTED; }
+inline CUresult CUDAAPI cuMemGetAllocationGranularity(size_t* granularity, const CUmemAllocationProp*, CUmemAllocationGranularity_flags) {
+    if (granularity) *granularity = 0;
+    return CUDA_ERROR_NOT_SUPPORTED; }

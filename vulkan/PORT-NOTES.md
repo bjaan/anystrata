@@ -119,3 +119,53 @@ the spin is seen on the first read (arm 2, `reads=0`). So `doorbell_ring`/`doorb
 `copy_rows_from_mapped_after` must port as ring-then-launch (or copy-flushed flags), never live
 spins inside a graph; `cudaHostGetDevicePointer` still refuses rather than hand back a host address
 the arena-offset launchers would misread. `vk_doorbell_probe` (ctest) is the witness.
+
+## Task 1.4 compat gaps (found by compiling/linking strata-poly-vk, in the order they appeared)
+
+1. **`cuda.h` driver VMM calls become inline "not supported" answers.** `src/poly/engine.cpp` calls
+   `cuDeviceGet`/`cuDeviceGetAttribute`/`cuMem*` DIRECTLY (the CUDA target links `CUDA::cuda_driver`),
+   unlike `src/core/vmm.cpp` which resolves them by name through `cudaGetDriverEntryPoint`. The old
+   declarations ("never linked against") would not link; they became inline definitions that answer
+   `CUDA_ERROR_NOT_SUPPORTED` with `VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED -> 0`, which trips engine.cpp's
+   own probe (`vmm_` stays false) onto the plain `cudaMalloc` arena path — the grow-never fallback the
+   Task-1.3 twins already carry. Nothing reports success, so no VMM path can half-run.
+2. **`cudaGetErrorString` after `cudaGetLastError()`'s clear** — the engine's `ck(e, what)` idiom
+   (runtime.hpp) calls `cudaGetLastError()` (which CLEARS, per CUDA) and formats the string after: the
+   arena's named reason ("copy span crosses an arena piece", "out of VRAM growing the arena") vanished
+   into a bare "error". Fixed in `strata_vk.h` with a `last_reason()` that outlives the clear: the
+   code clears exactly as CUDA does, the reason stays readable. (Found when a straddling load copy
+   failed with an unnamed "a copy into VRAM: error".)
+3. **Copy/fill chunkers clip to the piece they start in** (`vk_runtime.cpp piece_room()`). RADV's max
+   allocation is 512 MiB, the engine's `cudaMalloc(512 MiB + tail)` chains pieces, and a 2 MiB chunk
+   that straddled the chain boundary threw — the region is contiguous in arena space and the copy just
+   has to respect the chain. Straddling copies now round-trip intact (probe case D rewritten: straddling
+   copy must round-trip AND a span with no piece under it must still throw by name; `vk_device_probe`
+   green on both arms).
+4. **poly contract traps, not migrated copies.** `src/poly/kernels.cu` + `kernels_dsv4.cu` are host+device
+   TUs (77/8 `<<<` launches): with no nvcc there is no "host-only migrated copy" worth extracting — the
+   whole `include/strata/poly/kernels.hpp` contract (52 entries) becomes traps, generated mechanically by
+   `vulkan/tools/gen_poly_stubs.py` (the gen_stubs.py AST mechanism pointed at that one header). Host-only
+   parts carried honestly, NOT trapped: `sum_threads`, `attend_split_floats` (pure arithmetic), and
+   `blas_create`/`blas_destroy` (the compat cuBLAS handle's lifecycle — the CPU fallback GEMM is a real
+   host library here, no kernel involved).
+5. **`strata::kernels` native_mmvq capability/byte-count queries host-defined** (missing.cpp; HOST_DEFINED
+   in gen_stubs.py): `native_mmvq_supported`, `native_mmvq_ids_supported`, `native_q8_1_bytes`,
+   `native_q8_1_il_bytes` are pure type tables / byte arithmetic in the CUDA build too — the LOAD asks them
+   before any launch — so trapping them would re-route the whole load (every expert copied as bf16, the
+   expert cache off) instead of reaching the launch traps in the model's demand order. They are transcribed
+   from `src/kernels/cuda/native_mmvq.cu` (the `native_mmvq_il_supported` table stays false: the interleaved
+   variants are not this backend's planned Phase-2 shape). `native_mmvq`/`_slots`/`_ids` and the quantizers
+   STAY trapped — that is where the run stops, as designed.
+6. **`strata_poly_mmq` (llama.cpp ggml-cuda MMQ) -> trap twin `vulkan/src/poly/mmq_vk.cpp`.** The
+   constructor, `quantize()` and `mul()` name themselves; `fits()` honestly answers false (no MMQ tile
+   built for this backend), which is exactly what CUDA's fits() returns when the card has no config —
+   the engine keeps its batched prompt path off and the run reaches the decode traps instead.
+7. **`src/core/graph.cpp` compiled unchanged**: its `cudaGraph*` calls land on the compat graph traps
+   (`missing("cuda-graph: cudaGraphInstantiate")`-style names); `--no-graphs` keeps the engine off them.
+   engine.cpp's own record()/replay sites trap the same way.
+8. **gen_stubs.py drift guard** extended: the PORT-STATUS `todo` cross-check now tolerates the
+   host-defined/ported names added above (the script's own HOST_DEFINED list is the registry).
+
+**Not needed after all** (predicted friction that did not appear): `cudaFuncSetAttribute`,
+`cudaOccupancy*`, `cudaMemcpyToSymbol` device-symbol sites, `__constant__` — the poly host files never
+reach them (they are in the .cu files, which stay uncompiled); dim3/vector types were already in place.

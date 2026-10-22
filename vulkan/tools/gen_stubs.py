@@ -33,7 +33,11 @@ PORTED = {"s2_gemv", "dequant_s2"}
 # ---- HOST_DEFINED: defined without a trap in vulkan/src/engine/missing.cpp
 # (metal/src/engine/missing.cpp's pattern): the engine's host loop calls cvec()
 # unconditionally on every layer; the honest answer is the empty, unloaded vector.
-HOST_DEFINED = {"cvec"}
+# The native_mmvq capability/byte-count queries (Task 1.4): pure type tables and byte arithmetic in
+# the CUDA build too — the engine's load path asks them before any kernel is launched, and trapping
+# them would route the whole load through a different format than the CUDA engine picks.
+HOST_DEFINED = {"cvec", "native_mmvq_supported", "native_mmvq_ids_supported", "native_mmvq_il_supported",
+                "native_q8_1_bytes", "native_q8_1_il_bytes"}
 
 # ---- N/A: ledger rows whose state is `n/a` — these must NOT trap (the engine's
 # verify.cpp evaluates pdl_supported() on EVERY run, graphs or not; a trap there

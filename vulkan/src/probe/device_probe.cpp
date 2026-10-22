@@ -66,8 +66,11 @@ int main() {
     // chains into 2 pieces (512 MiB + ~86 MiB). Patterns are written at region A's offset 0 (first piece)
     // and region B's (bytes - 4 KiB) (deep in the LAST piece of the chain): both copies and the kernel's
     // piece-local sub-span bindings exercise piece_of() lookup at both ends of a chained region.
-    // Sub-check: an H2D copy that STRADDLES a piece boundary must throw with 'piece' in its message -
-    // that named rejection IS the design (the launcher/copy refuses instead of reading wrong bytes).
+    // Sub-check (Task 1.4, updated): an H2D copy that STRADDLES a piece boundary must now ROUND-TRIP
+    // intact - the copy layer clips its chunks to the piece they start in (piece_room), which is what
+    // the engine's 512 MiB allocations need (a single cudaMalloc chains at the max allocation and
+    // memcpy's whole regions across the chain). A span with NO piece under it at all still throws
+    // with 'piece' in its message: the named rejection stays for spans the arena does not back.
     const uint64_t MiB = 1ull << 20;
     const uint64_t region = 600 * MiB;
     uint64_t ra = a.alloc(region);          // throws "out of VRAM" if the 256 MiB slack rule fails;
@@ -77,14 +80,26 @@ int main() {
     for (size_t j = 0; j < patB.size(); j++) patB[j] = 7000000 + (int)j;
     vk::copy_h2d((void*)(uintptr_t)ra, patA.data(), 1024 * 4, nullptr);                    // head of piece 0
     vk::copy_h2d((void*)(uintptr_t)(rb + region - 1024 * 4), patB.data(), 256 * 4, nullptr); // tail of last piece
+    bool straddle_ok = false;
+    {
+        int filler[1024]; for (size_t j = 0; j < 1024; j++) filler[j] = (int)j + 31337;
+        // half on piece 0, half on piece 1 of region A (512 MiB boundary): must land on BOTH pieces
+        const uint64_t straddle = ra + 512 * MiB - 1024;
+        vk::copy_h2d((void*)(uintptr_t)straddle, filler, sizeof filler, nullptr);
+        int back[1024];
+        vk::copy_d2h(back, (void*)(uintptr_t)straddle, sizeof back, nullptr);
+        straddle_ok = true;
+        for (size_t j = 0; j < 1024 && straddle_ok; j++) if (back[j] != filler[j]) straddle_ok = false;
+        std::printf("probe: piece-straddling copy round-trips %s\n", straddle_ok ? "OK" : "MISMATCH");
+    }
     bool straddle_rejected = false;
     try {
-        int filler[1024]; for (size_t j = 0; j < 1024; j++) filler[j] = (int)j;
-        // half on piece 0, half on piece 1 of region A (512 MiB boundary)
-        vk::copy_h2d((void*)(uintptr_t)(ra + 512 * MiB - 1024), filler, 4096, nullptr);
+        // 1 GiB past the cursor: no piece backs the span - the named rejection must still fire.
+        uint64_t hole = a.alloc(8);
+        vk::copy_h2d((void*)(uintptr_t)(a.alloc(region + 1024) + region + 4096), &hole, 8, nullptr);
     } catch (const std::exception& e) {
-        straddle_rejected = std::strstr(e.what(), "piece") != nullptr;
-        std::printf("probe: piece-straddle copy rejected by name: %s\n", e.what());
+        straddle_rejected = std::strstr(e.what(), "piece") != nullptr || std::strstr(e.what(), "VRAM") != nullptr;
+        std::printf("probe: unbacked copy span rejected by name: %s\n", e.what());
     }
     // Kernel binds three piece-local sub-spans: patA (in A's first piece), patB (in B's last piece), out.
     vk::Kernel ksp = vk::kernel_load("probe_spans", probe_spans_spv, probe_spans_spv_len, 3, 0, 256, false);
@@ -96,8 +111,8 @@ int main() {
     vk::copy_d2h(span_res.data(), (void*)(uintptr_t)out4, 1024 * 4, nullptr);
     int spans = 1;
     for (int r : span_res) if (r != 1) { spans = 0; break; }
-    const bool dval = spans && straddle_rejected;
-    std::printf("probe: far-apart arena spans + piece-straddle copy rejected: %s\n", dval ? "OK" : "FAIL");
+    const bool dval = spans && straddle_ok && straddle_rejected;
+    std::printf("probe: far-apart arena spans + straddling copy round-trips + unbacked span rejected: %s\n", dval ? "OK" : "FAIL");
 
     const bool pass = (val == 10) && (val2 == 321) && (cval == 1) && dval;
     std::printf("vk_device_probe %s on %s\n", pass ? "PASS" : "FAIL", d.name.c_str());

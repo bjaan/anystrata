@@ -52,6 +52,16 @@ VkBuffer piece_of(uint64_t off, uint64_t bytes, uint64_t& piece_off) {
     return VK_NULL_HANDLE;
 }
 
+// Bytes left in the piece that starts under `off` (0 when no piece holds it). The copy/fill chunkers
+// clip to this so a span NEVER crosses a piece boundary (Task 1.4: the engine's 512 MiB allocations
+// land as max-allocation piece chains, and a chunk that straddles one used to throw - the region
+// itself is fine; the chunking just has to respect the chain).
+uint64_t piece_room(uint64_t off) {
+    for (auto& p : g_pieces)
+        if (off >= p.base && off < p.base + p.size) return p.base + p.size - off;
+    return 0;
+}
+
 void arena_add(uint64_t bytes) {
     VkDevice dev = (VkDevice)vk_handle();
     const DeviceInfo& d = device_info();
@@ -183,6 +193,7 @@ void copy_h2d(void* dst, const void* src, uint64_t bytes, void*) {
     uint64_t at = (uint64_t)(uintptr_t)dst, off = 0;
     while (off < bytes) {
         uint64_t n = bytes - off < (2ull << 20) ? bytes - off : (2ull << 20);
+        if (uint64_t room = piece_room(at + off)) { if (n > room) n = room; }
         stage_ensure(n);
         std::memcpy(g_stage_map, (const char*)src + off, n);
         copy_chunk(true, nullptr, at + off, n);
@@ -194,6 +205,7 @@ void copy_d2h(void* dst, const void* src, uint64_t bytes, void*) {
     uint64_t at = (uint64_t)(uintptr_t)src, off = 0;
     while (off < bytes) {
         uint64_t n = bytes - off < (2ull << 20) ? bytes - off : (2ull << 20);
+        if (uint64_t room = piece_room(at + off)) { if (n > room) n = room; }
         stage_ensure(n);
         copy_chunk(false, nullptr, at + off, n);
         std::memcpy((char*)dst + off, g_stage_map, n);
@@ -207,6 +219,7 @@ void fill_d(void* dst, uint8_t byte, uint64_t bytes, void*) {
     uint64_t off = 0;
     while (off < bytes) {
         uint64_t n = bytes - off < chunk ? bytes - off : chunk;
+        if (uint64_t room = piece_room((uint64_t)(uintptr_t)dst + off)) { if (n > room) n = room; }
         std::memset(g_stage_map, byte, n);
         copy_chunk(true, nullptr, (uint64_t)(uintptr_t)dst + off, n);
         off += n;

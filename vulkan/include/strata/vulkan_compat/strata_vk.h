@@ -62,8 +62,15 @@ namespace strata_vk_compat {
 
 struct ErrState { cudaError_t code = cudaSuccess; std::string msg; };
 inline ErrState& last_error() { static thread_local ErrState e; return e; }
+// The message survives cudaGetLastError()'s clear (Task 1.4): the engine's ck() idiom is
+// "cudaGetLastError(); throw ...(cudaGetErrorString(e))" - it CLEARS the error before formatting it,
+// and without this the arena's named reason ("copy span straddles a piece", "out of VRAM growing
+// the arena") vanished into CUDA's generic "unknown error". The clear stays CUDA-correct for the
+// CODE; the reason stays readable.
+inline ErrState& last_reason() { static thread_local ErrState r; return r; }
 inline void set_error(cudaError_t code, const char* what) {
-    if (code != cudaSuccess) last_error() = ErrState{code, what ? what : "unknown error"};
+    if (code != cudaSuccess) { last_error() = ErrState{code, what ? what : "unknown error"};
+                               last_reason() = last_error(); }
 }
 // Every arena-touching runtime call can throw (out of VRAM, straddling piece).  Catch once, per call.
 #define STRATA_VK_TRY try {
@@ -197,6 +204,8 @@ inline const char* cudaGetErrorString(cudaError_t e) {
     using namespace strata_vk_compat;
     if (e == cudaSuccess) return "no error";
     if (last_error().code == e && !last_error().msg.empty()) return last_error().msg.c_str();
+    // ck()-clears-first (see last_reason): the named reason outlives the clear.
+    if (last_reason().code == e && !last_reason().msg.empty()) return last_reason().msg.c_str();
     switch ((int) e) {
         case cudaErrorMemoryAllocation: return "out of memory (arena)";
         case cudaErrorNotReady:         return "not ready";
