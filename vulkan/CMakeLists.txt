@@ -161,6 +161,25 @@ target_link_libraries(vk_device_probe PRIVATE strata_vk_runtime)
 enable_testing()
 add_test(NAME vk_device_probe COMMAND vk_device_probe)
 
+# ---- probe case E (Task 1.3 step 1, the doorbell): can a RUNNING RADV kernel see host stores to
+# HOST_VISIBLE|HOST_COHERENT memory? The sycl/ port's Arc A750 landmine (sycl_queue.hpp:43) says some
+# drivers never deliver them; the pinned twins' design is decided by THIS box's answer, measured before
+# anything is built on it. Self-contained raw Vulkan (the runtime's submit-always-waits path would make
+# "while it runs" unmeasurable), so the .comp goes through glslc + embed_spv like everything else.
+set(_probe_db_spv ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_doorbell.spv)
+add_custom_command(OUTPUT ${_probe_db_spv}
+  COMMAND ${CMAKE_COMMAND} -E env VK_GLSLC_MODE=${GLSLC_MODE} VK_GLSLC_TOOL=${GLSLC_TOOL}
+          ${VK_GLSLC} --target-env=vulkan1.0 -O ${CMAKE_CURRENT_SOURCE_DIR}/src/probe/kernels/probe_doorbell.comp -o ${_probe_db_spv}
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/probe/kernels/probe_doorbell.comp ${VK_GLSLC}
+  COMMENT "vk-glslc(${GLSLC_MODE}) probe_doorbell.comp")
+add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_doorbell.spv.h
+  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_probe_db_spv} ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_doorbell.spv.h probe_doorbell
+  DEPENDS ${_probe_db_spv})
+add_executable(vk_doorbell_probe src/probe/doorbell_probe.cpp ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_doorbell.spv.h)
+target_include_directories(vk_doorbell_probe PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/spv)
+target_link_libraries(vk_doorbell_probe PRIVATE Vulkan::Vulkan)
+add_test(NAME vk_doorbell_probe COMMAND vk_doorbell_probe)
+
 # ---- parity: the tree's own s2_gemv parity contract, on Vulkan. The reference transcription (validated
 # against ggml upstream) stays in ../src; only the device call is this backend's.
 add_executable(s2_gemv_vk_parity src/tests/s2_gemv_vk_parity.cpp)
@@ -186,6 +205,24 @@ add_test(NAME vk_stubs_trap_log COMMAND vk_stubs_trap log)
 set_tests_properties(vk_stubs_trap PROPERTIES PASS_REGULAR_EXPRESSION "strata::kernels::rope_neox_apply has no Vulkan implementation yet")
 set_tests_properties(vk_stubs_trap_log PROPERTIES ENVIRONMENT "STRATA_VK_STUBS=log"
   PASS_REGULAR_EXPRESSION "strata-vk: STUB strata::kernels::rope_neox_apply")
+
+# ---- the core twins (Task 1.3): device.hpp / pinned.hpp / vmm.hpp contracts on Vulkan.
+# vk_device_impl.cpp implements include/strata/core/device.hpp over strata::vk (src/core/device.cu is
+# NOT compiled by this backend); vk_pinned.cpp is pinned.cu's body carried unchanged against the compat
+# layer with the PCIe probe routed to a named skip; vk_vmm.cpp gives the elastic-K/V interface a
+# grow-never arena fallback. PinnedRing (pinned_ring.hpp) is header-inline over the compat calls.
+add_library(strata_vk_core STATIC
+  src/core/vk_device_impl.cpp
+  src/core/vk_pinned.cpp
+  src/core/vk_vmm.cpp)
+target_include_directories(strata_vk_core PUBLIC
+  ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(strata_vk_core PUBLIC strata_vk_compat)
+
+add_executable(vk_core_smoke src/tests/vk_core_smoke.cpp ${STRATA_ROOT}/src/platform/memory.cpp)
+target_include_directories(vk_core_smoke PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(vk_core_smoke PRIVATE strata_vk_core)
+add_test(NAME vk_core_smoke COMMAND vk_core_smoke)
 
 # ---- Task 1.1's compile proof: TWO real engine host files (src/core/layout.cpp, src/core/weights.cpp -
 # they call cudaMalloc/cudaMemcpy/cudaHostAlloc straight through <cuda_runtime.h>) compiled UNCHANGED

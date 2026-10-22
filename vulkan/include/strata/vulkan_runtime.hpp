@@ -31,6 +31,15 @@ struct DeviceInfo {
     bool buffer_device_address = false;
     bool unified_memory = false;
     std::string driver;
+    // Task 1.3 (step 5): the facts cudaDeviceProp exposes that vk_device.cpp did not carry.
+    // multi_processor_count comes from VK_AMD_shader_core_properties when the driver answers it
+    // (radv on the BC-250: shaderEngineCount 2 x shaderArraysPerEngineCount 2 x computeUnitsPerShaderArray 6
+    // = 24 CUs; a BC-250 BIOS may unlock to 40 — the driver's figure is what kernels plan against, and
+    // STRATA_VK_CU_OVERRIDE rewrites it for occupancy experiments). l2_bytes: no Vulkan query exists for
+    // it (radv exposes no L2 property), so it stays 0 and the compat layer says so — readers only tune
+    // prefetch/bench sizes with it (src/kernels/s2_expert_grouped_parity.cpp:532).
+    int multi_processor_count = 0;
+    int l2_bytes = 0;
 };
 
 // Throws when there is no usable Vulkan device. Init once per process.

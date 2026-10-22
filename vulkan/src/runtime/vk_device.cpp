@@ -145,6 +145,21 @@ void init() {
     g_info.integer_dot_product = idp;
     g_info.subgroup_size_control = ssc;
     g_info.buffer_device_address = has("VK_EXT_buffer_device_address");
+    // ---- CU count (Task 1.3 step 5): VK_AMD_shader_core_properties through the properties2 chain —
+    // queryable WITHOUT enabling the device extension (measured on this box: engines 2 x arrays/engine 2
+    // x CUs/array 6 = 24). STRATA_VK_CU_OVERRIDE=N rewrites it for occupancy experiments (a BC-250 BIOS
+    // unlock to 40 CUs is NOT visible through this query — the driver reports what its power hints say).
+    {
+        VkPhysicalDeviceShaderCorePropertiesAMD scp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_PROPERTIES_AMD};
+        VkPhysicalDeviceProperties2 q2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        q2.pNext = &scp;
+        vkGetPhysicalDeviceProperties2(g_phys, &q2);
+        uint64_t cu = (uint64_t) scp.shaderEngineCount * scp.shaderArraysPerEngineCount *
+                      scp.computeUnitsPerShaderArray;
+        if (const char* e = getenv("STRATA_VK_CU_OVERRIDE")) cu = (uint64_t) atoll(e);
+        g_info.multi_processor_count = cu > 0 && cu < 1024 ? (int) cu : 0;
+    }
+    g_info.l2_bytes = 0;   // no Vulkan query for it; radv exposes no L2 property (documented, not guessed)
     VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties(g_phys, &mp);
     g_info.unified_memory = false;

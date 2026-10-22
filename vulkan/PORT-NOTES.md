@@ -109,3 +109,13 @@ CUBLAS_STATUS_EXECUTION_FAILED with the runtime's named message, never a silent 
 `src/core/weights.cpp` unchanged — cudaMalloc/cudaMemcpy/cudaHostAlloc/cudaFreeHost/cudaDeviceSynchronize all
 resolve against the compat headers with no CUDA toolkit on the box — then exercises an arena round-trip and
 the cublas fallback (Sgemm and GemmEx fp16-in/fp32-out) against host references.
+
+**Doorbell (Task 1.3, measured 2026-10-22):** RADV on the BC-250 does NOT deliver host stores to a
+RUNNING kernel — a 40M-read `atomicAdd` spin on a HOST_VISIBLE|HOST_COHERENT buffer never saw a flag
+the host flipped 200 ms in (nor with an uncached/WC allocation + `vkFlushMappedMemoryRanges`): the
+Arc A750 landmine from sycl/ reproduces here. What works: a store that predates the LAUNCH is
+visible to the next kernel on the same buffer (arm 4), and a flag staged in by a copy node before
+the spin is seen on the first read (arm 2, `reads=0`). So `doorbell_ring`/`doorbell_wait`/
+`copy_rows_from_mapped_after` must port as ring-then-launch (or copy-flushed flags), never live
+spins inside a graph; `cudaHostGetDevicePointer` still refuses rather than hand back a host address
+the arena-offset launchers would misread. `vk_doorbell_probe` (ctest) is the witness.

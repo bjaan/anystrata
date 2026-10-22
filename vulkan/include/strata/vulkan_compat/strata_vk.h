@@ -245,8 +245,8 @@ inline cudaError_t cudaGetDeviceProperties(cudaDeviceProp* p, int dev) {
     p->totalGlobalMem = (size_t) d.total_bytes;
     p->sharedMemPerBlock = 65536;             // measured maxComputeSharedMemorySize on this part
     p->maxSharedMemoryPerMultiprocessor = 65536;
-    p->multiProcessorCount = 0;               // not in vk::DeviceInfo yet (Task 1.3)
-    p->l2CacheSize = 0;                       // not in vk::DeviceInfo yet (Task 1.3)
+    p->multiProcessorCount = d.multi_processor_count;   // VK_AMD_shader_core_properties (this box: 24)
+    p->l2CacheSize = d.l2_bytes;                        // 0: radv exposes no L2 query (documented gap)
     p->maxThreadsPerBlock = (int) d.max_workgroup_invocations;
     p->integrated = 0;                        // discrete GPU (its heap is unified, but it is not an APU)
     return cudaSuccess;
@@ -455,8 +455,14 @@ inline cudaError_t cudaHostUnregister(void* p) {
 }
 inline cudaError_t cudaHostGetDevicePointer(void** p, void* h, unsigned) {
     if (!h || !p) return cudaErrorInvalidValue;
+    // Task 1.3 measured why there is no cheap honest alias (vk_doorbell_probe): RADV never delivers a
+    // live host store to a RUNNING kernel, and the arena's offset-as-pointer space does not contain
+    // host RAM — handing back the host address would have the doorbell/publish kernels' launchers read
+    // it as an arena offset and bind the wrong bytes. Call sites all have fallback branches; the ones
+    // that need a real device view of pinned RAM take the staged route (ring -> submit boundary ->
+    // launch, proven by the probe's arm 4) when their kernels port.
     strata_vk_compat::set_error(cudaErrorNotSupported,
-        "strata-vk: no device alias for host memory yet - pinned/doorbell mappings arrive with the Task-1.3 twins");
+        "strata-vk: no device alias for host memory (doorbell measured: host stores never reach a running kernel on RADV; use ring-then-launch)");
     return cudaErrorNotSupported;
 }
 

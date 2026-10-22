@@ -1,0 +1,35 @@
+#version 450
+// vulkan/src/probe/kernels/probe_doorbell.comp — the Task 1.3 doorbell handshake kernel (probe case E).
+// One thread spins reading the flag (w[0]) of the bound buffer, up to kBound reads. The read is
+// `atomicAdd(w[0], 0)`: a zero-add buffer atomic IS the load the memory model cannot hoist or cache
+// (GLSL has no volatile; the loop-carried w[2] store is the weaker second opinion — both were run,
+// both give the same verdict on this box). If the flag is nonzero: echo it to w[1] and write the
+// sentinel 0x5A5A5A5A to w[3]; if the bound expires first: w[4]=1. w[2] = reads performed.
+// doorbell_probe.cpp binds this kernel two ways: arm 1 flips w[0] from the HOST while the kernel runs
+// (does RADV deliver live host stores to a running kernel? the Arc A750 landmine the sycl/ port
+// documented, sycl/include/strata/sycl_queue.hpp:43), arm 2 pre-stages the flag into the buffer with
+// a copy submitted before the spin (the fallback handshake must be green either way).
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) buffer DB {
+    uint w[];   // [0]=flag (host or copy writes) [1]=observed flag [2]=reads [3]=sentinel [4]=timeout
+} db;
+
+const uint kBound = 40000000u;   // ~0.74 s of atomic spins on this part (measured, BC-250/RADV)
+
+void main() {
+    uint reads = 0u;
+    uint flag = atomicAdd(db.w[0], 0u);
+    while (flag == 0u && reads < kBound) {
+        reads = reads + 1u;
+        db.w[2] = reads;
+        flag = atomicAdd(db.w[0], 0u);
+    }
+    db.w[2] = reads;
+    if (flag != 0u) {
+        db.w[1] = flag;
+        db.w[3] = 0x5A5A5A5Au;
+    } else {
+        db.w[4] = 1u;
+    }
+}

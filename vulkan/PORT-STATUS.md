@@ -30,7 +30,7 @@ header helpers, one row per header) | `n/a` (decision `n/a`).
 | dequant_bf16 / dequant_f16 / dequant_f16_ld / dequant_f32 | dequant_bf16.hpp | src/kernels/cuda/dequant_bf16.cu | dequant_wide_parity.cpp | `__constant__` | translate | todo |
 | strata_dp4a (device dot helper) | dp4a.hpp | (header; used by iq/qsa .cu) | none | PTX dp4a via asm | translate (GLSL integer-dot emulation; gfx1013 has no dp4a) | todo |
 | elementwise: embedding_gather, gdn_gate, scale_inplace, add_inplace, f32_to_f16_bulk, f32_to_bf16_bulk, silu_inplace, rms_norm_weighted, scatter_rows_f32, copy_rows_from_mapped(_after), copy_i32_from_mapped, copy_from_mapped_multi | elementwise.hpp | src/kernels/cuda/elementwise.cu | elementwise_parity.cpp | `__shfl`, `__shared__` | translate | todo |
-| elementwise: doorbell_* (ring/wait/publish/payload — host-side pinned-memory plumbing) | elementwise.hpp | (host side of elementwise.cu) | elementwise_parity.cpp | none (host) | host-free (compiled-unchanged) | todo |
+| elementwise: doorbell_* (ring/wait/publish/payload — host-side pinned-memory plumbing) | elementwise.hpp | (host side of elementwise.cu) | elementwise_parity.cpp | none (host) | host-free (compiled-unchanged) | todo — **handshake measured (Task 1.3): host stores are NOT visible to a running kernel on RADV** (see "Device / pinned / vmm twins": doorbell FAILS live, OK across a submit boundary / staged copy); the ported waiter must ring-then-launch, not spin live |
 | fused_gdn_conv_l2 / fused_gdn_ab / fused_gdn_step_norm / fused_gdn_step_norm_silu | fused_gdn.hpp | src/kernels/cuda/fused_gdn.cu | none (covered via spec_verify_parity) | `__shfl`, `__shared__`, `__ldg` | translate | todo |
 | gdn_step / gdn_conv_step / gdn_l2_norm / gdn_beta_gate / gdn_out_norm | gdn.hpp | src/kernels/cuda/gdn.cu | gdn_parity.cpp | `__shfl`, `__shared__` | translate | todo |
 | fused_gr_read / _multi / _persist (config setters host-side) | fused_gr.hpp | src/kernels/cuda/fused_gr.cu | gr_multi_parity.cpp, hc_persist_parity.cpp | `__shfl`, `__shared__`, `cp.async`, `mma`, `asm volatile`, `__ldg` | fp32-fallback (ordered-FP32 variant, docs/AMD_HIP.md QSA-fallback lineage; STRATA_ATTN_PRE75-style portable path) | todo |
@@ -142,6 +142,35 @@ and `_Exit(86)`; `STRATA_VK_STUBS=log` prints one `STUB` line per entry and retu
 run) carry no trap. The roster regenerates mechanically after each port; the ctest cases
 `vk_stubs_trap` / `vk_stubs_trap_log` prove both arms on this box. Link rule: kernel libs come BEFORE
 `strata_vk_stubs` on the link line (`vulkan/CMakeLists.txt`).
+
+## Device / pinned / vmm twins (Task 1.3) — measured on this box (2026-10-22)
+
+**doorbell: FAILS on RADV (host stores NOT visible to a RUNNING kernel).**
+`vk_doorbell_probe` (ctest, probe case E: `src/probe/doorbell_probe.cpp` + `probe_doorbell.comp`):
+a 40M-`atomicAdd`-read spin (~0.74 s) on a HOST_VISIBLE|HOST_COHERENT buffer, flag flipped from the
+host 200 ms into the spin — `observed=0, reads=40,000,000, timeout=1`: the store never reaches the
+running kernel (reproduced 4/4, and identically with an uncached/WC host allocation + explicit
+`vkFlushMappedMemoryRanges`: arm 3, also NEVER SEEN). Same verdict as the sycl port's Arc A750
+(i915). **What DOES work:** the staged handshake — arm 2, a flag copied into device memory by
+`vkCmdCopyBuffer` before the spin launches: `observed=7, reads=0`, sentinel set; and arm 4, a host
+store that predates the LAUNCH is visible to the next kernel on the same coherent buffer
+(`VISIBLE at next launch`). Consequence for the engine's `doorbell_ring`/`doorbell_wait` ports:
+ring = host store + submit boundary; a waiter kernel must be launched AFTER the ring (or the flag
+flushed by a copy node before it), never spun live inside an already-running graph. The pinned twins
+keep the compat `cudaHostAlloc` buffers as the host side of the doorbell — the store travels through
+the queue-submit ordering, which is proven by arm 4.
+
+| contract | CUDA twin | Vulkan twin | state |
+|---|---|---|---|
+| `include/strata/core/device.hpp` (device_count/device_info/device_summary/gpu_arch_problem/primary/CudaError/DeviceArena) | src/core/device.cu | `vulkan/src/core/vk_device_impl.cpp` | implemented, green in `vk_core_smoke` (cc 10.1, arch gfx1013, 24 SMs via VK_AMD_shader_core_properties [2 engines x 2 arrays x 6 CUs, queried WITHOUT enabling the extension; a BIOS-unlocked 40-CU count is NOT visible to it — STRATA_VK_CU_OVERRIDE=N rewrites for occupancy experiments], 15715 MiB total / 14042 MiB free, DeviceArena bump + compat pointer contract round-trip) |
+| `include/strata/core/pinned.hpp` + `pinned_ring.hpp` | src/core/pinned.cu | `vulkan/src/core/vk_pinned.cpp` (pinned.cu's body against the compat layer — the file has no device code; PinnedRing is header-inline over compat) | implemented, green in `vk_core_smoke` (PinnedArena 8 MiB: `cudaHostRegister PORTABLE ok` on NormalPages — hugetlb absent (vm.nr_hugepages=0), THP reported as found; ring h2d bit-exact). PCIe probe: `stream_bandwidth` routes to a NAMED SKIP by default (uma=1, no bus tier; `seconds=-1` "not measured", never a fake number; `STRATA_VK_SKIP_PCIE_PROBE=0` measures anyway) |
+| `include/strata/core/vmm.hpp` | src/core/vmm.cpp (driver entry points resolve null through compat — the engine's documented off-switch) | `vulkan/src/core/vk_vmm.cpp` | **grow-never arena fallback** (`host-free fallback`): reserve() maps the whole span up front, mapped(i) true from the start, unmap/freed nothing (bump arena). The elastic K/V reports full at all times: `--kv-grow` costs its max context at startup instead of at token 4000; take()-donated spare chunks waste their bytes (bounded, recorded here). Green in `vk_core_smoke` |
+| `multiProcessorCount` / `l2CacheSize` for cudaDeviceProp | (CUDA query) | vk_device.cpp: CU count via VK_AMD_shader_core_properties (=24 measured); **L2: no Vulkan query exists on radv — stays 0, documented**, readers only tune prefetch/bench cycling with it (`s2_expert_grouped_parity.cpp:532`) | gap closed for CUs, honestly open for L2 |
+
+`src/core/device.cu`, `src/core/pinned.cu` and `src/core/vmm.cpp` are NOT compiled by this backend; the
+twins live in `vulkan/src/core/` (static lib `strata_vk_core`). `vk_core_smoke` is the ctest proof
+(28 checks, all green on this box).
+
 
 ## cublas CPU fallback (Task 1.1)
 
