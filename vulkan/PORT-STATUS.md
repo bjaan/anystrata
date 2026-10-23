@@ -201,7 +201,7 @@ Re-run with `STRATA_VK_STUBS=log` enumerates the rest of the qwen35moe decode pa
 | 1 | `strata::poly::copy2` | poly: copy2_kernel — **PORTED (Task 2.1)** |
 | 2 | `strata::poly::rms_norm` | poly: rms_norm_kernel — **PORTED (Task 2.1)** |
 | 3 | `strata::kernels::native_quantize_q8_1` | q8_1 (native_quantize_q8_1, …) — **PORTED (Task 2.1)** |
-| 4 | `strata::kernels::native_mmvq` | native_mmvq / _pair / _slots / _ids — **iq2_xxs (type 16) PORTED (Task 2.2)**; other types trap-by-name |
+| 4 | `strata::kernels::native_mmvq` | native_mmvq / _pair / _slots / _ids — **iq2_xxs (type 16) PORTED (Task 2.2)**; **iq3_xxs (type 18) PORTED (Task 2.9)**; other types trap-by-name |
 | 5 | `strata::poly::gemv_f32` | poly: gemv_kernel — **PORTED (Task 2.4)** |
 | 6 | `strata::poly::conv4_silu` | poly: conv4_silu/_rows/_state kernels — **PORTED (Task 2.4)** |
 | 7 | `strata::poly::gdn_step` | poly: gdn_norm/gates/state/state_reg/out kernels — **PORTED (Task 2.5)** |
@@ -324,6 +324,23 @@ EW_VARIANT 3 (flattened grid + 65535-row chunking, mul_sigmoid's pattern): worst
 (exp vs expf, inside the 1e-5 family bound). native_mmvq_ids (:3194, the sibling contract) NOT
 ported — still trap-by-number; record: the next halt may demand it. ctest 11/11. Model gate:
 load 32.6 s, decode ran past #11 and #12, stopped at native_mmvq type 18 = IQ3_XXS (ggml.h:408).
+
+**Halt point after Task 2.9 (2026-10-23):** `strata::poly::head_norm_rope` (demand #14 — the
+pre-digested order holds; store_f16 #15 and any type-8 Q8_0 / slots-18 demand did NOT show up).
+IQ3_XXS (type 18) ported as mmvq_iq3_xxs.comp — a straight swap of the proven iq2_xxs template:
+Fmt<18> (iq_kernels.cu:613) is qk 256/ipb 8/step 2, identical launch geometry (ROWS=4, grid
+ceil(n_out/4)); vec_dot_iq3_xxs_q8_1 (:191-214) differs from iq2_xxs' only in (a) block_iq3_xxs =
+98 B (half d + 64 grid-index bytes + 32 aux bytes: aux32 at byte 66+2*iqs, read word-wise through
+the wb/w32 byte assembler — 98 is not 4-aligned), (b) two uint32 grid words per l0 pair
+(make_int2 of CONSECUTIVE iq3xxs_grid entries, not one uint64's halves — the table is 256 x uint32,
+extracted verbatim to iq3xxs_grid_vk.h and uploaded once to the arena like iq2xxs'), (c) the scale
+step `(ls*sumi + sumi/2)/2` with ls = aux32>>28 (trunc_div2 by hand, both divisions truncate toward
+zero). native_mmvq_slots(18) still returns false (no slots kernel for 18 — the engine falls back to
+per-matrix native_mmvq, which is what the model exercised: single-launch arms ran, halt advanced).
+native_mmvq_vk_parity: iq3_xxs 5 shapes (2048x64 ncols 1/2, 2048x768, 768x64 ncols 3, 256x3 —
+expert dims included) = 1155 outputs **BITWISE**, 0 differ; suite now 10228 compared, 0 differ.
+ctest 11/11. Model gate: load 30.7 s, 10496/10496 experts in VRAM, decode ran past type-18 mmvq
+and stopped at head_norm_rope — demand #14 next.
 
 Phase-2 first picks by demand order: `copy2`, `rms_norm`, then the mmvq family
 (`native_quantize_q8_1`, `native_mmvq`) — matching the plan's expectation (quantize_act /

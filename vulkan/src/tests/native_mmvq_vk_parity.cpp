@@ -28,6 +28,7 @@
 #include "strata/vulkan_runtime.hpp"
 #include "strata/vulkan_compat/strata_vk.h"
 #include "iq2xxs_grid_vk.h"
+#include "iq3xxs_grid_vk.h"
 
 #include <cmath>
 #include <cstdint>
@@ -109,6 +110,35 @@ float vdot_iq2_xxs(const uint8_t* bq2, const uint8_t* q8, int iqs) {
     const int ls = int((aux32 >> 27) | 1u);
     sumi = (sumi * ls) / 8;                                              // C truncation toward zero
     uint16_t d8h; std::memcpy(&d8h, q8, 2);                              // __low2float(ds)
+    return dw * f16_to_f32(d8h) * float(sumi);
+}
+
+// vec_dot_iq3_xxs_q8_1 (iq_kernels.cu:191-214) transcribed verbatim; bq3 = block bytes (98 B: half d
+// at 0, 64 grid-index bytes at 2..65, aux words at 66..97 - get_int_b2(qs, 16 + iqs/2) = 4 bytes at
+// 2 + 4*(16 + iqs/2) = 66 + 2*iqs), q8 = the q8_1 block's byte 0 (word 0 = ds, bytes 4..35 = qs).
+float vdot_iq3_xxs(const uint8_t* bq3, const uint8_t* q8, int iqs) {
+    uint16_t dh; std::memcpy(&dh, bq3, 2);
+    const float dw = f16_to_f32(dh);
+    uint32_t q3[2];
+    std::memcpy(q3,    bq3 + 2 + 4 * iqs,       8);   // make_int2(get_int_b2(qs,iqs), get_int_b2(qs,iqs+1))
+    const uint8_t* qb = (const uint8_t*) q3;          // q3[] indexes bytes l0, l0+1 of the pair
+    uint32_t aux32;
+    std::memcpy(&aux32, bq3 + 66 + 2 * iqs, 4);       // get_int_b2(qs, QK_K/16 + iqs/2)
+    int sumi = 0;
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const uint32_t gx = strata::vk::kIq3xxsGrid[qb[l0 + 0]];       // word itself = four int8 lanes
+        const uint32_t gy = strata::vk::kIq3xxsGrid[qb[l0 + 1]];
+        const uint32_t signs = unpack_ksigns((aux32 >> (7 * (l0 / 2))) & 0xFFu);
+        const uint32_t s0 = vcmpne4(signs & 0x08040201u);
+        uint32_t u0; std::memcpy(&u0, q8 + 4 + l0 * 4, 4);             // get_int_b4(bq8->qs, l0)
+        sumi = dp4a(vsub4(gx ^ s0, s0), u0, sumi);
+        const uint32_t s1 = vcmpne4(signs & 0x80402010u);
+        uint32_t u1; std::memcpy(&u1, q8 + 4 + (l0 + 1) * 4, 4);
+        sumi = dp4a(vsub4(gy ^ s1, s1), u1, sumi);
+    }
+    const int ls = int(aux32 >> 28);                                   // logical shift; 4-bit value
+    sumi = (ls * sumi + sumi / 2) / 2;                                 // C truncation toward zero, both divs
+    uint16_t d8h; std::memcpy(&d8h, q8, 2);                            // __low2float(ds)
     return dw * f16_to_f32(d8h) * float(sumi);
 }
 
@@ -316,6 +346,72 @@ int main(int argc, char** argv) {
                 }
             }
         std::printf("native_mmvq iq2_xxs vk vs reference: n_in %d n_out %d ncols %d: %d outputs, %d differ bitwise\n",
+                    s.n_in, s.n_out, s.ncols, s.ncols * s.n_out, shape_fails);
+    }
+    // ---- type 18 (IQ3_XXS, Task 2.9): Fmt<18> = {qk 256, ipb 8, step 2}, ROWS=4 grid ceil(n_out/4)
+    // always (mmvq_kernel<18> default, iq_kernels.cu:3126 iq_mmvq -> the Split/multi kernel pinned
+    // bitwise-equal per column). Blocks are 98 B.
+    const Shape iq3_shapes[] = {{2048, 64, 1}, {2048, 64, 2}, {2048, 768, 1}, {768, 64, 3}, {256, 3, 1}};
+    for (const Shape& s : iq3_shapes) {
+        const int nb = s.n_in / 256;
+        std::mt19937 rng(4200 + s.n_in * 13 + s.ncols);
+        std::uniform_real_distribution<float> sc(0.0009765625f, 0.03125f);   // d in [2^-10, 2^-5)
+        std::vector<uint8_t> W(size_t(s.n_out) * nb * 98);
+        for (auto& blk : W) blk = uint8_t(rng() & 0xFF);                     // random legal bytes
+        for (int r = 0; r < s.n_out; ++r)
+            for (int b = 0; b < nb; ++b) {
+                const uint16_t dh = f16_rn((rng() & 1) ? -sc(rng) : sc(rng));
+                std::memcpy(W.data() + (size_t(r) * nb + b) * 98, &dh, 2);   // finite fp16 scale
+            }
+        std::vector<float> x(size_t(s.n_in) * s.ncols);
+        for (auto& v : x) v = float(int(rng() % 2001) - 1000) / 250.0f;
+
+        const uint64_t w_sz = W.size(), w_pad = (w_sz + 3) & ~3ull;          // words read up to a pad
+        const uint64_t x_sz = size_t(s.n_in) / 32 * s.ncols * 36;
+        const uint64_t y_sz = size_t(s.ncols) * s.n_out * 4;
+        const uint64_t ax = a.alloc(x.size() * 4), aq = a.alloc(x_sz);
+        const uint64_t aw = a.alloc(w_pad + 4), ay = a.alloc(y_sz);
+        vk::copy_h2d((void*)ax, x.data(), x.size() * 4, nullptr);
+        vk::copy_h2d((void*)aw, W.data(), w_sz, nullptr);
+        vk::fill_d((void*)ay, 0xFE, y_sz, nullptr);
+        kernels::native_quantize_q8_1((const float*)strata_vk_compat::wrap(ax), strata_vk_compat::wrap(aq),
+                                      s.n_in, s.ncols, strata_vk_compat::wrap(1000));
+        std::vector<uint8_t> Q(x_sz);
+        vk::copy_d2h(Q.data(), (void*)aq, x_sz, nullptr);
+
+        kernels::native_mmvq(18, strata_vk_compat::wrap(aw), strata_vk_compat::wrap(aq),
+                             (float*)strata_vk_compat::wrap(ay), s.n_in, s.n_out, s.ncols,
+                             strata_vk_compat::wrap(1000));
+        std::vector<float> y(size_t(s.ncols) * s.n_out);
+        vk::copy_d2h(y.data(), (void*)ay, y_sz, nullptr);
+
+        int shape_fails = 0;
+        for (int c = 0; c < s.ncols; ++c)
+            for (int r = 0; r < s.n_out; ++r) {
+                const uint8_t* wr = W.data() + size_t(r) * nb * 98;
+                const uint8_t* xcol = Q.data() + size_t(c) * nb * 8 * 36;
+                float part[32] = {0.f};
+                for (int k = 0; k < nb * 8; ++k) {                          // lane k%32's call k
+                    const int kbx = k / 8, iqs = 2 * (k % 8);
+                    part[k % 32] += vdot_iq3_xxs(wr + kbx * 98, xcol + size_t(kbx * 8 + iqs / 2) * 36, iqs);
+                }
+                float acc[32], nxt[32];
+                std::memcpy(acc, part, sizeof part);
+                for (int o = 16; o > 0; o >>= 1) {                          // warp_sum's xor tree
+                    for (int l = 0; l < 32; ++l) nxt[l] = acc[l] + acc[l ^ o];
+                    std::memcpy(acc, nxt, sizeof nxt);
+                }
+                const float ref = acc[0], got = y[size_t(c) * s.n_out + r];
+                ++compared;
+                if (got != ref) {
+                    uint32_t gb, rb; std::memcpy(&gb, &got, 4); std::memcpy(&rb, &ref, 4);
+                    if (shape_fails < 24)
+                        std::printf("  MISMATCH t18 n_in %d ncols %d r %d: got %.9g ref %.9g (bits %08x/%08x)\n",
+                                    s.n_in, c, r, got, ref, gb, rb);
+                    ++shape_fails; ++fails;
+                }
+            }
+        std::printf("native_mmvq iq3_xxs vk vs reference: n_in %d n_out %d ncols %d: %d outputs, %d differ bitwise\n",
                     s.n_in, s.n_out, s.ncols, s.ncols * s.n_out, shape_fails);
     }
     // ---- type 13 (Q5_K): n_in 2048 -> rows=1 (nb 8, SmallK=false); 768/256 -> rows=4 (SmallK=true)
