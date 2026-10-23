@@ -198,8 +198,12 @@ is not an engine family today — `src/poly/engine.cpp:992` dispatches only qwen
 glm5-next / gemma4 / deepseek4 / lfm2moe. Interim: `tools/vulkan/serve-swift27.sh`
 (llama.cpp Vulkan; measured 87 pp / 15.5 tg tok/s on this card). Engine support needs:
 
-- **7.1** Check upstream PolyStrata for a `qwen35`-dense family (merge if it exists — the
-  fork's rule is upstream engine code unchanged).
+- **7.1** DONE 2026-10-23: checked upstream — VecSzn/PolyStrata main's dispatch
+  (src/poly/engine.cpp:1010-1014) serves only glm5-next / qwen35moe / gemma4 / deepseek4 /
+  lfm2moe, exactly like this fork: **no qwen35-dense family exists upstream**. 7.2 is
+  therefore authoring work (`Qwen38Dense` alongside the five), and it is a real PR candidate
+  upstream — the model itself (Swift-1.5-27B GGUFs, llama.cpp arch `qwen35`) is a popular
+  family and the fork's whole kernel roster for it is already here. Proceeding to 7.2.
 - **7.2** If not: a new `vulkan`-side... NO — the family is engine-host code (architecture
   neutral, CUDA-shaped): `src/poly/qwen38dense.cpp` mirrors `qwen35.cpp`'s shape minus MoE
   routing; upstream would take it as a feature PR; the Vulkan port only needs whatever
