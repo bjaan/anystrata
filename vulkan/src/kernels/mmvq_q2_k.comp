@@ -1,0 +1,123 @@
+// vulkan/src/kernels/mmvq_q2_k.comp - native_mmvq for ggml_type 10 (Q2_K).
+//
+// Line-by-line translation of src/kernels/cuda/native_mmvq.cu's native_q2_k_mmvq (2851-2873):
+// Q2_K has no multi-column kernel there - each column is its own single-column launch, so the
+// c loop below re-bases x and y per column exactly as the CUDA wrapper's j loop does (the slots
+// path stays false for type 10, mirroring slots_kind == 0). The partition is the Q3_K shape:
+// QK=256, QI=16, VDR=1, kqs = tid % 16, BLOCKS_PER_ITER = WARPS*WARP/16 = 8, and the SmallK
+// pick (:2865) is n_in/256 < 8 -> ROWS=4 (grid ceil(n_out/4)), else ROWS=1 (grid n_out).
+//
+// The dot is q2k_q8_dot (501-523) verbatim: same word indices, same i order 0..3, same float
+// accumulation. Q2KBlock (102-106, static_asserts :144-145): scales[16]@0, qs[64]@16, dm half2@80
+// = 84 bytes, 4-aligned but 84 % 4 == 0 only at 4-byte stride blocks... 84 = 21 words exactly,
+// so a row-major block stream keeps every block 4-aligned; the (int*)w->qs loads at byte
+// 16 + 4*kqs stay on word boundaries. scales[i] and dm are byte-assembled (wb/w16) regardless.
+//
+// Contraction law (PORT-NOTES "RADV arithmetic gotchas" #6, the q4_k lineage's verified fusion):
+// CUDA builds with --use_fast_math and no -ffp-contract=off, so the exact dot semantics are
+// FUSED: sumf_d += fma(d8, dot*sc, sumf_d), sumf_m += fma(d8, dot_m, sumf_m), and the return is
+// fma(-dm_y, sumf_m, dm_x * sumf_d). glslc keeps OpFMul+OpFAdd and RADV's NIR fuses to exactly
+// that; the parity test's host reference spells std::fma in the same order.
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer W    { uint  v[]; } bw;   // Q2_K blocks, 21 words each
+layout(std430, binding = 1) readonly buffer X    { uint  v[]; } bx;   // q8_1 columns, 9 words/block
+layout(std430, binding = 2)           buffer Y    { float v[]; } by;   // ncols * n_out floats
+
+layout(push_constant) uniform PC { uint n_in; uint n_out; uint ncols; uint rows; } pc;
+
+uint wb(uint B) { return (bw.v[B >> 2u] >> (8u * (B & 3u))) & 0xFFu; }
+uint w32(uint B) { return wb(B) | (wb(B + 1u) << 8u) | (wb(B + 2u) << 16u) | (wb(B + 3u) << 24u); }
+
+int sbyte(uint a, uint i) {
+    const uint b = (a >> (8u * i)) & 255u;
+    return b >= 128u ? int(b) - 256 : int(b);
+}
+int dp4a(int a, int b, int c) {
+    for (uint i = 0u; i < 4u; ++i) c += sbyte(uint(a), i) * sbyte(uint(b), i);
+    return c;
+}
+
+// q2k_q8_dot(w = block at word b, x = q8 chain at word base xw, iqs), load/apply folded.
+// 84 B = 21 words per block: the row-major stream keeps every block 4-aligned, so qs[iqs] is a
+// direct word read at b+4+iqs (qs@byte 16 = word 4) and dm at b+20 (byte 80 = word 20). scales
+// bytes are still byte-addressed through wb against the global byte offset 4*b.
+float q2_k_dot(uint b, uint xw, uint iqs) {
+    const uint bq8_offset = 4u * (iqs / 8u);
+    // scales = w->scales + (iqs - iqs % 8 + (iqs % 8) / 4)   (scales@byte 0 of the block)
+    const uint sb = 4u * b + iqs - (iqs % 8u) + (iqs % 8u) / 4u;
+    const uint v = bw.v[b + 4u + iqs];               // (int*)w->qs [iqs]
+    float sumf_d = 0.0;
+    float sumf_m = 0.0;
+    for (uint i = 0u; i < 4u; ++i) {
+        // bq8i = x + bq8_offset + i: word base xw + (bq8_offset + i)*9; u = (int*)qs + (iqs%8)
+        const uint xb = xw + (bq8_offset + i) * 9u;
+        const int u = int(bx.v[xb + 1u + (iqs % 8u)]);
+        const float d8 = unpackHalf2x16(bx.v[xb]).x; // __low2float(bq8i->ds)
+        const uint sc = wb(sb + 2u * i);
+        const uint vi = (v >> (2u * i)) & 0x03030303u;
+        sumf_d += d8 * float(dp4a(int(vi), u, 0) * int(sc & 0xFu));   // contraction(on): -> fma
+        int m = int(sc >> 4u);
+        m |= m << 8;
+        m |= m << 16;
+        sumf_m += d8 * float(dp4a(m, u, 0));
+    }
+    const vec2 dm = unpackHalf2x16(bw.v[b + 20u]);   // __half22float2(w->dm)
+    return dm.x * sumf_d - dm.y * sumf_m;
+}
+
+// double-buffered across columns (max 8) so each c's reduction reads only its own writes
+shared float sh[8][4][4][32];
+
+void main() {
+    const uint tid    = gl_LocalInvocationID.x;      // CUDA tid = 32*threadIdx.y + threadIdx.x
+    const uint lane   = tid & 31u;
+    const uint subrow = tid >> 5u;                   // threadIdx.y
+    const uint nb     = pc.n_in / 256u;              // blocks_per_row
+    const uint row0   = (pc.rows == 4u) ? gl_WorkGroupID.x * 4u : gl_WorkGroupID.x;
+    const uint kqs    = tid % 16u;                   // VDR = 1
+    const uint maxc   = min(pc.ncols, 8u);
+    for (uint c = 0u; c < maxc; ++c) {
+        float t0 = 0.0, t1 = 0.0, t2 = 0.0, t3 = 0.0;
+        const uint xc = c * (nb * 8u) * 9u;          // column c's x base (words)
+        for (uint kbx = tid / 16u; kbx < nb; kbx += 8u) {   // BLOCKS_PER_ITER = WARPS*WARP/16
+            const uint xb = xc + kbx * 8u * 9u;      // kby = kbx * QK/Q8K q8 blocks
+            const uint wb0 = kbx * 21u;
+            // inner `for (i = 0; i < ROWS; ++i)` in the same order; the row guard keeps the
+            // partial-row-group read in-bounds exactly like the CUDA source.
+            if (pc.rows == 1u) {
+                t0 += q2_k_dot(row0 * nb * 21u + wb0, xb, kqs);
+            } else {
+                if (row0 + 0u < pc.n_out) t0 += q2_k_dot((row0 + 0u) * nb * 21u + wb0, xb, kqs);
+                if (row0 + 1u < pc.n_out) t1 += q2_k_dot((row0 + 1u) * nb * 21u + wb0, xb, kqs);
+                if (row0 + 2u < pc.n_out) t2 += q2_k_dot((row0 + 2u) * nb * 21u + wb0, xb, kqs);
+                if (row0 + 3u < pc.n_out) t3 += q2_k_dot((row0 + 3u) * nb * 21u + wb0, xb, kqs);
+            }
+        }
+        sh[c][subrow][0u][lane] = t0;
+        if (pc.rows == 4u) {           // ROWS=1: CUDA partial[..][i>0] is never written; keep the
+            sh[c][subrow][1u][lane] = t1;   // slots untouched (zero) so the sum stays exact.
+            sh[c][subrow][2u][lane] = t2;
+            sh[c][subrow][3u][lane] = t3;
+        }
+        groupMemoryBarrier(); barrier();
+        // CUDA: warp 0 only (threadIdx.y > 0 returned) sums tmp + partial[l] l = 0..WARPS-2
+        // ascending = sh[0]+sh[1]+sh[2]+sh[3] (all 4 SUBROWS, whatever ROWS is: for rows==1 the
+        // other three subrows hold the same row's t0 partials).
+        if (subrow == 0u) {
+            for (uint i = 0u; i < pc.rows; ++i) {
+                float acc = sh[c][0u][i][lane];
+                acc = acc + sh[c][1u][i][lane];
+                acc = acc + sh[c][2u][i][lane];
+                acc = acc + sh[c][3u][i][lane];
+                for (uint o = 16u; o > 0u; o >>= 1u) acc += subgroupShuffleXor(acc, o);   // warp_sum tree
+                if (lane == i && row0 + i < pc.n_out) by.v[c * pc.n_out + row0 + i] = acc;
+            }
+        }
+        groupMemoryBarrier(); barrier();             // next c must not race this c's reads
+    }
+}

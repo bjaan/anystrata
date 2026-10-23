@@ -220,6 +220,7 @@ Re-run with `STRATA_VK_STUBS=log` enumerates the rest of the qwen35moe decode pa
 | 19 | `strata::kernels::native_mmvq` type 22 (IQ2_S) | native_mmvq family — **PORTED (Task 2.14)** |
 | 20 | `strata::kernels::native_mmvq` type 12 (Q4_K) | native_mmvq family — **PORTED (Task 2.15)** |
 | 21 | `strata::poly::gemv_bf16` | poly: gemv_kernel<uint16_t> — **PORTED (Task 2.16)** |
+| 22 | `strata::kernels::native_mmvq` type 10 (Q2_K) | native_mmvq family — **PORTED (Task 2.17)** |
 
 (The log arm returns untouched outputs, so entries after #1 are the path's *shape*, not a
 guaranteed per-token sequence; the first trap, `copy2`, is exact — the default arm stops there.)
@@ -501,3 +502,18 @@ contract `acc += w*x` here, same as f32 gemv). gen_poly_stubs.py PORTED += gemv_
 traps. ctest 13/13. Model gate: load 33.8 s, 10496/10496 experts, halt moved from poly gemv_bf16
 to `native_mmvq type 10` (Q2_K; native_mmvq.cu's Q2_K mmvq is the next shape to port — the
 K-quants' super-block scale decode, the q4_k template's closest sibling).
+
+**Halt point after Task 2.17 (2026-10-23):** `strata::kernels::native_mmvq` **type 11 (Q3_K)** —
+demand #22 cleared: Q2_K mmvq as mmvq_q2_k.comp, the q4_k clone with the Q3_K partition (VDR=1:
+kqs = tid%16, BLOCKS_PER_ITER = WARPS*WARP/16 = 8, SmallK n_in/256 < 8 -> ROWS=4) and the 84 B
+Q2KBlock = 21 words (scales[16]@0, qs[64]@16, dm half2@80 — 4-aligned at 84 B stride, so qs[iqs]
+and dm are direct word reads; only the scales bytes go through wb). The dot is q2k_q8_dot
+(:501-523) line-for-line: per-i `vi = (v >> 2i) & 0x03030303` DP4A vs the q8 word at (iqs%8),
+sc = scales[2i] split 0xF/>>4 replicated, and the fused return fma(-dm.y, sumf_m, dm.x*sumf_d)
+(the q4_k contraction arm went bitwise first try — both arms verified in one run). Single-matrix
+dispatch only: the CUDA wrapper launches per-column (:2862 j loop), the comp's c loop re-bases
+x/y exactly like that; slots stays false (mirrors slots_kind == 0). Parity (+6 shapes
+2048x64/768/768x3 + 768x64x2/768x3/256x3x2, rows 1 and 4): **BITWISE 0 differ, 3273 outputs
+added -> 27795 total compared, 0 differ**. ctest 13/13. Model gate: load 32.8 s, 10496/10496
+experts, 8 mmvq10 launches traced, and the halt moves from type 10 to `native_mmvq type 11`
+(Q3_K — the q5_k/q4_k decode tree with the 5-bit qh plane's low bit folded, the next sibling).
