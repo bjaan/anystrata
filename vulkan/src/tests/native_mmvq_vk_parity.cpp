@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <bit>
 #include <random>
 #include <vector>
 
@@ -467,6 +468,140 @@ int main(int argc, char** argv) {
         }
         std::printf("native_mmvq q6_k vk vs reference: n_in %d n_out %d ncols %d rows %d: %d outputs, %d differ bitwise\n",
                     s.n_in, s.n_out, s.ncols, rows, s.ncols * s.n_out, shape_fails);
+    }
+    // ---- Task 2.8: native_mmvq_slots. Per the CUDA contract (native_mmvq.hpp:140-149, kernel
+    // :1710-1755 / iq mmvq_slots_kernel :3491-3501): matrix i is w[i] times x[i] into y[i], one
+    // column each, and per-slot work is the SAME partition as the single-launch kernel — so
+    // y_slots == y_single BITWISE is the strongest check; we additionally assert the host refs.
+    // Mixed slots across types: iq2_xxs expert dims (2048 x 768), q5_k (2048 x 2048 style), q6_k.
+    const int slots_cases = 0; (void)slots_cases;
+    {
+        struct SlotCase { int type, count, n_in, n_out; int rb; };   // rb = row block bytes
+        // 2048: ROWS=1 arm for 13/14; 512: the SmallK ROWS=2 arm (nb 2 < 8/4) — the host refs
+        // model the single-call ROWS=4 partition, provably the same per-row lane sums (see above).
+        const SlotCase cases[] = { {16, 3, 2048, 768, 66}, {13, 2, 2048, 512, 176}, {14, 2, 2048, 2048, 210},
+                                   {14, 3, 512, 64, 210}, {13, 2, 512, 7, 176} };
+        for (const auto& sc : cases) {
+            const int nb = sc.n_in / 256;
+            std::mt19937 rng(7700 + sc.type * 101 + sc.count);
+            std::vector<std::vector<uint8_t>> W(sc.count);
+            for (auto& w : W) {
+                w.resize(size_t(sc.n_out) * nb * sc.rb);
+                for (auto& blk : w) blk = uint8_t(rng() & 0xFF);
+            }
+            if (sc.type == 16) for (auto& w : W) for (int r = 0; r < sc.n_out; ++r) for (int b = 0; b < nb; ++b) {
+                const uint16_t dh = f16_rn((rng() & 1) ? -0.01f : 0.02f);
+                std::memcpy(w.data() + (size_t(r) * nb + b) * 66, &dh, 2);
+            } else if (sc.type == 13) for (auto& w : W) for (int r = 0; r < sc.n_out; ++r) for (int b = 0; b < nb; ++b) {
+                const uint16_t dh = f16_rn((rng() & 1) ? -0.01f : 0.02f), dl = f16_rn((rng() & 1) ? -0.02f : 0.01f);
+                std::memcpy(w.data() + (size_t(r) * nb + b) * 176, &dh, 2);
+                std::memcpy(w.data() + (size_t(r) * nb + b) * 176 + 2, &dl, 2);
+            } else for (auto& w : W) for (int r = 0; r < sc.n_out; ++r) for (int b = 0; b < nb; ++b) {
+                const uint16_t dh = f16_rn((rng() & 1) ? -0.01f : 0.02f);
+                std::memcpy(w.data() + (size_t(r) * nb + b) * 210 + 208, &dh, 2);
+            }
+            // one shared activation column (the engine repeats x[i]): quantize once
+            std::vector<float> x(sc.n_in);
+            for (auto& v : x) v = float(int(rng() % 2001) - 1000) / 250.0f;
+            const uint64_t x_sz = size_t(nb) * 8 * 36;
+            const uint64_t ax = a.alloc(x.size() * 4), aq = a.alloc(x_sz);
+            vk::copy_h2d((void*)ax, x.data(), x.size() * 4, nullptr);
+            kernels::native_quantize_q8_1((const float*)strata_vk_compat::wrap(ax), strata_vk_compat::wrap(aq),
+                                          sc.n_in, 1, strata_vk_compat::wrap(1000));
+            std::vector<uint8_t> Q(x_sz);
+            vk::copy_d2h(Q.data(), (void*)aq, x_sz, nullptr);
+
+            kernels::MmvqSlots slots{};
+            std::vector<uint64_t> aw(sc.count), ay(sc.count);
+            const uint64_t y_sz = size_t(sc.n_out) * 4;
+            for (int i = 0; i < sc.count; ++i) {
+                const uint64_t w_pad = (W[i].size() + 3) & ~3ull;
+                aw[i] = a.alloc(w_pad + 4);
+                ay[i] = a.alloc(y_sz);
+                vk::copy_h2d((void*)aw[i], W[i].data(), W[i].size(), nullptr);
+                vk::fill_d((void*)ay[i], 0xFE, y_sz, nullptr);
+                slots.w[i] = strata_vk_compat::wrap(aw[i]);
+                slots.x[i] = strata_vk_compat::wrap(aq);      // the same column in every slot
+                slots.y[i] = (float*)strata_vk_compat::wrap(ay[i]);
+            }
+            // single-launch reference outputs (the base kernel for the same type/shape)
+            std::vector<std::vector<float>> y_single(sc.count);
+            for (int i = 0; i < sc.count; ++i) {
+                kernels::native_mmvq(sc.type, slots.w[i], slots.x[i], slots.y[i], sc.n_in, sc.n_out, 1,
+                                     strata_vk_compat::wrap(1000));
+                y_single[i].resize(sc.n_out);
+                vk::copy_d2h(y_single[i].data(), (void*)ay[i], y_sz, nullptr);
+                vk::fill_d((void*)ay[i], 0xFE, y_sz, nullptr);   // re-poison for the slots run
+            }
+            if (!kernels::native_mmvq_slots(sc.type, slots, sc.count, sc.n_in, sc.n_out,
+                                            strata_vk_compat::wrap(1000))) {
+                std::printf("slots: native_mmvq_slots(%d) returned FALSE — FAIL\n", sc.type);
+                ++fails;
+                continue;
+            }
+            int shape_fails = 0;
+            for (int i = 0; i < sc.count; ++i) {
+                std::vector<float> y(sc.n_out);
+                vk::copy_d2h(y.data(), (void*)ay[i], y_sz, nullptr);
+                for (int r = 0; r < sc.n_out; ++r) {
+                    // (a) bitwise the single-launch kernel's answer
+                    if (y[r] != y_single[i][r]) {
+                        if (shape_fails < 8) {
+                            uint32_t gb, sb; std::memcpy(&gb, &y[r], 4); std::memcpy(&sb, &y_single[i][r], 4);
+                            std::printf("  MISMATCH slots t %d slot %d r %d: slots %.9g single %.9g (bits %08x/%08x)\n",
+                                        sc.type, i, r, y[r], y_single[i][r], gb, sb);
+                        }
+                        ++shape_fails; ++fails;
+                    }
+                    // (b) bitwise the host transcription of the same partition
+                    float ref;
+                    if (sc.type == 16) {
+                        const uint8_t* wr = W[i].data() + size_t(r) * nb * 66;
+                        float part[32] = {0.f};
+                        for (int k = 0; k < nb * 8; ++k)
+                            part[k % 32] += vdot_iq2_xxs(wr + (k / 8) * 66, Q.data() + size_t(k) * 36, 2 * (k % 8));
+                        float acc[32], nxt[32]; std::memcpy(acc, part, sizeof acc);
+                        for (int o = 16; o > 0; o >>= 1) { for (int l = 0; l < 32; ++l) nxt[l] = acc[l] + acc[l ^ o]; std::memcpy(acc, nxt, sizeof nxt); }
+                        ref = acc[0];
+                    } else if (sc.type == 13) {
+                        const int rows = (nb < 8) ? 4 : 1;
+                        ref = q5_k_ref(W[i].data(), Q.data(), nb, rows == 1 ? r : (r / 4) * 4, rows, r % 4);
+                    } else {
+                        const int rows = (nb < 4) ? 4 : 1;
+                        ref = q6_k_ref(W[i].data(), Q.data(), nb, rows == 1 ? r : (r / 4) * 4, rows, r % 4);
+                    }
+                    ++compared;
+                    if (y[r] != ref) {
+                        if (shape_fails < 8) {
+                            uint32_t gb, rb2; std::memcpy(&gb, &y[r], 4); std::memcpy(&rb2, &ref, 4);
+                            std::printf("  MISMATCH slots-ref t %d slot %d r %d: got %.9g ref %.9g (bits %08x/%08x)\n",
+                                        sc.type, i, r, y[r], ref, gb, rb2);
+                        }
+                        ++shape_fails; ++fails;
+                    }
+                }
+            }
+            std::printf("native_mmvq_slots t %d count %d n_in %d n_out %d: %d outputs, %d differ bitwise\n",
+                        sc.type, sc.count, sc.n_in, sc.n_out, sc.count * sc.n_out, shape_fails);
+        }
+        // ---- an unported format: false, with NOTHING launched (CUDA wrapper :3179's slots_kind
+        // leg) — y stays poisoned. Type 12 (Q4_K) is ported nowhere here (single-matrix traps).
+        {
+            kernels::MmvqSlots slots{};
+            const uint64_t aw0 = a.alloc(256), ax0 = a.alloc(256), ay = a.alloc(64 * 4);
+            vk::fill_d((void*)ay, 0xFE, 64 * 4, nullptr);
+            slots.w[0] = strata_vk_compat::wrap(aw0);
+            slots.x[0] = strata_vk_compat::wrap(ax0);
+            slots.y[0] = (float*)strata_vk_compat::wrap(ay);
+            if (kernels::native_mmvq_slots(12, slots, 1, 2048, 64, strata_vk_compat::wrap(1000))) {
+                std::printf("slots: type 12 returned TRUE — FAIL\n"); ++fails;
+            }
+            std::vector<float> y(64);
+            vk::copy_d2h(y.data(), (void*)ay, 64 * 4, nullptr);
+            for (int r = 0; r < 64; ++r)
+                if (std::bit_cast<uint32_t>(y[r]) != 0xFEFEFEFEu) { std::printf("slots t12 poisoned y touched — FAIL\n"); ++fails; break; }
+            std::printf("native_mmvq_slots unported type 12: false, nothing launched — checked\n");
+        }
     }
     std::printf("native_mmvq_vk_parity: %d outputs compared bitwise, %d differ -> %s\n",
                 compared, fails, fails == 0 ? "PASS" : "FAIL");

@@ -1,0 +1,141 @@
+// vulkan/src/kernels/mmvq_slots_q6_k.comp - native_mmvq_slots for ggml type 14 (Q6_K), Task 2.8.
+//
+// Transcription of native_mmvq.cu's native_mmvq_slots_kernel<Q6KTraits,ROWS> (:1710-1755) and its
+// launcher (:1758-1768): blockIdx.y selects the slot, the rest is the multi kernel's exact per-row
+// layout. Q6_K: VDR=1 -> kbx = tid/32 + 4t (BLOCKS_PER_ITER = WARPS*WARP/32 = 4), kqs = tid%32;
+// SmallK pick: n_in/256 < 4 -> ROWS=2 (grid ceil(n_out/2)), else ROWS=1 (grid n_out). For a fixed
+// row every arm lets all 128 threads contribute their kbx partial for that row, summed subrow-
+// ascending then the xor tree, lane i writing row0+i -> the slots answer is BITWISE the single-
+// call mmvq_q6_k.comp answer (asserted by the parity test).
+//
+// Flattened 2D grid (the runtime dispatches groups_x only): slot = gid / gx, grp = gid % gx.
+// One W/X/Y triple per slot (24 bindings); the per-slot code is macro instances of the q6_k dot
+// (identical bodies, different SSBO names - glsl has no indexed buffers).
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0)  readonly buffer W0 { uint v[]; } bw0;
+layout(std430, binding = 1)  readonly buffer W1 { uint v[]; } bw1;
+layout(std430, binding = 2)  readonly buffer W2 { uint v[]; } bw2;
+layout(std430, binding = 3)  readonly buffer W3 { uint v[]; } bw3;
+layout(std430, binding = 4)  readonly buffer W4 { uint v[]; } bw4;
+layout(std430, binding = 5)  readonly buffer W5 { uint v[]; } bw5;
+layout(std430, binding = 6)  readonly buffer W6 { uint v[]; } bw6;
+layout(std430, binding = 7)  readonly buffer W7 { uint v[]; } bw7;
+layout(std430, binding = 8)  readonly buffer X0 { uint v[]; } bx0;
+layout(std430, binding = 9)  readonly buffer X1 { uint v[]; } bx1;
+layout(std430, binding = 10) readonly buffer X2 { uint v[]; } bx2;
+layout(std430, binding = 11) readonly buffer X3 { uint v[]; } bx3;
+layout(std430, binding = 12) readonly buffer X4 { uint v[]; } bx4;
+layout(std430, binding = 13) readonly buffer X5 { uint v[]; } bx5;
+layout(std430, binding = 14) readonly buffer X6 { uint v[]; } bx6;
+layout(std430, binding = 15) readonly buffer X7 { uint v[]; } bx7;
+layout(std430, binding = 16)          buffer Y0 { float v[]; } by0;
+layout(std430, binding = 17)          buffer Y1 { float v[]; } by1;
+layout(std430, binding = 18)          buffer Y2 { float v[]; } by2;
+layout(std430, binding = 19)          buffer Y3 { float v[]; } by3;
+layout(std430, binding = 20)          buffer Y4 { float v[]; } by4;
+layout(std430, binding = 21)          buffer Y5 { float v[]; } by5;
+layout(std430, binding = 22)          buffer Y6 { float v[]; } by6;
+layout(std430, binding = 23)          buffer Y7 { float v[]; } by7;
+
+// count, n_in, n_out, gx (blocks per slot), rows (1 or 2 - the CUDA SmallK pick)
+layout(push_constant) uniform PC { uint count; uint n_in; uint n_out; uint gx; uint rows; } pc;
+
+// Q6KBlock is 210 B (ql@0, qh@128, scales@192 int8, d half@208), not 4-aligned: byte assembler
+// per slot (wb/w16/rd32/rsbyte, the mmvq_q6_k.comp precedent).
+#define GEN_BYTES(I)                                                        \
+uint wb##I(uint B) { return (bw##I.v[B >> 2u] >> (8u * (B & 3u))) & 0xFFu; } \
+uint w16##I(uint B) { return wb##I(B) | (wb##I(B + 1u) << 8u); }            \
+int  rd32##I(uint B) { return int(wb##I(B) | (wb##I(B + 1u) << 8u) | (wb##I(B + 2u) << 16u) | (wb##I(B + 3u) << 24u)); } \
+int  rsb##I(uint B) { const uint b = wb##I(B); return b >= 128u ? int(b) - 256 : int(b); }
+GEN_BYTES(0) GEN_BYTES(1) GEN_BYTES(2) GEN_BYTES(3)
+GEN_BYTES(4) GEN_BYTES(5) GEN_BYTES(6) GEN_BYTES(7)
+
+int sbyte(uint a, uint i) { const uint b = (a >> (8u * i)) & 255u; return b >= 128u ? int(b) - 256 : int(b); }
+int dp4a(int a, int b, int c) { for (uint i = 0u; i < 4u; ++i) c += sbyte(uint(a), i) * sbyte(uint(b), i); return c; }
+int vsub4(int a, int b) {   // __vsubss4 byte-lane subtract; results fit int8, no clamp (mmvq_q6_k.comp)
+    int r = 0;
+    for (uint i = 0u; i < 4u; ++i)
+        r |= int((((uint(a) >> (8u * i)) & 255u) - ((uint(b) >> (8u * i)) & 255u)) & 255u) << (8u * i);
+    return r;
+}
+
+// q6_q8_dot (native_mmvq.cu:773-803) - identical body to mmvq_q6_k.comp's, bound to slot I.
+#define GEN_DOT(I)                                                          \
+float q6_k_dot##I(uint wbase, uint xw, uint iqs) {                          \
+    const uint bq8_offset  = 4u * (iqs / 16u) + (iqs % 16u) / 8u;           \
+    const uint scale_off   = 8u * (iqs / 16u) + (iqs % 16u) / 4u;           \
+    const uint vh_shift    = 2u * ((iqs % 16u) / 8u);                       \
+    const int  vl = rd32##I(wbase + 4u * iqs);                              \
+    const int  vh = rd32##I(wbase + 128u + 4u * (8u * (iqs / 16u) + iqs % 8u)) >> int(vh_shift); \
+    float sumf = 0.0;                                                       \
+    for (uint i = 0u; i < 2u; ++i) {                                        \
+        const int  sc = rsb##I(wbase + 192u + scale_off + 4u * i);          \
+        const int  vil = (vl >> int(4u * i)) & 0x0f0f0f0f;                  \
+        const int  vih = ((vh >> int(4u * i)) << 4) & 0x30303030;           \
+        const int  vi  = vsub4(vil | vih, 0x20202020);                      \
+        const uint xb  = xw + (bq8_offset + 2u * i) * 9u;                   \
+        const int  u   = int(bx##I.v[xb + 1u + (iqs % 8u)]);                \
+        const float d8 = unpackHalf2x16(bx##I.v[xb]).x;                     \
+        sumf += d8 * float(dp4a(vi, u, 0) * sc);                            \
+    }                                                                       \
+    const float d = unpackHalf2x16(w16##I(wbase + 208u)).x;                 \
+    return d * sumf;                                                        \
+}
+GEN_DOT(0) GEN_DOT(1) GEN_DOT(2) GEN_DOT(3)
+GEN_DOT(4) GEN_DOT(5) GEN_DOT(6) GEN_DOT(7)
+
+shared float sh[4][4][32];
+
+#define GEN_WORK(I)                                                         \
+void work##I(uint grp, uint tid, uint lane, uint subrow, uint nb, uint rows, uint n_out) { \
+    const uint row0 = rows * grp;                                           \
+    const uint kqs  = tid % 32u;                                            \
+    float t0 = 0.0, t1 = 0.0;                                               \
+    for (uint kbx = tid / 32u; kbx < nb; kbx += 4u) {                       \
+        const uint xb = kbx * 8u * 9u;                                      \
+        const uint wb = kbx * 210u;                                         \
+        if (rows == 1u) {                                                   \
+            t0 += q6_k_dot##I(row0 * nb * 210u + wb, xb, kqs);              \
+        } else {                                                            \
+            if (row0 + 0u < n_out) t0 += q6_k_dot##I((row0 + 0u) * nb * 210u + wb, xb, kqs); \
+            if (row0 + 1u < n_out) t1 += q6_k_dot##I((row0 + 1u) * nb * 210u + wb, xb, kqs); \
+        }                                                                   \
+    }                                                                       \
+    sh[subrow][0u][lane] = t0;                                              \
+    if (rows == 2u) sh[subrow][1u][lane] = t1;                              \
+    groupMemoryBarrier(); barrier();                                        \
+    if (subrow == 0u) {                                                     \
+        for (uint i = 0u; i < rows; ++i) {                                  \
+            float acc = sh[0u][i][lane];                                    \
+            acc = acc + sh[1u][i][lane];                                    \
+            acc = acc + sh[2u][i][lane];                                    \
+            acc = acc + sh[3u][i][lane];                                    \
+            for (uint o = 16u; o > 0u; o >>= 1u) acc += subgroupShuffleXor(acc, o); \
+            if (lane == i && row0 + i < n_out) by##I.v[row0 + i] = acc;     \
+        }                                                                   \
+    }                                                                       \
+    groupMemoryBarrier(); barrier();                                        \
+}
+GEN_WORK(0) GEN_WORK(1) GEN_WORK(2) GEN_WORK(3)
+GEN_WORK(4) GEN_WORK(5) GEN_WORK(6) GEN_WORK(7)
+
+void main() {
+    const uint slot = gl_WorkGroupID.x / pc.gx;
+    const uint grp  = gl_WorkGroupID.x % pc.gx;
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint lane = tid & 31u, subrow = tid >> 5u;
+    const uint nb = pc.n_in / 256u, rows = pc.rows;
+    if (slot == 0u) work0(grp, tid, lane, subrow, nb, rows, pc.n_out);
+    else if (slot == 1u) work1(grp, tid, lane, subrow, nb, rows, pc.n_out);
+    else if (slot == 2u) work2(grp, tid, lane, subrow, nb, rows, pc.n_out);
+    else if (slot == 3u) work3(grp, tid, lane, subrow, nb, rows, pc.n_out);
+    else if (slot == 4u) work4(grp, tid, lane, subrow, nb, rows, pc.n_out);
+    else if (slot == 5u) work5(grp, tid, lane, subrow, nb, rows, pc.n_out);
+    else if (slot == 6u) work6(grp, tid, lane, subrow, nb, rows, pc.n_out);
+    else work7(grp, tid, lane, subrow, nb, rows, pc.n_out);
+}

@@ -1,0 +1,160 @@
+// vulkan/src/kernels/mmvq_slots_q5_k.comp - native_mmvq_slots for ggml type 13 (Q5_K), Task 2.8.
+//
+// Transcription of native_mmvq.cu's native_mmvq_slots_kernel<Q5KTraits,ROWS> (:1710-1755) and its
+// launcher (:1758-1768): blockIdx.y selects the slot (slot_ptrs), the rest is the multi kernel's
+// exact per-row layout: ROWS=1 (grid n_out) when blocks_per_row >= BLOCKS_PER_ITER (8), else
+// ROWS=2 (grid ceil(n_out/2)). For a fixed row, all three ROWS arms (1/2/4) let every one of the
+// 128 threads contribute the same kbx = tid/16 + 8t chain in the same order and reduce
+// subrow-ascending then the xor tree - so the slots answer is BITWISE the single-call
+// mmvq_q5_k.comp answer (the parity test asserts y_slots == y_single).
+//
+// Vulkan: the runtime dispatches groups_x only, so the 2D grid is FLATTENED: slot =
+// gl_WorkGroupID.x / gx and the in-slot block = gl_WorkGroupID.x % gx (uniform per workgroup, so
+// the slot switch never diverges a barrier). W/X/Y are one buffer triple per slot (24 bindings);
+// per-slot code is token-pasting macro instances of the q5_k dot (identical bodies, different
+// SSBO names - glsl has no indexed buffers; the copy-by-macro keeps one source of truth).
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0)  readonly buffer W0 { uint v[]; } bw0;
+layout(std430, binding = 1)  readonly buffer W1 { uint v[]; } bw1;
+layout(std430, binding = 2)  readonly buffer W2 { uint v[]; } bw2;
+layout(std430, binding = 3)  readonly buffer W3 { uint v[]; } bw3;
+layout(std430, binding = 4)  readonly buffer W4 { uint v[]; } bw4;
+layout(std430, binding = 5)  readonly buffer W5 { uint v[]; } bw5;
+layout(std430, binding = 6)  readonly buffer W6 { uint v[]; } bw6;
+layout(std430, binding = 7)  readonly buffer W7 { uint v[]; } bw7;
+layout(std430, binding = 8)  readonly buffer X0 { uint v[]; } bx0;
+layout(std430, binding = 9)  readonly buffer X1 { uint v[]; } bx1;
+layout(std430, binding = 10) readonly buffer X2 { uint v[]; } bx2;
+layout(std430, binding = 11) readonly buffer X3 { uint v[]; } bx3;
+layout(std430, binding = 12) readonly buffer X4 { uint v[]; } bx4;
+layout(std430, binding = 13) readonly buffer X5 { uint v[]; } bx5;
+layout(std430, binding = 14) readonly buffer X6 { uint v[]; } bx6;
+layout(std430, binding = 15) readonly buffer X7 { uint v[]; } bx7;
+layout(std430, binding = 16)          buffer Y0 { float v[]; } by0;
+layout(std430, binding = 17)          buffer Y1 { float v[]; } by1;
+layout(std430, binding = 18)          buffer Y2 { float v[]; } by2;
+layout(std430, binding = 19)          buffer Y3 { float v[]; } by3;
+layout(std430, binding = 20)          buffer Y4 { float v[]; } by4;
+layout(std430, binding = 21)          buffer Y5 { float v[]; } by5;
+layout(std430, binding = 22)          buffer Y6 { float v[]; } by6;
+layout(std430, binding = 23)          buffer Y7 { float v[]; } by7;
+
+// count, n_in, n_out, gx (blocks per slot in the flattened grid), rows (1 or 2 - the CUDA SmallK pick)
+layout(push_constant) uniform PC { uint count; uint n_in; uint n_out; uint gx; uint rows; } pc;
+
+int sbyte(uint a, uint i) {
+    const uint b = (a >> (8u * i)) & 255u;
+    return b >= 128u ? int(b) - 256 : int(b);
+}
+int dp4a(int a, int b, int c) {
+    for (uint i = 0u; i < 4u; ++i) c += sbyte(uint(a), i) * sbyte(uint(b), i);
+    return c;
+}
+
+// q5_q8_dot (native_mmvq.cu:243-299) - identical body to mmvq_q5_k.comp's, bound to slot I's W/X.
+#define GEN_DOT(I)                                                          \
+float q5_k_dot##I(uint b, uint xw, uint iqs) {                              \
+    const uint boff = 2u * ((iqs / 2u) / 4u);                               \
+    const uint col  = (iqs / 2u) % 4u;                                      \
+    const uint qsw  = b + 12u + 4u * boff + col;                            \
+    const int vl0 = int(bw##I.v[qsw]);                                      \
+    const int vl1 = int(bw##I.v[qsw + 4u]);                                 \
+    const uint qhw = b + 4u + col;                                          \
+    const int vh0 = int(bw##I.v[qhw] >> boff);                              \
+    const int vh1 = int(bw##I.v[qhw + 4u] >> boff);                         \
+    const uint j  = boff / 2u;                                              \
+    const uint sh = 16u * (j & 1u);                                         \
+    const uint s0 = (bw##I.v[b + 1u] >> sh) & 0xFFFFu;                      \
+    const uint s2 = (bw##I.v[b + 2u] >> sh) & 0xFFFFu;                      \
+    const uint s4 = (bw##I.v[b + 3u] >> sh) & 0xFFFFu;                      \
+    const uint hi = (j >= 2u) ? 0xFFFFFFFFu : 0u;                           \
+    const uint aux0 = ((s0 & 0x3f3fu) & ~hi) |                              \
+                      ((((s4 >> 0u) & 0x0f0fu) | ((s0 & 0xc0c0u) >> 2u)) & hi); \
+    const uint aux1 = ((s2 & 0x3f3fu) & ~hi) |                              \
+                      ((((s4 >> 4u) & 0x0f0fu) | ((s2 & 0xc0c0u) >> 2u)) & hi); \
+    const uint sc0 = aux0 & 0xFFu,        sc1 = (aux0 >> 8u) & 0xFFu;       \
+    const uint m0  = aux1 & 0xFFu,        m1  = (aux1 >> 8u) & 0xFFu;       \
+    float sumf_d = 0.0;                                                     \
+    float sumf_m = 0.0;                                                     \
+    for (uint i = 0u; i < 2u; ++i) {                                        \
+        const int vl0i = (vl0 >> int(4u * i)) & 0x0f0f0f0f;                 \
+        const int vl1i = (vl1 >> int(4u * i)) & 0x0f0f0f0f;                 \
+        const int vh0i = ((vh0 >> int(i)) << 4) & 0x10101010;               \
+        const int vh1i = ((vh1 >> int(i)) << 4) & 0x10101010;               \
+        const int v0i = vl0i | vh0i;                                        \
+        const int v1i = vl1i | vh1i;                                        \
+        const uint xb = xw + (boff + i) * 9u;                               \
+        const int u0 = int(bx##I.v[xb +  1u + col]);                        \
+        const int u1 = int(bx##I.v[xb +  5u + col]);                        \
+        const int dot1 = dp4a(v0i, u0, dp4a(v1i, u1, 0));                   \
+        const int dot2 = dp4a(0x01010101, u0, dp4a(0x01010101, u1, 0));     \
+        const float d8 = unpackHalf2x16(bx##I.v[xb]).x;                     \
+        sumf_d += d8 * float(dot1 * int(i == 0u ? sc0 : sc1));              \
+        sumf_m += d8 * float(dot2 * int(i == 0u ? m0  : m1));               \
+    }                                                                       \
+    const vec2 dm5f = unpackHalf2x16(bw##I.v[b]);                           \
+    return dm5f.x * sumf_d - dm5f.y * sumf_m;                               \
+}
+GEN_DOT(0) GEN_DOT(1) GEN_DOT(2) GEN_DOT(3)
+GEN_DOT(4) GEN_DOT(5) GEN_DOT(6) GEN_DOT(7)
+
+// subrow x row-slot x lane partials (native_mmvq.cu's shared partial[WARPS-1][ROWS][WARP], widened
+// to 4 subrows x 4 rows exactly like mmvq_q5_k.comp: the sum reads subrows 0..3 ascending, which
+// IS tmp + partial[0..2]).
+shared float sh[4][4][32];
+
+// the slots kernel body for slot I: ROWS rows per block (1 or 2), the CUDA kbx partition, the
+// reduction and the lane==i write of native_mmvq.cu:1740-1754.
+#define GEN_WORK(I)                                                         \
+void work##I(uint grp, uint tid, uint lane, uint subrow, uint nb, uint rows, uint n_out) { \
+    const uint row0 = rows * grp;                                           \
+    const uint kqs  = 2u * (tid % 16u);                                     \
+    float t0 = 0.0, t1 = 0.0;                                               \
+    for (uint kbx = tid / 16u; kbx < nb; kbx += 8u) {                       \
+        const uint xb = kbx * 8u * 9u;                                      \
+        const uint wb = kbx * 44u;                                          \
+        if (rows == 1u) {                                                   \
+            t0 += q5_k_dot##I(row0 * nb * 44u + wb, xb, kqs);               \
+        } else {                                                            \
+            if (row0 + 0u < n_out) t0 += q5_k_dot##I((row0 + 0u) * nb * 44u + wb, xb, kqs); \
+            if (row0 + 1u < n_out) t1 += q5_k_dot##I((row0 + 1u) * nb * 44u + wb, xb, kqs); \
+        }                                                                   \
+    }                                                                       \
+    sh[subrow][0u][lane] = t0;                                              \
+    if (rows == 2u) sh[subrow][1u][lane] = t1;                              \
+    groupMemoryBarrier(); barrier();                                        \
+    if (subrow == 0u) {                                                     \
+        for (uint i = 0u; i < rows; ++i) {                                  \
+            float acc = sh[0u][i][lane];                                    \
+            acc = acc + sh[1u][i][lane];                                    \
+            acc = acc + sh[2u][i][lane];                                    \
+            acc = acc + sh[3u][i][lane];                                    \
+            for (uint o = 16u; o > 0u; o >>= 1u) acc += subgroupShuffleXor(acc, o); \
+            if (lane == i && row0 + i < n_out) by##I.v[row0 + i] = acc;     \
+        }                                                                   \
+    }                                                                       \
+    groupMemoryBarrier(); barrier();                                        \
+}
+GEN_WORK(0) GEN_WORK(1) GEN_WORK(2) GEN_WORK(3)
+GEN_WORK(4) GEN_WORK(5) GEN_WORK(6) GEN_WORK(7)
+
+void main() {
+    const uint slot = gl_WorkGroupID.x / pc.gx;
+    const uint grp  = gl_WorkGroupID.x % pc.gx;
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint lane = tid & 31u, subrow = tid >> 5u;
+    const uint nb = pc.n_in / 256u, rows = pc.rows;
+    if (slot == 0u) work0(grp, tid, lane, subrow, nb, rows, pc.n_out);
+    else if (slot == 1u) work1(grp, tid, lane, subrow, nb, rows, pc.n_out);
+    else if (slot == 2u) work2(grp, tid, lane, subrow, nb, rows, pc.n_out);
+    else if (slot == 3u) work3(grp, tid, lane, subrow, nb, rows, pc.n_out);
+    else if (slot == 4u) work4(grp, tid, lane, subrow, nb, rows, pc.n_out);
+    else if (slot == 5u) work5(grp, tid, lane, subrow, nb, rows, pc.n_out);
+    else if (slot == 6u) work6(grp, tid, lane, subrow, nb, rows, pc.n_out);
+    else work7(grp, tid, lane, subrow, nb, rows, pc.n_out);
+}

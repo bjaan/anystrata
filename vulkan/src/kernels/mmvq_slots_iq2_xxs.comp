@@ -1,0 +1,137 @@
+// vulkan/src/kernels/mmvq_slots_iq2_xxs.comp - native_mmvq_slots for ggml type 16 (IQ2_XXS), Task 2.8.
+//
+// Transcription of iq_kernels.cu's mmvq_slots_kernel<TY=16> (:3491-3501) and its launcher
+// slots_of<> (:3504-3517): grid(ceil(n_out/4), count), block(32,4); blockIdx.y = the slot, whose
+// w/x/y come from slot_ptrs; row = blockIdx.x*4 + threadIdx.y; ONE column per slot: the row's
+// warp_sum(row_dot<16>) written by lane 0. The row_dot partition is mmvq_iq2_xxs.comp's exactly
+// (k = lane, lane+32,...; kbx = k/8, iqs = 2*(k%8); xor tree 16,8,4,2,1), so per slot the answer
+// is BITWISE the single-call native_mmvq(16) answer (asserted by the parity test).
+//
+// Flattened 2D grid (the runtime dispatches groups_x only): slot = gid / gx, grp = gid % gx, with
+// gx = ceil(n_out/4). One W/X/Y triple per slot (24 storage buffers) + the shared iq2xxs_grid
+// table (binding 24). Per-slot code is macro instances of the iq2_xxs dot (identical bodies,
+// different SSBO names - glsl has no indexed buffers; the copy-by-macro keeps one source of truth).
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0)  readonly buffer W0 { uint v[]; } bw0;
+layout(std430, binding = 1)  readonly buffer W1 { uint v[]; } bw1;
+layout(std430, binding = 2)  readonly buffer W2 { uint v[]; } bw2;
+layout(std430, binding = 3)  readonly buffer W3 { uint v[]; } bw3;
+layout(std430, binding = 4)  readonly buffer W4 { uint v[]; } bw4;
+layout(std430, binding = 5)  readonly buffer W5 { uint v[]; } bw5;
+layout(std430, binding = 6)  readonly buffer W6 { uint v[]; } bw6;
+layout(std430, binding = 7)  readonly buffer W7 { uint v[]; } bw7;
+layout(std430, binding = 8)  readonly buffer X0 { uint v[]; } bx0;
+layout(std430, binding = 9)  readonly buffer X1 { uint v[]; } bx1;
+layout(std430, binding = 10) readonly buffer X2 { uint v[]; } bx2;
+layout(std430, binding = 11) readonly buffer X3 { uint v[]; } bx3;
+layout(std430, binding = 12) readonly buffer X4 { uint v[]; } bx4;
+layout(std430, binding = 13) readonly buffer X5 { uint v[]; } bx5;
+layout(std430, binding = 14) readonly buffer X6 { uint v[]; } bx6;
+layout(std430, binding = 15) readonly buffer X7 { uint v[]; } bx7;
+layout(std430, binding = 16)          buffer Y0 { float v[]; } by0;
+layout(std430, binding = 17)          buffer Y1 { float v[]; } by1;
+layout(std430, binding = 18)          buffer Y2 { float v[]; } by2;
+layout(std430, binding = 19)          buffer Y3 { float v[]; } by3;
+layout(std430, binding = 20)          buffer Y4 { float v[]; } by4;
+layout(std430, binding = 21)          buffer Y5 { float v[]; } by5;
+layout(std430, binding = 22)          buffer Y6 { float v[]; } by6;
+layout(std430, binding = 23)          buffer Y7 { float v[]; } by7;
+layout(std430, binding = 24) readonly buffer Grid { uvec2 v[]; } bg;   // iq2xxs_grid (256 x uint64)
+
+// count, n_in, n_out, gx = ceil(n_out/4) (blocks per slot in the flattened grid)
+layout(push_constant) uniform PC { uint count; uint n_in; uint n_out; uint gx; } pc;
+
+// one byte / uint16 of slot I's W (66-B blocks are not 4-aligned: assemble byte-by-byte, the
+// mmvq_iq2_xxs.comp precedent)
+#define GEN_BYTES(I)                                                        \
+uint wb##I(uint B) { return (bw##I.v[B >> 2u] >> (8u * (B & 3u))) & 0xFFu; } \
+uint w16##I(uint B) { return wb##I(B) | (wb##I(B + 1u) << 8u); }
+GEN_BYTES(0) GEN_BYTES(1) GEN_BYTES(2) GEN_BYTES(3)
+GEN_BYTES(4) GEN_BYTES(5) GEN_BYTES(6) GEN_BYTES(7)
+
+uint vcmpne4(uint a) {
+    uint r = 0u;
+    for (uint i = 0u; i < 4u; ++i)
+        r |= (((a >> (8u * i)) & 255u) != 0u ? 255u : 0u) << (8u * i);
+    return r;
+}
+uint vsub4(uint a, uint b) {
+    uint r = 0u;
+    for (uint i = 0u; i < 4u; ++i)
+        r |= (((a >> (8u * i)) - (b >> (8u * i))) & 255u) << (8u * i);
+    return r;
+}
+int sbyte(uint a, uint i) {
+    const uint b = (a >> (8u * i)) & 255u;
+    return b >= 128u ? int(b) - 256 : int(b);
+}
+int dp4a(int a, int b, int c) {
+    for (uint i = 0u; i < 4u; ++i) c += sbyte(uint(a), i) * sbyte(uint(b), i);
+    return c;
+}
+int trunc_div8(int x) { return x >= 0 ? x / 8 : -( (-x) / 8 ); }
+
+// vec_dot_iq2_xxs_q8_1 (iq_kernels.cu:101-125) - identical body to mmvq_iq2_xxs.comp's iq2_xxs_dot,
+// bound to slot I's W/X. xw is the slot's x base (its own buffer: always 0; kept explicit).
+#define GEN_DOT(I)                                                          \
+float iq2_xxs_dot##I(uint b0, uint xw, uint kbx, uint iqs) {                \
+    const uint qs = b0 + kbx * 66u + 2u;                                    \
+    const uint p  = qs + 4u * iqs;                                          \
+    const uint q2    = w16##I(p)       | (w16##I(p + 2u) << 16u);           \
+    const uint aux32 = w16##I(p + 4u)  | (w16##I(p + 6u) << 16u);           \
+    const uint xw0 = xw + (kbx * 8u + iqs / 2u) * 9u;                       \
+    int sumi = 0;                                                           \
+    for (uint k0 = 0u; k0 < 8u; k0 += 2u) {                                 \
+        const uint au = k0 >> 1u;                                           \
+        const uvec2 gp = bg.v[(q2 >> (8u * au)) & 255u];                    \
+        const uint v = (aux32 >> (7u * au)) & 255u;                         \
+        const uint sgn = (v ^ ((uint(bitCount(v)) & 1u) << 7u)) * 0x01010101u; \
+        const uint s0 = vcmpne4(sgn & 0x08040201u);                         \
+        sumi = dp4a(int(vsub4(gp.x ^ s0, s0)), int(bx##I.v[xw0 + 1u + k0]), sumi); \
+        const uint s1 = vcmpne4(sgn & 0x80402010u);                         \
+        sumi = dp4a(int(vsub4(gp.y ^ s1, s1)), int(bx##I.v[xw0 + 1u + k0 + 1u]), sumi); \
+    }                                                                       \
+    const uint ls = (aux32 >> 27u) | 1u;                                    \
+    sumi = trunc_div8(sumi * int(ls));                                      \
+    const float dw = unpackHalf2x16(w16##I(b0 + kbx * 66u)).x;              \
+    const float d8 = unpackHalf2x16(bx##I.v[xw0]).x;                        \
+    return dw * d8 * float(sumi);                                           \
+}
+GEN_DOT(0) GEN_DOT(1) GEN_DOT(2) GEN_DOT(3)
+GEN_DOT(4) GEN_DOT(5) GEN_DOT(6) GEN_DOT(7)
+
+// row_dot<16> for one row of slot I (mma_iq2_xxs's warp walk, then warp_sum, then lane 0 writes)
+#define GEN_WORK(I)                                                         \
+void work##I(uint grp, uint lane, uint n_out) {                             \
+    const uint row = grp * 4u + (gl_LocalInvocationID.x >> 5u);             \
+    if (row >= n_out) return;                                               \
+    const uint nb = pc.n_in / 256u;                                         \
+    const uint b0 = row * nb * 66u;                                         \
+    float s = 0.0;                                                          \
+    for (uint k = lane; k < nb * 8u; k += 32u)                              \
+        s += iq2_xxs_dot##I(b0, 0u, k / 8u, 2u * (k % 8u));                 \
+    for (uint o = 16u; o > 0u; o >>= 1u)                                    \
+        s += subgroupShuffleXor(s, o);                                      \
+    if (lane == 0u) by##I.v[row] = s;                                       \
+}
+GEN_WORK(0) GEN_WORK(1) GEN_WORK(2) GEN_WORK(3)
+GEN_WORK(4) GEN_WORK(5) GEN_WORK(6) GEN_WORK(7)
+
+void main() {
+    const uint slot = gl_WorkGroupID.x / pc.gx;
+    const uint grp  = gl_WorkGroupID.x % pc.gx;
+    const uint lane = gl_LocalInvocationID.x & 31u;
+    if (slot == 0u) work0(grp, lane, pc.n_out);
+    else if (slot == 1u) work1(grp, lane, pc.n_out);
+    else if (slot == 2u) work2(grp, lane, pc.n_out);
+    else if (slot == 3u) work3(grp, lane, pc.n_out);
+    else if (slot == 4u) work4(grp, lane, pc.n_out);
+    else if (slot == 5u) work5(grp, lane, pc.n_out);
+    else if (slot == 6u) work6(grp, lane, pc.n_out);
+    else work7(grp, lane, pc.n_out);
+}

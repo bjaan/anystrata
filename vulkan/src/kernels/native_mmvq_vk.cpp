@@ -44,6 +44,9 @@ namespace {
 #include "native_mmvq.spv.h"   // mmvq_iq2_xxs.comp
 #include "mmvq_q5_k.spv.h"     // mmvq_q5_k.comp
 #include "mmvq_q6_k.spv.h"     // mmvq_q6_k.comp
+#include "mmvq_slots_iq2_xxs.spv.h"  // mmvq_slots_iq2_xxs.comp
+#include "mmvq_slots_q5_k.spv.h"     // mmvq_slots_q5_k.comp
+#include "mmvq_slots_q6_k.spv.h"     // mmvq_slots_q6_k.comp
 
 constexpr int IQ_BLOCK_ELEMS = 256;
 using vk::kIq2xxsGrid;   // the grid table header (namespace strata::vk)
@@ -145,6 +148,74 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     }
     if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
         throw std::runtime_error(std::string("native MMVQ launch: ") + cudaGetErrorString(e));
+}
+
+// ---- native_mmvq_slots (Task 2.8) ----------------------------------------------
+// The CUDA wrapper (native_mmvq.cu:3178-3190): false, with nothing launched, when slots_kind()
+// is 0 - i.e. for every format this port has no kernel for (the unported mmvq types and, at the
+// engine level, the iq family beyond 16). Types 16/13/14 dispatch to the slots kernels, which are
+// per-slot transcriptions of the single-call kernels' exact partition, so matrix i's y[i] is
+// BITWISE native_mmvq(type, w[i], x[i], y[i], n_in, n_out, 1) (the parity test asserts both
+// against the host refs and against the single-launch outputs). native_mmvq_ids (the sibling
+// contract, :3194) is NOT ported: it stays trap-by-number in stubs_gen.
+bool native_mmvq_slots(int ggml_type, const MmvqSlots& slots, int count, int n_in, int n_out, void* stream) {
+    if (ggml_type != 16 && ggml_type != 13 && ggml_type != 14) return false;   // CUDA's slots_kind == 0 leg
+    if (n_out <= 0 || count < 1 || count > MAX_NCOLS)
+        throw std::invalid_argument("native MMVQ requires n_out > 0 and 1 to 8 matrices");
+    validate_shape(n_in, 1, IQ_BLOCK_ELEMS);        // n_in % 256 (per-matrix ncols == 1)
+    for (int i = 0; i < count; ++i) {
+        validate_pointer(slots.w[i]);
+        validate_pointer(slots.x[i]);
+        validate_pointer(slots.y[i]);
+    }
+    validate_stream(stream);
+    if (std::getenv("STRATA_VK_TRACE_MMVQ_SLOTS"))
+        std::fprintf(stderr, "mmvq_slots t %d count %d n_in %d n_out %d\n", ggml_type, count, n_in, n_out);
+    const uint64_t nb = uint64_t(n_in) / IQ_BLOCK_ELEMS;
+    const uint64_t x_sz = nb * 8 * Q8_BLOCK_BYTES;  // one Q8_1 column per slot
+    const uint64_t y_sz = uint64_t(n_out) * 4;
+    // 24 bindings (w,x,y per slot; +grid for iq2_xxs): unused slots alias slot 0's buffers with a
+    // 4-byte span - the flattened grid runs exactly count slots' arms, so they are never touched.
+    uint64_t bufs[25], sizes[25];
+    const int n_buf = ggml_type == 16 ? 25 : 24;
+    const uint64_t rb = uint64_t(n_out) * nb *
+                        (ggml_type == 16 ? IQ_BLOCK_BYTES : ggml_type == 13 ? Q5K_BLOCK_BYTES : Q6K_BLOCK_BYTES);
+    for (int i = 0; i < 8; ++i) {
+        const int j = i < count ? i : 0;
+        bufs[i]      = strata_vk_compat::off(slots.w[j]);
+        bufs[8 + i]  = strata_vk_compat::off(slots.x[j]);
+        bufs[16 + i] = strata_vk_compat::off(slots.y[j]);
+        sizes[i]      = (i < count) ? rb : 4;
+        sizes[8 + i]  = (i < count) ? x_sz : 4;
+        sizes[16 + i] = (i < count) ? y_sz : 4;
+    }
+    if (ggml_type == 16) {
+        static const vk::Kernel k = vk::kernel_load(
+            "mmvq_slots_iq2_xxs", mmvq_slots_iq2_xxs_spv, mmvq_slots_iq2_xxs_spv_len,
+            /*storage buffers*/ 25, /*push bytes*/ 16, /*workgroup*/ THREADS, true);
+        bufs[24] = grid_buffer(); sizes[24] = sizeof(kIq2xxsGrid);
+        const uint32_t gx = uint32_t((n_out + 3) / 4);   // mmvq_kernel's grid x, iq_kernels.cu:3506
+        const uint32_t pc[4] = {(uint32_t)count, (uint32_t)n_in, (uint32_t)n_out, gx};
+        vk::kernel_launch_sized(k, int(gx) * count, bufs, sizes, 25, pc);
+    } else {
+        // launch_slots (native_mmvq.cu:1758-1768): SmallK n_in/DIV < BPI -> ROWS=2, else ROWS=1
+        const bool q5 = ggml_type == 13;
+        const uint32_t rows = (nb < (q5 ? 8u : 4u)) ? 2u : 1u;
+        const uint32_t gx = uint32_t((n_out + rows - 1) / rows);
+        const uint32_t pc[5] = {(uint32_t)count, (uint32_t)n_in, (uint32_t)n_out, gx, rows};
+        if (q5) {
+            static const vk::Kernel k = vk::kernel_load(
+                "mmvq_slots_q5_k", mmvq_slots_q5_k_spv, mmvq_slots_q5_k_spv_len,
+                /*storage buffers*/ 24, /*push bytes*/ 20, /*workgroup*/ THREADS, true);
+            vk::kernel_launch_sized(k, int(gx) * count, bufs, sizes, 24, pc);
+        } else {
+            static const vk::Kernel k = vk::kernel_load(
+                "mmvq_slots_q6_k", mmvq_slots_q6_k_spv, mmvq_slots_q6_k_spv_len,
+                /*storage buffers*/ 24, /*push bytes*/ 20, /*workgroup*/ THREADS, true);
+            vk::kernel_launch_sized(k, int(gx) * count, bufs, sizes, 24, pc);
+        }
+    }
+    return true;
 }
 
 }  // namespace strata::kernels
