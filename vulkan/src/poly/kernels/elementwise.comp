@@ -1,0 +1,78 @@
+// vulkan/src/poly/kernels/elementwise.comp - the poly elementwise batch (Task 2.7): one .comp
+// compiled to three kernels via -DEW_VARIANT, chosen by the launcher exactly as the CUDA wrappers
+// (src/poly/kernels.cu) dispatch:
+//   0 = axpy_kernel (:853, also reused for add_scaled_kernel's (:867) per-vector pass) - one thread
+//       one element: acc[i] = add ? acc[i] + x[i]*a : x[i]*a;
+//   1 = swiglu_clamp_kernel (:844) - g = min(gate,limit); u = clamp(up,-limit,limit);
+//       out = g/(1+expf(-g)) * u;
+//   2 = mul_sigmoid_kernel (:1849) - acc[row*n+i] *= 1/(1+expf(-g[row*g_stride + (one_gate?0:i)])),
+//       one flattened row per workgroup (the CUDA grid is dim3(grid(n,256), rows), rows chunked at
+//       65535 by the wrapper :2667 - the launcher replays that loop by offsetting the buffers).
+// Pure elementwise: NO reduction, NO cross-thread order. The only freedom is fp32 contraction of
+// acc + x*a (CUDA fuses it, nvcc -fmad ON; PORT-NOTES contraction law #6) and exp vs CUDA expf,
+// which are NOT documented twins - swiglu/mul_sigmoid ride the tree's rel 1e-5 silu-family bound
+// (the conv4_silu trio set it), axpy/add_scaled are bitwise against the fma (or mul+add) arm the
+// parity test measures.
+// workgroup size 256 everywhere, like the CUDA launches.
+#version 450
+
+#ifndef EW_VARIANT
+#define EW_VARIANT 0
+#endif
+
+layout(local_size_x = 256) in;
+
+#if EW_VARIANT == 0
+// ---- axpy / add_scaled pass
+layout(std430, binding = 0) readonly buffer X { float v[]; } bx;
+layout(std430, binding = 1) buffer ACC { float v[]; } bacc;
+
+// n, add (0/1), a as raw float bits.
+layout(push_constant) uniform PC { uint n; uint add; uint a_bits; uint pad; } pc;
+
+void main() {
+    const uint i = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+    if (i >= pc.n) return;
+    const float a = uintBitsToFloat(pc.a_bits);
+    // CUDA: acc[i] = add ? acc[i] + x[i]*a : x[i]*a. nvcc fuses the add arm to fma(a, x[i], acc).
+    bacc.v[i] = pc.add != 0u ? fma(a, bx.v[i], bacc.v[i]) : bx.v[i] * a;
+}
+
+#elif EW_VARIANT == 1
+// ---- swiglu_clamp
+layout(std430, binding = 0) readonly buffer GATE { float v[]; } bgate;
+layout(std430, binding = 1) readonly buffer UP { float v[]; } bup;
+layout(std430, binding = 2) buffer OUT { float v[]; } bout;
+
+// n, limit as raw float bits.
+layout(push_constant) uniform PC { uint n; uint limit_bits; uint pad0; uint pad1; } pc;
+
+void main() {
+    const uint i = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+    if (i >= pc.n) return;
+    const float limit = uintBitsToFloat(pc.limit_bits);
+    // CUDA :848-850: fminf(fmaxf()) == min/max for non-NaN; no mul-add pair to contract, so the
+    // only exp-vs-expf difference is the transcendental itself.
+    const float g = min(bgate.v[i], limit);
+    const float u = min(max(bup.v[i], -limit), limit);
+    bout.v[i] = g / (1.0 + exp(-g)) * u;
+}
+
+#else
+// ---- mul_sigmoid: the launcher replays the wrapper's 65535-row loop by offsetting both buffers,
+// so here row is the in-chunk row and base pointers already sit at chunk start.
+layout(std430, binding = 0) buffer ACC { float v[]; } bacc;
+layout(std430, binding = 1) readonly buffer G { float v[]; } bg;
+
+// n, g_stride, one_gate (0/1), blocks per row = ceil(n/256).
+layout(push_constant) uniform PC { uint n; uint g_stride; uint one_gate; uint blocks; } pc;
+
+void main() {
+    const uint blocks = gl_WorkGroupID.x / pc.blocks;
+    const uint i = (gl_WorkGroupID.x % pc.blocks) * 256u + gl_LocalInvocationID.x;
+    if (i >= pc.n) return;
+    // CUDA :1853: acc[y*n+i] *= sigmoid(g[y*g_stride + (one_gate ? 0 : i)]), y = blockIdx.y.
+    const float gate = bg.v[blocks * pc.g_stride + (pc.one_gate != 0u ? 0u : i)];
+    bacc.v[blocks * pc.n + i] *= 1.0 / (1.0 + exp(-gate));
+}
+#endif

@@ -13,10 +13,8 @@
 namespace strata::vk_engine { void missing(const char* name); }
 
 namespace strata::poly { void add_bias(const float * p0, float * p1, int p2, int p3, void * p4) { strata::vk_engine::missing("strata::poly::add_bias"); } }
-namespace strata::poly { void add_scaled(const ScaledRows & p0, int p1, int p2, void * p3) { strata::vk_engine::missing("strata::poly::add_scaled"); } }
 namespace strata::poly { void attend(const float * p0, const uint16_t * p1, const uint16_t * p2, int64_t p3, int p4, float * p5, int p6, float * p7, int p8, int p9, int p10, float p11, void * p12, int p13, int p14, bool p15, const long long * p16, int p17, size_t p18, Kvq8 p19, Kvq8 p20) { strata::vk_engine::missing("strata::poly::attend"); } }
 namespace strata::poly { void attend_batch(void * p0, const float * p1, const uint16_t * p2, const uint16_t * p3, int64_t p4, int p5, float * p6, size_t p7, float * p8, float * p9, int p10, int p11, int p12, float p13, void * p14, int p15, int p16, bool p17, Kvq8 p18, Kvq8 p19, uint16_t * p20, uint16_t * p21, size_t p22) { strata::vk_engine::missing("strata::poly::attend_batch"); } }
-namespace strata::poly { void axpy(const float * p0, float p1, float * p2, int p3, bool p4, void * p5) { strata::vk_engine::missing("strata::poly::axpy"); } }
 namespace strata::poly { void bf16_to_f32(const uint16_t * p0, float * p1, size_t p2, void * p3) { strata::vk_engine::missing("strata::poly::bf16_to_f32"); } }
 namespace strata::poly { void dsa_attend(void * p0, const float * p1, const uint16_t * p2, const int32_t * p3, int p4, int p5, int p6, int64_t p7, int p8, int p9, float * p10, float * p11, int p12, float * p13, int p14, int p15, float p16, void * p17) { strata::vk_engine::missing("strata::poly::dsa_attend"); } }
 namespace strata::poly { void dsv4_attend(const float * p0, const uint16_t * p1, int p2, int p3, const uint16_t * p4, int p5, const int32_t * p6, int p7, int p8, const float * p9, float * p10, int p11, int p12, float p13, int64_t p14, int p15, void * p16, const long long * p17, int p18) { strata::vk_engine::missing("strata::poly::dsv4_attend"); } }
@@ -44,7 +42,6 @@ namespace strata::poly { void kda_step(float * p0, float * p1, const float * p2,
 namespace strata::poly { void layer_norm(const float * p0, const float * p1, const float * p2, float * p3, int p4, int p5, float p6, void * p7) { strata::vk_engine::missing("strata::poly::layer_norm"); } }
 namespace strata::poly { void likeliest(const float * p0, int p1, Likeliest * p2, void * p3) { strata::vk_engine::missing("strata::poly::likeliest"); } }
 namespace strata::poly { void moe_sum(const float * p0, const float * p1, float * p2, int p3, int p4, int p5, void * p6) { strata::vk_engine::missing("strata::poly::moe_sum"); } }
-namespace strata::poly { void mul_sigmoid(float * p0, const float * p1, int p2, int p3, int p4, bool p5, void * p6) { strata::vk_engine::missing("strata::poly::mul_sigmoid"); } }
 namespace strata::poly { void permute_groups(const float * p0, float * p1, int p2, int p3, int p4, bool p5, void * p6) { strata::vk_engine::missing("strata::poly::permute_groups"); } }
 namespace strata::poly { void route_rows(const float * p0, int p1, int p2, int p3, int p4, float p5, const float * p6, const float * p7, bool p8, float p9, int32_t * p10, float * p11, void * p12) { strata::vk_engine::missing("strata::poly::route_rows"); } }
 namespace strata::poly { void shortconv(const float * p0, float * p1, const float * p2, float * p3, int p4, int p5, void * p6, float * p7, size_t p8, unsigned int p9) { strata::vk_engine::missing("strata::poly::shortconv"); } }
@@ -53,7 +50,6 @@ namespace strata::poly { void store_f16(const float * p0, uint16_t * p1, int p2,
 namespace strata::poly { void store_f16_at(const float * p0, uint16_t * p1, int p2, const long long * p3, int p4, int p5, void * p6) { strata::vk_engine::missing("strata::poly::store_f16_at"); } }
 namespace strata::poly { void store_q8(const float * p0, int8_t * p1, uint16_t * p2, int p3, int64_t p4, int p5, void * p6) { strata::vk_engine::missing("strata::poly::store_q8"); } }
 namespace strata::poly { void store_q8_at(const float * p0, int8_t * p1, uint16_t * p2, int p3, const long long * p4, int p5, int p6, void * p7) { strata::vk_engine::missing("strata::poly::store_q8_at"); } }
-namespace strata::poly { void swiglu_clamp(const float * p0, const float * p1, float * p2, int p3, float p4, void * p5) { strata::vk_engine::missing("strata::poly::swiglu_clamp"); } }
 namespace strata::poly { void swiglu_clamp_rows(const float * p0, float * p1, int p2, int p3, float p4, void * p5) { strata::vk_engine::missing("strata::poly::swiglu_clamp_rows"); } }
 // HOST-defined contract helpers (no device work): the same arithmetic as kernels.cu's.
 namespace strata::poly {

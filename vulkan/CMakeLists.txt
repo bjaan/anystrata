@@ -194,6 +194,34 @@ add_library(strata_vk_kernel_conv4_silu STATIC src/poly/kernels/conv4_silu_vk.cp
 target_include_directories(strata_vk_kernel_conv4_silu PUBLIC ${STRATA_ROOT}/include ${STRATA_ROOT}/src/poly ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
 target_link_libraries(strata_vk_kernel_conv4_silu PUBLIC strata_vk_runtime strata_vk_compat)
 
+# Task 2.7: poly elementwise batch (axpy, swiglu_clamp, mul_sigmoid, add_scaled) — one .comp,
+# three -DEW_VARIANT arms (0 axpy/add_scaled pass, 1 swiglu_clamp, 2 mul_sigmoid), one launcher lib.
+set(_ew_spvs "")
+foreach(_v axpy swiglu mul_sigmoid)
+  if(_v STREQUAL axpy)
+    set(_ev 0)
+  elseif(_v STREQUAL swiglu)
+    set(_ev 1)
+  else()
+    set(_ev 2)
+  endif()
+  set(_spv ${CMAKE_CURRENT_BINARY_DIR}/spv/elementwise_${_v}.spv)
+  add_custom_command(OUTPUT ${_spv}
+    COMMAND ${CMAKE_COMMAND} -E env VK_GLSLC_MODE=${GLSLC_MODE} VK_GLSLC_TOOL=${GLSLC_TOOL}
+            ${VK_GLSLC} --target-env=vulkan1.3 -O -DEW_VARIANT=${_ev}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels/elementwise.comp -o ${_spv}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels/elementwise.comp ${VK_GLSLC}
+    COMMENT "vk-glslc elementwise.comp EW_VARIANT=${_ev}")
+  set(_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/elementwise_${_v}.spv.h)
+  add_custom_command(OUTPUT ${_inc}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} elementwise_${_v}
+    DEPENDS ${_spv})
+  list(APPEND _ew_spvs ${_inc})
+endforeach()
+add_library(strata_vk_kernel_elementwise STATIC src/poly/kernels/elementwise_vk.cpp ${_ew_spvs})
+target_include_directories(strata_vk_kernel_elementwise PUBLIC ${STRATA_ROOT}/include ${STRATA_ROOT}/src/poly ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
+target_link_libraries(strata_vk_kernel_elementwise PUBLIC strata_vk_runtime strata_vk_compat)
+
 strata_vk_kernel(native_quantize_q8_1 COMP quantize_q8_1.comp LAUNCHER src/kernels/native_quantize_q8_1_vk.cpp)
 # Task 2.2: native_mmvq for IQ2_XXS (type 16) — the model's routed experts. The .spv embeds under
 # the entry point's name (native_mmvq.spv.h) so the launcher includes it like the others.
@@ -358,7 +386,7 @@ add_test(NAME native_mmvq_vk_parity COMMAND native_mmvq_vk_parity --selftest)
 # Task 2.1: unit parity for the model-demanded trio (poly's copy2/rms_norm + the q8_1 quantizer).
 add_executable(poly_kernels_vk_parity src/tests/poly_kernels_vk_parity.cpp)
 target_include_directories(poly_kernels_vk_parity PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
-target_link_libraries(poly_kernels_vk_parity PRIVATE strata_vk_kernel_copy2 strata_vk_kernel_rms_norm strata_vk_kernel_native_quantize_q8_1 strata_vk_kernel_gemv strata_vk_kernel_conv4_silu strata_vk_poly_kernels strata_vk_runtime strata_vk_compat strata_vk_stubs)   # stubs LAST: missing() for the poly trap lib; real launchers already resolved
+target_link_libraries(poly_kernels_vk_parity PRIVATE strata_vk_kernel_copy2 strata_vk_kernel_rms_norm strata_vk_kernel_native_quantize_q8_1 strata_vk_kernel_gemv strata_vk_kernel_conv4_silu strata_vk_kernel_elementwise strata_vk_poly_kernels strata_vk_runtime strata_vk_compat strata_vk_stubs)   # stubs LAST: missing() for the poly trap lib; real launchers already resolved
 # strata_vk_poly_kernels supplies the host-defined sum_threads() the rms_norm launcher asks for; its
 # traps stay dormant here (the test calls only ported entry points).
 add_test(NAME poly_kernels_vk_parity COMMAND poly_kernels_vk_parity)
@@ -479,7 +507,7 @@ target_link_libraries(strata-poly-vk PRIVATE
   strata_vk_kernel_s2_gemv strata_vk_kernel_dequant_s2   # real launchers FIRST (link-order rule above)
   strata_vk_kernel_copy2 strata_vk_kernel_rms_norm strata_vk_kernel_native_quantize_q8_1
   strata_vk_kernel_native_mmvq
-  strata_vk_kernel_gemv strata_vk_kernel_conv4_silu strata_vk_kernel_gdn
+  strata_vk_kernel_gemv strata_vk_kernel_conv4_silu strata_vk_kernel_gdn strata_vk_kernel_elementwise
   strata_vk_poly_kernels strata_vk_core
   ggml-cpu ggml-base
   strata_vk_compat strata_vk_stubs                      # stubs last: they only let the link complete

@@ -95,12 +95,12 @@ header helpers, one row per header) | `n/a` (decision `n/a`).
 | launch_pdl / pdl_* (programmatic dependent launch) | pdl.hpp | (host launch glue; pdl helpers) | pdl_parity.cpp | cudaGraph, PDL (programmatic dependent launch) | n/a (NVIDIA PDL/graph feature — run with --no-graphs; the Vulkan port uses its own submission ordering) | n/a |
 | poly: gemv_kernel, dequant_q8_kernel | src/poly/kernels.cu (no include/strata header) | src/poly/kernels.cu | none (poly engine tests) | `__shared__`, `__constant__` | translate | **gemv_kernel ported via the gemv_f32 launcher (Task 2.4): vulkan/src/poly/kernels/gemv.comp (5 workgroup-size variants), gemv_vk.cpp, unit poly_kernels_vk_parity BITWISE on 5 shapes; dequant_q8_kernel todo** |
 | poly: rms_norm, copy2 (launchers) | include/strata/poly/kernels.hpp | src/poly/kernels.cu | unit poly_kernels_vk_parity + model-run advance | `__shfl`, `__shared__` (rms_norm block_sum) | translate | **ported+parity-green** (vulkan/src/poly/kernels/{rms_norm,copy2}.comp, *_vk.cpp) |
-| poly: layer_norm_kernel, bf16_to_f32_kernel, store_f16_kernel/_at, store_q8_kernel/_at, add_bias_kernel, axpy_kernel, add_scaled_kernel, mul_sigmoid_kernel, softcap_kernel, likeliest_kernel | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | todo |
+| poly: layer_norm_kernel, bf16_to_f32_kernel, store_f16_kernel/_at, store_q8_kernel/_at, add_bias_kernel, axpy_kernel, add_scaled_kernel, mul_sigmoid_kernel, softcap_kernel, likeliest_kernel | src/poly/kernels.cu | src/poly/kernels.cu | unit poly_kernels_vk_parity | none | translate | **axpy/add_scaled/mul_sigmoid PORTED (Task 2.7): vulkan/src/poly/kernels/elementwise.comp (EW_VARIANT arms) + elementwise_vk.cpp; parity: axpy/add_scaled bitwise, mul_sigmoid rel 5.0e-7 (exp vs expf, tree tol 1e-5); rest todo** |
 | poly: hc_mix/read/post/head/mean kernels | src/poly/kernels.cu | src/poly/kernels.cu | hc_persist_parity.cpp (host-side contract) | `__shfl`, `__shared__` | translate | todo |
 | poly: kda_conv/_rows/_state, kda_step/gates/state/out kernels | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | todo |
 | poly: gdn_norm/gates/state/state_reg/out kernels | src/poly/kernels.cu | src/poly/kernels.cu | gdn_parity.cpp (host-side contract) | `__shfl`, `__shared__` | translate | **gdn_step PORTED (Task 2.5): gdn_norm.comp/gdn_gates.comp/gdn_state.comp (plain+reg<1,2,4,8>)/gdn_out.comp + gdn_vk.cpp; unit poly_gdn_vk_parity rel_l1 <= 1.6e-7 vs both contraction arms (tree tol 1e-5)** |
 | poly: conv4_silu/_rows/_state, shortconv/_rows/_state kernels | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | **conv4_silu (all three kernels: walk/rows/state) ported (Task 2.4): vulkan/src/poly/kernels/conv4_silu.comp, conv4_state.comp, conv4_silu_vk.cpp, unit poly_kernels_vk_parity rel 5.9e-7 (tree tol 1e-5); shortconv todo** |
-| poly: swiglu_clamp/_rows, geglu/_rows kernels | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | none | translate | todo |
+| poly: swiglu_clamp/_rows, geglu/_rows kernels | src/poly/kernels.cu | src/poly/kernels.cu | unit poly_kernels_vk_parity | none | translate | **swiglu_clamp PORTED (Task 2.7, elementwise.comp): parity rel 7.0e-7 (exp vs expf); swiglu_clamp_rows + geglu todo** |
 | poly: dsa_keys/softmax, idx_store/pool/weigh, route_kernel, moe_sum_kernel | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | todo |
 | poly: attn_score/softmax/value/group/ungroup/softmax_block/scale, head_norm_rope kernels | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | `__shfl`, `__shared__`, `cp.async` (some paths), `asm volatile` | fp32-fallback for the cp.async/mma-attn paths; ordered-FP32 score/softmax otherwise | todo |
 | poly dsv4: rope/state/squeeze/idx_score/select kernels | src/poly/kernels_dsv4.cu | src/poly/kernels_dsv4.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | todo |
@@ -205,12 +205,12 @@ Re-run with `STRATA_VK_STUBS=log` enumerates the rest of the qwen35moe decode pa
 | 6 | `strata::poly::conv4_silu` | poly: conv4_silu/_rows/_state kernels — **PORTED (Task 2.4)** |
 | 7 | `strata::poly::gdn_step` | poly: gdn_norm/gates/state/state_reg/out kernels — **PORTED (Task 2.5)** |
 | 7b | `strata::kernels::native_mmvq` type 14 (Q6_K) | native_mmvq family — **PORTED (Task 2.6)** |
-| 8 | `strata::poly::axpy` | poly: axpy_kernel |
-| 9 | `strata::poly::swiglu_clamp` | poly: swiglu_clamp/_rows |
-| 10 | `strata::poly::mul_sigmoid` | poly: mul_sigmoid_kernel |
+| 8 | `strata::poly::axpy` | poly: axpy_kernel — **PORTED (Task 2.7)** |
+| 9 | `strata::poly::swiglu_clamp` | poly: swiglu_clamp/_rows — **swiglu_clamp PORTED (Task 2.7)**; _rows todo |
+| 10 | `strata::poly::mul_sigmoid` | poly: mul_sigmoid_kernel — **PORTED (Task 2.7)** |
 | 11 | `strata::kernels::native_mmvq_slots` | native_mmvq / _pair / _slots / _ids |
 | 12 | `strata::poly::swiglu_clamp_rows` | poly: swiglu_clamp/_rows |
-| 13 | `strata::poly::add_scaled` | poly: add_scaled_kernel |
+| 13 | `strata::poly::add_scaled` | poly: add_scaled_kernel — **PORTED (Task 2.7)** |
 | 14 | `strata::poly::head_norm_rope` | poly: head_norm_rope kernels |
 | 15 | `strata::poly::store_f16` | poly: store_f16_kernel/_at |
 | 16 | `strata::poly::attend` | poly: attn_score/softmax/value/… kernels |
@@ -291,6 +291,19 @@ un-fused host arm differs by 1-2 ULP on 38/64 of the first shape, the fused arm 
 bit; rows=4 (nb<4, one iteration) matched either way. ctest 11/11. Model load 94 s, gate reached
 decode and stopped at poly demand #8 (axpy) — the pre-digested demand order resumes: axpy,
 swiglu_clamp, mul_sigmoid (actual halt decides).
+
+**Halt point after Task 2.7 (2026-10-23):** `strata::kernels::native_mmvq_slots` — the poly
+elementwise batch (demands #8 axpy, #9 swiglu_clamp, #10 mul_sigmoid, + #13 add_scaled) ported as
+vulkan/src/poly/kernels/elementwise.comp (one .comp, -DEW_VARIANT 0/1/2: axpy reused as
+add_scaled's per-vector pass — the CUDA kernel's k-loop == count sequential axpy launches, no
+cross-pass ordering; mul_sigmoid flattens dim3(grid,rows) and replays the wrapper's 65535-row
+chunking) + elementwise_vk.cpp. PURE ELEMENTWISE, no contraction bites: axpy and add_scaled are
+BITWISE against the device's chosen arm (un-fused arm matches at 0.0 rel on this box; scale arm
+trivially); swiglu_clamp/mul_sigmoid are NOT bitwise-only because CUDA expf vs GLSL exp is not a
+documented twin — MEASURED worst rel: swiglu_clamp 7.0e-7, mul_sigmoid 5.0e-7 / 3.6e-7 (one_gate
+arms), inside the tree's silu/gemv-family 1e-5 bound. ctest 11/11. Model gate: load 32.9 s, decode
+ran past demands 8-10 and 13, stopped at native_mmvq_slots (#11) — the expert-path's slot gather:
+port native_mmvq_slots before the next poly demand (swiglu_clamp_rows, #12).
 
 Phase-2 first picks by demand order: `copy2`, `rms_norm`, then the mmvq family
 (`native_quantize_q8_1`, `native_mmvq`) — matching the plan's expectation (quantize_act /

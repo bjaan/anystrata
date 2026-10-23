@@ -390,6 +390,141 @@ int main() {
         }
     }
 
+    // ---- Task 2.7: the elementwise batch (axpy, swiglu_clamp, mul_sigmoid, add_scaled).
+    {
+        auto arm_bits = [](const std::vector<float>& got, const std::vector<float>& ref) {
+            int bit = 1; double worst = 0.0;
+            for (size_t i = 0; i < got.size(); ++i) {
+                if (std::memcmp(&got[i], &ref[i], 4) != 0) bit = 0;
+                worst = std::fmax(worst, std::fabs((double)got[i] - ref[i]) / std::fmax(1e-3, std::fabs((double)ref[i])));
+            }
+            return std::pair<int, double>(bit, worst);   // bit: 1 bitwise, 0 not
+        };
+        std::mt19937 rng(47);
+        std::uniform_real_distribution<float> u(-3.f, 3.f);
+
+        // axpy at the model's 2048-dim arm, negatives and zeros included; add=true fuses to
+        // fma(a,x,acc) on CUDA -- measure the fused and unfused arms, bitwise to the closer one.
+        for (int add : {1, 0}) {
+            const int n = 2048;
+            std::vector<float> x(n), acc(n), a0(n);
+            for (auto& v : x) v = u(rng);
+            for (auto& v : acc) v = u(rng);
+            a0 = acc;
+            if (add) for (int i = 0; i < n; i += 7) x[i] = 0.f;
+            const float sc = -0.7340033f;
+            const uint64_t ax_ = a.alloc(n * 4), aa = a.alloc(n * 4);
+            vk::copy_h2d((void*)ax_, x.data(), n * 4, nullptr);
+            vk::copy_h2d((void*)aa, acc.data(), n * 4, nullptr);
+            poly::axpy((const float*)strata_vk_compat::wrap(ax_), sc,
+                       (float*)strata_vk_compat::wrap(aa), n, add != 0, nullptr);
+            std::vector<float> got(n, 0.f);
+            vk::copy_d2h(got.data(), (void*)aa, n * 4, nullptr);
+            std::vector<float> ref(n), ref_u(n);
+            for (int i = 0; i < n; ++i) {
+                ref[i] = add ? (float)((double)a0[i] + (double)sc * x[i])   // fma arm (host exact)
+                             : sc * x[i];
+                ref_u[i] = add ? a0[i] + sc * x[i] : sc * x[i];              // mul+add arm
+            }
+            if (!add) ref = ref_u;
+            auto bf = arm_bits(got, ref), bu = arm_bits(got, ref_u);
+            std::printf("  axpy n=%d add=%d: bitwise-fused %s, bitwise-unfused %s, worst rel %.3e\n",
+                        n, add, bf.first ? "yes" : "no", bu.first ? "yes" : "no",
+                        std::fmin(bf.second, bu.second));
+            check(bf.first || bu.first, "axpy matches one contraction arm bitwise (scale arm exact)");
+        }
+
+        // add_scaled: 3 vectors into 3 acc rows, n=1024 (ffn width-ish), one shared x.
+        {
+            const int n = 1024, count = 3;
+            poly::ScaledRows rows;
+            std::vector<std::vector<float>> x(count, std::vector<float>(n)), acc(count, std::vector<float>(n));
+            for (int k = 0; k < count; ++k) { for (auto& v : x[k]) v = u(rng); for (auto& v : acc[k]) v = u(rng); }
+            rows.w[0] = 0.5f; rows.w[1] = -1.25f; rows.w[2] = 0.0625f;
+            std::vector<uint64_t> ax(count), aa(count);
+            for (int k = 0; k < count; ++k) {
+                ax[k] = a.alloc(n * 4); aa[k] = a.alloc(n * 4);
+                vk::copy_h2d((void*)ax[k], x[k].data(), n * 4, nullptr);
+                vk::copy_h2d((void*)aa[k], acc[k].data(), n * 4, nullptr);
+                rows.x[k] = (const float*)strata_vk_compat::wrap(ax[k]);
+                rows.acc[k] = (float*)strata_vk_compat::wrap(aa[k]);
+            }
+            poly::add_scaled(rows, count, n, nullptr);
+            int bad = 0;
+            for (int k = 0; k < count; ++k) {
+                std::vector<float> got(n, 0.f);
+                vk::copy_d2h(got.data(), (void*)aa[k], n * 4, nullptr);
+                std::vector<float> ref(n), ref_u(n);
+                for (int i = 0; i < n; ++i) {
+                    ref[i] = (float)((double)acc[k][i] + (double)rows.w[k] * x[k][i]);
+                    ref_u[i] = acc[k][i] + rows.w[k] * x[k][i];
+                }
+                auto b1 = arm_bits(got, ref).first, b2 = arm_bits(got, ref_u).first;
+                if (!(b1 || b2)) ++bad;
+            }
+            std::printf("  add_scaled count=%d n=%d: bad rows %d\n", count, n, bad);
+            check(bad == 0, "add_scaled per-row matches a contraction arm bitwise");
+        }
+
+        // swiglu_clamp at the ffn arm: n=1024, limit=7 (the model's softcap-style clamp); the
+        // exp-vs-expf gap is the only non-bitwise freedom -> rel 1e-5 (silu family bound).
+        {
+            const int n = 1024; const float limit = 7.0f;
+            std::vector<float> gate(n), up(n);
+            for (auto& v : gate) v = u(rng) * 4.f;   // cross the clamp both ways
+            for (auto& v : up) v = u(rng) * 4.f;
+            gate[0] = limit + 1.f; up[0] = -limit - 1.f; gate[1] = 0.f; up[1] = 0.f;
+            const uint64_t ag = a.alloc(n * 4), au = a.alloc(n * 4), ao = a.alloc(n * 4);
+            vk::copy_h2d((void*)ag, gate.data(), n * 4, nullptr);
+            vk::copy_h2d((void*)au, up.data(), n * 4, nullptr);
+            vk::fill_d((void*)ao, 0, n * 4, nullptr);
+            poly::swiglu_clamp((const float*)strata_vk_compat::wrap(ag), (const float*)strata_vk_compat::wrap(au),
+                               (float*)strata_vk_compat::wrap(ao), n, limit, nullptr);
+            std::vector<float> got(n, 0.f);
+            vk::copy_d2h(got.data(), (void*)ao, n * 4, nullptr);
+            std::vector<float> ref(n);
+            for (int i = 0; i < n; ++i) {
+                float g = std::fmin(gate[i], limit);
+                float uu = std::fmin(std::fmax(up[i], -limit), limit);
+                ref[i] = g / (1.0f + std::exp(-g)) * uu;
+            }
+            auto b = arm_bits(got, ref);
+            std::printf("  swiglu_clamp n=%d limit=%g: bitwise %s, worst rel %.3e (tree tol 1e-5)\n",
+                        n, limit, b.first ? "yes" : "no", b.second);
+            check(b.second < 1e-5, "swiglu_clamp within rel 1e-5 (exp vs expf)");
+        }
+
+        // mul_sigmoid: rows=16 (heads) x n=128, g_stride=256 (bigger than n: strided gate rows),
+        // plus the one_gate arm. sigmoid = 1/(1+expf(-x)) -> same transcendental caveat.
+        for (int og : {0, 1}) {
+            const int n = 128, rows = 16, g_stride = 256;
+            std::vector<float> acc((size_t)rows * n), g((size_t)rows * g_stride);
+            for (auto& v : acc) v = u(rng);
+            for (auto& v : g) v = u(rng) * 2.f;
+            const uint64_t aa = a.alloc(acc.size() * 4), ag = a.alloc(g.size() * 4);
+            vk::copy_h2d((void*)aa, acc.data(), acc.size() * 4, nullptr);
+            vk::copy_h2d((void*)ag, g.data(), g.size() * 4, nullptr);
+            poly::mul_sigmoid((float*)strata_vk_compat::wrap(aa),
+                              (const float*)strata_vk_compat::wrap(ag), n, rows, g_stride, og != 0, nullptr);
+            std::vector<float> got(acc.size(), 0.f);
+            vk::copy_d2h(got.data(), (void*)aa, got.size() * 4, nullptr);
+            std::vector<float> ref(acc.size());
+            for (int r = 0; r < rows; ++r) {
+                const float gv = g[(size_t)r * g_stride + (og ? 0 : 0)];  // one_gate=1 -> col 0
+                double worst = 0.0; int bit = 1;
+                for (int i = 0; i < n; ++i) {
+                    const float gate = g[(size_t)r * g_stride + (og ? 0 : i)];
+                    ref[(size_t)r * n + i] = acc[(size_t)r * n + i] * (1.0f / (1.0f + std::exp(-gate)));
+                    (void)gv;
+                }
+            }
+            auto b = arm_bits(got, ref);
+            std::printf("  mul_sigmoid n=%d rows=%d g_stride=%d one_gate=%d: bitwise %s, worst rel %.3e\n",
+                        n, rows, g_stride, og, b.first ? "yes" : "no", b.second);
+            check(b.second < 1e-5, "mul_sigmoid within rel 1e-5 (exp vs expf)");
+        }
+    }
+
     std::printf("poly_kernels_vk_parity %s\n", fails == 0 ? "PASS" : "FAIL");
     return fails == 0 ? 0 : 1;
 }
