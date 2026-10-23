@@ -221,6 +221,7 @@ Re-run with `STRATA_VK_STUBS=log` enumerates the rest of the qwen35moe decode pa
 | 20 | `strata::kernels::native_mmvq` type 12 (Q4_K) | native_mmvq family — **PORTED (Task 2.15)** |
 | 21 | `strata::poly::gemv_bf16` | poly: gemv_kernel<uint16_t> — **PORTED (Task 2.16)** |
 | 22 | `strata::kernels::native_mmvq` type 10 (Q2_K) | native_mmvq family — **PORTED (Task 2.17)** |
+| 23 | `strata::kernels::native_mmvq` type 11 (Q3_K) | native_mmvq family — **PORTED (Task 2.18)** |
 
 (The log arm returns untouched outputs, so entries after #1 are the path's *shape*, not a
 guaranteed per-token sequence; the first trap, `copy2`, is exact — the default arm stops there.)
@@ -517,3 +518,21 @@ x/y exactly like that; slots stays false (mirrors slots_kind == 0). Parity (+6 s
 added -> 27795 total compared, 0 differ**. ctest 13/13. Model gate: load 32.8 s, 10496/10496
 experts, 8 mmvq10 launches traced, and the halt moves from type 10 to `native_mmvq type 11`
 (Q3_K — the q5_k/q4_k decode tree with the 5-bit qh plane's low bit folded, the next sibling).
+
+**Halt point after Task 2.18 (2026-10-23):** `strata::poly::likeliest` — demand #23 cleared:
+Q3_K mmvq as mmvq_q3_k.comp, the q2_k clone with the Q3_K partition it documents (VDR=1:
+kqs = tid%16, kbx = tid/16 + 8t, SmallK n_in/256 < 8 -> ROWS=4) and the 110 B Q3KBlock
+(hmask[32]@0, qs[64]@32, scales[12]@96, half d@108 — alignof 2, 110 % 4 = 2, so like Q6_K every
+W byte goes through wb/w16/rd32; load_int_b2 = plain 4-byte LE). The dot is q3_q8_dot +
+q3_q8_dot_impl (:422-460) line-for-line: vl = qs pair, vh = ~hmask pair >> bq8_offset (the
+>> i << 2 fold never crosses bit 31), vsubss4 exact without clamping (bytes in [-4,3]), the
+6-bit scale decode indexing scales[isc%8] nibbles OR scales[8+isc%4] 2-bit high field minus 32.
+Contraction law 6 (the q6_k lineage): fused fma per i, and tmp += d*sumf -> fma(d, sumf, acc)
+(all shapes 1 kbx iteration; first draft failed 100% only because the host ref read scales at
+byte isc instead of 96+isc — kernel was right first try). Single-matrix dispatch; slots stays
+false (CUDA slots_kind(11)==1 but no slots comp ported, the q2_k precedent). Parity (+6 shapes
+2048x64/768/768x3 + 768x64x2/768x3/256x3x2, both rows arms): **BITWISE 0 differ, 3273 outputs
+added -> 31068 total compared, 0 differ**. ctest 13/13. Model gate: load 34.2 s, 10496/10496
+experts, and the halt moves from `native_mmvq type 11` to `strata::poly::likeliest` — the mmvq
+family is fully walked through the first decode step; the next halt is a poly-path kernel
+(likeliest_kernel, src/poly/kernels.cu, still todo in the poly table).

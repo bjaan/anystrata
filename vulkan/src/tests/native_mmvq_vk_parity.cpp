@@ -388,6 +388,57 @@ float q2_k_ref(const uint8_t* wr, const uint8_t* xcol, int nb, int row, int rows
     return a[row_in_group];   // lane i's post-tree value answers row0+i
 }
 
+// ---- Q3_K (type 11): transcription of q3_q8_dot / q3_q8_dot_impl (native_mmvq.cu:422-460).
+// Q3KBlock bytes (native_mmvq.cu:79, static_asserts :132-133): hmask[32]@0, qs[64]@32,
+// scales[12]@96, d (half)@108; 110 B, alignof 2 -> byte-addressed reads (the q6_k precedent).
+// Fused contraction (law 6): sumf += d8 * (dp4a(vi, u, 0) * sc) -> std::fma; the d * sumf return
+// fuses into the kbx accumulator, and every test shape gives each thread exactly 1 iteration
+// (nb=8 -> tid/16 in 0..7), so acc starts at 0 and the fusion is identity-safe.
+float vdot_q3_k(const uint8_t* w, const uint8_t* x, int iqs) {   // w = block bytes, x = q8 chain bytes
+    const int bq8_offset = 4 * (iqs / 8);
+    const int scale_offset = iqs - iqs % 8 + (iqs % 8) / 4;
+    const float d = f16_to_f32(rd_u16(w + 108));                 // w->d (half)
+    const int vl = rd_i32(w + 32 + 4 * iqs);                     // load_int_b2(qs, iqs)
+    const int vh = ~rd_i32(w + 4 * (iqs % 8)) >> bq8_offset;     // ~load_int_b2(hmask, iqs%8) >> bq8
+    float sumf = 0.0f;
+    for (int i = 0; i < 4; ++i) {
+        const int isc = scale_offset + 2 * i;
+        const int sc_low = (w[96 + isc % 8] >> (4 * (isc / 8))) & 0xf;        // scales@byte 96
+        const int sc_high = ((w[96 + 8 + isc % 4] >> (2 * (isc / 4))) & 3) << 4;
+        const int sc = (sc_low | sc_high) - 32;
+        const int vil = (vl >> (2 * i)) & 0x03030303;
+        const int vih = ((vh >> i) << 2) & 0x04040404;
+        const int vi = int(vsub4(uint32_t(vil), uint32_t(vih)));  // vsubss4 (in-range, exact)
+        const uint8_t* bq8i = x + (bq8_offset + i) * 36;
+        const int u = rd_i32(bq8i + 4 + 4 * (iqs % 8));           // (int*)qs + iqs%8
+        const float d8 = f16_to_f32(rd_u16(bq8i));                // __low2float(ds)
+        sumf = std::fma(d8, float(dp4a(uint32_t(vi), uint32_t(u), 0) * sc), sumf);
+    }
+    return d * sumf;
+}
+
+// emulate native_q3_k_mmvq_kernel<SmallK> for one (row, column): VDR=1 partition (kbx = tid/16 +
+// 8t ascending, kqs = tid % 16); 110 B blocks (q3_q8_dot inlines the load/apply, :459).
+float q3_k_ref(const uint8_t* wr, const uint8_t* xcol, int nb, int row, int rows, int row_in_group) {
+    float part[4][32];
+    for (int s = 0; s < 4; ++s) for (int l = 0; l < 32; ++l) part[s][l] = 0.f;
+    for (int tid = 0; tid < 128; ++tid) {
+        const int s = tid / 32, lane = tid % 32, kqs = tid % 16;
+        const int r = (rows == 1) ? row : row + row_in_group;   // guarded by caller for rows==4
+        float acc = 0.f;
+        for (int kbx = tid / 16; kbx < nb; kbx += 8)
+            acc += vdot_q3_k(wr + (size_t(r) * nb + kbx) * 110,
+                             xcol + size_t(kbx * 8) * 36, kqs);
+        part[s][lane] += acc;
+    }
+    float a[32];
+    for (int l = 0; l < 32; ++l)
+        a[l] = ((part[0][l] + part[1][l]) + part[2][l]) + part[3][l];
+    float n[32];
+    for (int o = 16; o > 0; o >>= 1) { for (int l = 0; l < 32; ++l) n[l] = a[l] + a[l ^ o]; std::memcpy(a, n, sizeof a); }
+    return a[row_in_group];   // lane i's post-tree value answers row0+i
+}
+
 // ---- Q6_K (type 14): transcription of q6_q8_dot / q6_q8_dot_impl (native_mmvq.cu:773-803).
 // Q6KBlock bytes: ql[128]@0, qh[64]@128, scales[16]@192 (int8), d (half)@208; 210 B, not aligned.
 // Returns d and sumf separately: the kbx accumulation `tmp[i] += q6_q8_dot(...)` inlines the dot,
@@ -986,6 +1037,80 @@ int main(int argc, char** argv) {
             }
         }
         std::printf("native_mmvq q2_k vk vs reference: n_in %d n_out %d ncols %d rows %d: %d outputs, %d differ bitwise\n",
+                    s.n_in, s.n_out, s.ncols, rows, s.ncols * s.n_out, shape_fails);
+    }
+    // ---- type 11 (Q3_K, Task 2.18): n_in 2048 -> rows=1 (nb 8, SmallK=false); 768/256 -> rows=4
+    const struct { int n_in, n_out, ncols; } q3_shapes[] = {
+        {2048, 64, 1}, {2048, 768, 1}, {2048, 768, 3}, {768, 64, 2}, {768, 3, 1}, {256, 3, 2}};
+    for (const auto& s : q3_shapes) {
+        const int nb = s.n_in / 256;
+        const int rows = (nb < 8) ? 4 : 1;            // mirrors the launcher's SmallK pick
+        std::mt19937 rng(5900 + s.n_in * 7 + s.ncols);
+        std::vector<uint8_t> W(size_t(s.n_out) * nb * 110);
+        for (auto& blk : W) blk = uint8_t(rng() & 0xFF);
+        for (int r = 0; r < s.n_out; ++r)
+            for (int b = 0; b < nb; ++b) {           // sane fp16 d half at byte 108
+                const uint16_t dh = f16_rn((rng() & 1) ? -0.01f : 0.02f);
+                std::memcpy(W.data() + (size_t(r) * nb + b) * 110 + 108, &dh, 2);
+            }
+        std::vector<float> x(size_t(s.n_in) * s.ncols);
+        for (auto& v : x) v = float(int(rng() % 2001) - 1000) / 250.0f;
+
+        const uint64_t w_sz = W.size(), w_pad = (w_sz + 3) & ~3ull;
+        const uint64_t x_sz = size_t(s.n_in) / 32 * s.ncols * 36;
+        const uint64_t y_sz = size_t(s.ncols) * s.n_out * 4;
+        const uint64_t ax = a.alloc(x.size() * 4), aq = a.alloc(x_sz);
+        const uint64_t aw = a.alloc(w_pad + 4), ay = a.alloc(y_sz);
+        vk::copy_h2d((void*)ax, x.data(), x.size() * 4, nullptr);
+        vk::copy_h2d((void*)aw, W.data(), w_sz, nullptr);
+        vk::fill_d((void*)ay, 0xFE, y_sz, nullptr);
+        kernels::native_quantize_q8_1((const float*)strata_vk_compat::wrap(ax), strata_vk_compat::wrap(aq),
+                                      s.n_in, s.ncols, strata_vk_compat::wrap(1000));
+        std::vector<uint8_t> Q(x_sz);
+        vk::copy_d2h(Q.data(), (void*)aq, x_sz, nullptr);
+
+        kernels::native_mmvq(11, strata_vk_compat::wrap(aw), strata_vk_compat::wrap(aq),
+                             (float*)strata_vk_compat::wrap(ay), s.n_in, s.n_out, s.ncols,
+                             strata_vk_compat::wrap(1000));
+        std::vector<float> y(size_t(s.ncols) * s.n_out);
+        vk::copy_d2h(y.data(), (void*)ay, y_sz, nullptr);
+
+        int shape_fails = 0;
+        for (int c = 0; c < s.ncols; ++c) {
+            const uint8_t* xcol = Q.data() + size_t(c) * nb * 8 * 36;
+            if (rows == 1) {
+                for (int r = 0; r < s.n_out; ++r) {
+                    const float ref = q3_k_ref(W.data(), xcol, nb, r, 1, 0);
+                    const float got = y[size_t(c) * s.n_out + r];
+                    ++compared;
+                    if (got != ref) {
+                        if (shape_fails < 8) {
+                            uint32_t gb, rb; std::memcpy(&gb, &got, 4); std::memcpy(&rb, &ref, 4);
+                            std::printf("  MISMATCH q3k n_in %d ncols %d r %d: got %.9g ref %.9g (bits %08x/%08x)\n",
+                                        s.n_in, c, r, got, ref, gb, rb);
+                        }
+                        ++shape_fails; ++fails;
+                    }
+                }
+            } else {
+                for (int g = 0; g < (s.n_out + 3) / 4; ++g)
+                    for (int i = 0; i < 4 && g * 4 + i < s.n_out; ++i) {
+                        const int r = g * 4 + i;
+                        const float ref = q3_k_ref(W.data(), xcol, nb, g * 4, 4, i);
+                        const float got = y[size_t(c) * s.n_out + r];
+                        ++compared;
+                        if (got != ref) {
+                            if (shape_fails < 8) {
+                                uint32_t gb, rb; std::memcpy(&gb, &got, 4); std::memcpy(&rb, &ref, 4);
+                                std::printf("  MISMATCH q3k n_in %d ncols %d r %d: got %.9g ref %.9g (bits %08x/%08x)\n",
+                                            s.n_in, c, r, got, ref, gb, rb);
+                            }
+                            ++shape_fails; ++fails;
+                        }
+                    }
+            }
+        }
+        std::printf("native_mmvq q3_k vk vs reference: n_in %d n_out %d ncols %d rows %d: %d outputs, %d differ bitwise\n",
                     s.n_in, s.n_out, s.ncols, rows, s.ncols * s.n_out, shape_fails);
     }
     // ---- type 14 (Q6_K): n_in 2048 -> rows=1 (nb 8, SmallK=false); 512/256 -> rows=4 (nb<4)
