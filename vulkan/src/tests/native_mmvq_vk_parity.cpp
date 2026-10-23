@@ -29,6 +29,7 @@
 #include "strata/vulkan_compat/strata_vk.h"
 #include "iq2xxs_grid_vk.h"
 #include "iq3xxs_grid_vk.h"
+#include "iq2s_grid_vk.h"
 
 #include <cmath>
 #include <cstdint>
@@ -139,6 +140,39 @@ float vdot_iq3_xxs(const uint8_t* bq3, const uint8_t* q8, int iqs) {
     const int ls = int(aux32 >> 28);                                   // logical shift; 4-bit value
     sumi = (ls * sumi + sumi / 2) / 2;                                 // C truncation toward zero, both divs
     uint16_t d8h; std::memcpy(&d8h, q8, 2);                            // __low2float(ds)
+    return dw * f16_to_f32(d8h) * float(sumi);
+}
+
+// vec_dot_iq2_s_q8_1 (iq_kernels.cu:158-189, vecdotq.cuh:1124-1167) transcribed verbatim;
+// bq2 = block bytes (82 B: half d @0, qs[64] @2..65 -- grid-index bytes at 2+4*(iqs/2)+au and
+// sign bytes at 34+2*iqs+au == "get_int_b2(qs, 8 + iqs/2)", qh[8] @66, scales[8] @74), q8 = the
+// q8_1 block's byte 0 (word 0 = ds, bytes 4..35 = qs).
+float vdot_iq2_s(const uint8_t* bq2, const uint8_t* q8, int iqs) {
+    uint16_t dh; std::memcpy(&dh, bq2, 2);
+    const float dw = f16_to_f32(dh);
+    const uint8_t* qs = bq2 + 2 + 4 * (iqs / 2);        // qs_packed's 4 bytes
+    const uint8_t* sp = bq2 + 2 + 4 * (8 + iqs / 2);    // signs_packed_32's 4 bytes = 34 + 2*iqs
+    const int qh  = bq2[66 + iqs / 2];
+    const uint8_t scale = bq2[74 + iqs / 2];
+    const int ls0 = scale & 0x0F, ls1 = scale >> 4;
+    int sumi0 = 0, sumi1 = 0;
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const uint64_t g = strata::vk::kIq2sGrid[qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)];
+        const uint32_t gx = uint32_t(g), gy = uint32_t(g >> 32);      // (const int*) entry halves
+        const uint32_t s0 = vcmpne4(((sp[l0 / 2] & 0x03) << 7) | ((sp[l0 / 2] & 0x0C) << 21));
+        const uint32_t s1 = vcmpne4(((sp[l0 / 2] & 0x30) << 3) | ((sp[l0 / 2] & 0xC0) << 17));
+        uint32_t u0; std::memcpy(&u0, q8 + 4 + l0 * 4, 4);            // get_int_b4(bq8->qs, l0)
+        uint32_t u1; std::memcpy(&u1, q8 + 4 + (l0 + 1) * 4, 4);
+        if (l0 < 4) {
+            sumi0 = dp4a(vsub4(gx ^ s0, s0), u0, sumi0);
+            sumi0 = dp4a(vsub4(gy ^ s1, s1), u1, sumi0);
+        } else {
+            sumi1 = dp4a(vsub4(gx ^ s0, s0), u0, sumi1);
+            sumi1 = dp4a(vsub4(gy ^ s1, s1), u1, sumi1);
+        }
+    }
+    const int sumi = (sumi0 * ls0 + sumi1 * ls1 + (sumi0 + sumi1) / 2) / 4;   // C truncation, both divs
+    uint16_t d8h; std::memcpy(&d8h, q8, 2);                                   // __low2float(ds)
     return dw * f16_to_f32(d8h) * float(sumi);
 }
 
@@ -551,6 +585,72 @@ int main(int argc, char** argv) {
                 }
             }
         std::printf("native_mmvq iq4_xs vk vs reference: n_in %d n_out %d ncols %d: %d outputs, %d differ bitwise\n",
+                    s.n_in, s.n_out, s.ncols, s.ncols * s.n_out, shape_fails);
+    }
+    // ---- type 22 (IQ2_S, Task 2.14): Fmt<22> = {qk 256, ipb 8, step 2} - same ROWS=4 grid
+    // ceil(n_out/4) launch as 16/18; blocks are 82 B (half d + qs[64] + qh[8] + scales[8]), the
+    // uint64 iq2s_grid table (1024 entries) rides the arena-upload route bound as uvec2 pairs.
+    const Shape iq2s_shapes[] = {{2048, 64, 1}, {2048, 768, 1}, {2048, 64, 2}, {768, 64, 3}, {256, 64, 1}, {256, 3, 1}};
+    for (const Shape& s : iq2s_shapes) {
+        const int nb = s.n_in / 256;
+        std::mt19937 rng(6100 + s.n_in * 13 + s.ncols);
+        std::uniform_real_distribution<float> sc(0.0009765625f, 0.03125f);   // d in [2^-10, 2^-5)
+        std::vector<uint8_t> W(size_t(s.n_out) * nb * 82);
+        for (auto& blk : W) blk = uint8_t(rng() & 0xFF);                     // random legal bytes
+        for (int r = 0; r < s.n_out; ++r)
+            for (int b = 0; b < nb; ++b) {
+                const uint16_t dh = f16_rn((rng() & 1) ? -sc(rng) : sc(rng));
+                std::memcpy(W.data() + (size_t(r) * nb + b) * 82, &dh, 2);   // finite fp16 scale
+            }
+        std::vector<float> x(size_t(s.n_in) * s.ncols);
+        for (auto& v : x) v = float(int(rng() % 2001) - 1000) / 250.0f;
+
+        const uint64_t w_sz = W.size(), w_pad = (w_sz + 3) & ~3ull;          // words read up to a pad
+        const uint64_t x_sz = size_t(s.n_in) / 32 * s.ncols * 36;
+        const uint64_t y_sz = size_t(s.ncols) * s.n_out * 4;
+        const uint64_t ax = a.alloc(x.size() * 4), aq = a.alloc(x_sz);
+        const uint64_t aw = a.alloc(w_pad + 4), ay = a.alloc(y_sz);
+        vk::copy_h2d((void*)ax, x.data(), x.size() * 4, nullptr);
+        vk::copy_h2d((void*)aw, W.data(), w_sz, nullptr);
+        vk::fill_d((void*)ay, 0xFE, y_sz, nullptr);
+        kernels::native_quantize_q8_1((const float*)strata_vk_compat::wrap(ax), strata_vk_compat::wrap(aq),
+                                      s.n_in, s.ncols, strata_vk_compat::wrap(1000));
+        std::vector<uint8_t> Q(x_sz);
+        vk::copy_d2h(Q.data(), (void*)aq, x_sz, nullptr);
+
+        kernels::native_mmvq(22, strata_vk_compat::wrap(aw), strata_vk_compat::wrap(aq),
+                             (float*)strata_vk_compat::wrap(ay), s.n_in, s.n_out, s.ncols,
+                             strata_vk_compat::wrap(1000));
+        std::vector<float> y(size_t(s.ncols) * s.n_out);
+        vk::copy_d2h(y.data(), (void*)ay, y_sz, nullptr);
+
+        int shape_fails = 0;
+        for (int c = 0; c < s.ncols; ++c)
+            for (int r = 0; r < s.n_out; ++r) {
+                const uint8_t* wr = W.data() + size_t(r) * nb * 82;
+                const uint8_t* xcol = Q.data() + size_t(c) * nb * 8 * 36;
+                float part[32] = {0.f};
+                for (int k = 0; k < nb * 8; ++k) {                          // lane k%32's call k
+                    const int kbx = k / 8, iqs = 2 * (k % 8);               // Fmt<22>: step 2
+                    part[k % 32] += vdot_iq2_s(wr + kbx * 82, xcol + size_t(kbx * 8 + iqs / 2) * 36, iqs);
+                }
+                float acc[32], nxt[32];
+                std::memcpy(acc, part, sizeof part);
+                for (int o = 16; o > 0; o >>= 1) {                          // warp_sum's xor tree
+                    for (int l = 0; l < 32; ++l) nxt[l] = acc[l] + acc[l ^ o];
+                    std::memcpy(acc, nxt, sizeof nxt);
+                }
+                const float ref = acc[0], got = y[size_t(c) * s.n_out + r];
+                ++compared;
+                if (got != ref) {
+                    uint32_t gb, rb; std::memcpy(&gb, &got, 4); std::memcpy(&rb, &ref, 4);
+                    if (shape_fails < 24)
+                        std::printf("  MISMATCH t22 n_in %d ncols %d r %d: got %.9g ref %.9g (bits %08x/%08x)\n",
+                                    s.n_in, c, r, got, ref, gb, rb);
+                    ++shape_fails; ++fails;
+                }
+            }
+        std::printf("native_mmvq iq2_s vk vs reference: n_in %d n_out %d ncols %d: %d outputs, %d differ bitwise\n",
                     s.n_in, s.n_out, s.ncols, s.ncols * s.n_out, shape_fails);
     }
     // ---- type 13 (Q5_K): n_in 2048 -> rows=1 (nb 8, SmallK=false); 768/256 -> rows=4 (SmallK=true)

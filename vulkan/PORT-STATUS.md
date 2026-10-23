@@ -217,7 +217,8 @@ Re-run with `STRATA_VK_STUBS=log` enumerates the rest of the qwen35moe decode pa
 | 16 | `strata::poly::attend` | poly: attn_score/softmax/value/… kernels — **PORTED (Task 2.11)** |
 | 17 | `strata::kernels::native_mmvq` type 23 (IQ4_XS) | native_mmvq family — **PORTED (Task 2.12)** |
 | 18 | `strata::kernels::native_mmvq` type 8 (Q8_0) | native_mmvq family — **PORTED (Task 2.13)** |
-| 19 | `strata::kernels::native_mmvq` type 22 (IQ2_S) | native_mmvq family — the run's CURRENT halt |
+| 19 | `strata::kernels::native_mmvq` type 22 (IQ2_S) | native_mmvq family — **PORTED (Task 2.14)** |
+| 20 | `strata::kernels::native_mmvq` type 12 (Q4_K) | native_mmvq family — the run's CURRENT halt |
 
 (The log arm returns untouched outputs, so entries after #1 are the path's *shape*, not a
 guaranteed per-token sequence; the first trap, `copy2`, is exact — the default arm stops there.)
@@ -447,3 +448,19 @@ mmvq8 hits incl. n_in 512 -> rows=4 arm) and stopped at
 `strata-vk: strata::kernels::native_mmvq type 22 has no Vulkan implementation yet` (demand #19 —
 IQ2_S mmvq, iq_kernels.cu's mmvq_kernel<22> path; the iq3_xxs/iq4_xs templates are the proven
 shapes to extend).
+
+**Halt point after Task 2.14 (2026-10-23):** `strata::kernels::native_mmvq` **type 12 (Q4_K)** —
+demand #19 cleared: IQ2_S (type 22) is PORTED bitwise. mmvq_iq2_s.comp clones the iq2_xxs template
+with Fmt<22> = {qk 256, ipb 8, step 2}: 82-byte unaligned blocks (half d @0, qs[64] @2 — grid bytes
+at 2+4*(iqs/2)+au, 2-bit sign bytes at 34+2*iqs+au = get_int_b2(qs, 8+iqs/2), qh[8] @66, scales[8]
+@74 nibble pair ls0/ls1), the 10-bit grid composite qs | ((qh << (8-l0)) & 0x300) into
+iq2s_grid (1024 x uint64, ggml-common.h:758 — extracted value-by-value diff-clean to
+iq2s_grid_vk.h, uploaded once as uvec2 pairs like iq2xxs), the split sumi0/sumi1 accumulators and
+(sumi0*ls0 + sumi1*ls1 + trunc_div2(sumi0+sumi1))/4. Parity: 6 iq2_s shapes (2048x64 c1, 2048x768
+c1, 2048x64 c2, 768x64 c3, 256x64 c1, 256x3 c1) BITWISE — full suite now 20481/20481 outputs,
+0 differ; ctest 13/13. Contraction: the row accumulation stays UNFUSED (the dw*d8*sumi -> s +=
+term arm matches; same evidence as iq2_xxs/iq3_xxs — the fused arm was never needed). Model gate:
+load 35.0 s, 10496/10496 experts in VRAM, the decode walked 8 type-22 legs (trace mmvq22) and
+stopped at `strata-vk: strata::kernels::native_mmvq type 12 has no Vulkan implementation yet`
+(demand #20 — Q4_K mmvq, native_q4_k_mmvq in native_mmvq.cu: the Fmt<12> geometry is
+{qk 256, ipb QI4_K/VDR, step VDR} — super-block scale decode, no grid table).

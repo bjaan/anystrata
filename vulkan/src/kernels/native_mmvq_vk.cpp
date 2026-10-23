@@ -31,6 +31,7 @@
 #include "strata/vulkan_compat/strata_vk.h"
 #include "iq2xxs_grid_vk.h"
 #include "iq3xxs_grid_vk.h"
+#include "iq2s_grid_vk.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -51,11 +52,14 @@ namespace {
 #include "mmvq_iq3_xxs.spv.h"       // mmvq_iq3_xxs.comp (Task 2.9, type 18 IQ3_XXS)
 #include "mmvq_iq4_xs.spv.h"        // mmvq_iq4_xs.comp (Task 2.12, type 23 IQ4_XS)
 #include "mmvq_q8_0.spv.h"          // mmvq_q8_0.comp (Task 2.13, type 8 Q8_0)
+#include "mmvq_iq2_s.spv.h"         // mmvq_iq2_s.comp (Task 2.14, type 22 IQ2_S)
 
 constexpr int IQ_BLOCK_ELEMS = 256;
 using vk::kIq2xxsGrid;   // the grid table header (namespace strata::vk)
 using vk::kIq3xxsGrid;   // the iq3xxs grid table header
+using vk::kIq2sGrid;     // the iq2s grid table header (1024 x uint64)
 constexpr int IQ_BLOCK_BYTES = 66;   // block_iq2_xxs
+constexpr int IQ2S_BLOCK_BYTES = 82; // block_iq2_s (half d + qs[64] + qh[8] + scales[8])
 constexpr int IQ3_BLOCK_BYTES = 98;  // block_iq3_xxs (half d + uint8 qs[96])
 constexpr int IQ4XS_BLOCK_BYTES = 146;  // block_iq4_xs (half d + uint16 scales_h + uint8 scales_l[4] + uint8 qs[128])
 constexpr int Q5K_BLOCK_BYTES = 176; // Q5KBlock (native_mmvq.cu:129)
@@ -100,11 +104,22 @@ uint64_t grid32_buffer() {
     }();
     return p;
 }
+// the arena copy of iq2s_grid (1024 x uint64 = 8192 B), uploaded once - same route as grid_buffer
+uint64_t grid_iq2s_buffer() {
+    static const uint64_t p = [] {
+        const uint64_t g = vk::Arena::instance().alloc(sizeof(kIq2sGrid));
+        vk::copy_h2d(reinterpret_cast<void*>(static_cast<std::uintptr_t>(g)), kIq2sGrid,
+                     sizeof(kIq2sGrid), nullptr);
+        vk::device_sync();
+        return g;
+    }();
+    return p;
+}
 }  // namespace
 
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream) {
-    if (ggml_type != 16 && ggml_type != 18 && ggml_type != 23 && ggml_type != 13 && ggml_type != 14 &&
+    if (ggml_type != 16 && ggml_type != 18 && ggml_type != 23 && ggml_type != 22 && ggml_type != 13 && ggml_type != 14 &&
         ggml_type != 8) {
         // the CUDA wrapper would throw/exit here too — name the type instead (never compute with a
         // wrong decoder); shape is not validated for a type this port does not run.
@@ -124,6 +139,8 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
         std::fprintf(stderr, "mmvq23 n_in %d n_out %d ncols %d\n", n_in, n_out, ncols);
     if (std::getenv("STRATA_VK_TRACE_MMVQ8") && ggml_type == 8)
         std::fprintf(stderr, "mmvq8 n_in %d n_out %d ncols %d\n", n_in, n_out, ncols);
+    if (std::getenv("STRATA_VK_TRACE_MMVQ22") && ggml_type == 22)
+        std::fprintf(stderr, "mmvq22 n_in %d n_out %d ncols %d\n", n_in, n_out, ncols);
     if (ggml_type == 8) {
         // small_mmvq<Q80Block, 8> (native_mmvq.cu:2118-2145): 32-element blocks; SmallK when
         // n_in/32 < 2*WARPS*WARP/Qi (= 32) -> ROWS=4 grid ceil(n_out/4), else ROWS=1 grid n_out.
@@ -202,6 +219,17 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
         const uint32_t rows = (nb < 32u) ? 4u : 1u;
         const uint32_t pc[4] = {(uint32_t)n_in, (uint32_t)n_out, (uint32_t)ncols, rows};
         vk::kernel_launch_sized(k, rows == 4u ? int((n_out + 3) / 4) : n_out, bufs, sizes, 3, pc);
+    } else if (ggml_type == 22) {  // IQ2_S: Fmt<22> = {qk 256, ipb 8, step 2} - same launch as 16
+        static const vk::Kernel k = vk::kernel_load(
+            "native_mmvq_iq2_s", mmvq_iq2_s_spv, mmvq_iq2_s_spv_len,
+            /*storage buffers*/ 4, /*push bytes*/ 12, /*workgroup*/ THREADS,
+            /*force 32-wide subgroups*/ true);
+        const uint64_t w_sz = uint64_t(n_out) * nb * IQ2S_BLOCK_BYTES;
+        const uint64_t bufs[4]  = {strata_vk_compat::off(weights), strata_vk_compat::off(x_q8_1),
+                                   strata_vk_compat::off(y), grid_iq2s_buffer()};
+        const uint64_t sizes[4] = {w_sz, x_sz, y_sz, sizeof(kIq2sGrid)};
+        const uint32_t pc[3] = {(uint32_t)n_in, (uint32_t)n_out, (uint32_t)ncols};
+        vk::kernel_launch_sized(k, (int)((n_out + 3) / 4), bufs, sizes, 4, pc);
     } else {  // ggml_type == 18 (IQ3_XXS): Fmt<18> = {qk 256, ipb 8, step 2} - same grid/launch as 16
         static const vk::Kernel k = vk::kernel_load(
             "native_mmvq_iq3_xxs", mmvq_iq3_xxs_spv, mmvq_iq3_xxs_spv_len,
