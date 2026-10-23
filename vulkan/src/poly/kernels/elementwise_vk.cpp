@@ -18,6 +18,7 @@ namespace strata::poly {
 namespace {
 #include "elementwise_axpy.spv.h"
 #include "elementwise_swiglu.spv.h"
+#include "elementwise_swiglu_rows.spv.h"
 #include "elementwise_mul_sigmoid.spv.h"
 
 const vk::Kernel& pl_axpy() {
@@ -28,6 +29,11 @@ const vk::Kernel& pl_axpy() {
 const vk::Kernel& pl_swiglu() {
     static const vk::Kernel k = vk::kernel_load("elementwise_swiglu", elementwise_swiglu_spv,
                                                 elementwise_swiglu_spv_len, 3, 16, 256, false);
+    return k;
+}
+const vk::Kernel& pl_swiglu_rows() {
+    static const vk::Kernel k = vk::kernel_load("elementwise_swiglu_rows", elementwise_swiglu_rows_spv,
+                                                elementwise_swiglu_rows_spv_len, 2, 16, 256, false);
     return k;
 }
 const vk::Kernel& pl_mul_sigmoid() {
@@ -53,6 +59,22 @@ void swiglu_clamp(const float* gate, const float* up, float* out, int n, float l
     const uint64_t sizes[3] = {(uint64_t)n * 4, (uint64_t)n * 4, (uint64_t)n * 4};
     const uint32_t pc[4] = {(uint32_t)n, bits(limit), 0u, 0u};
     vk::kernel_launch_sized(pl_swiglu(), (n + 255) / 256, bufs, sizes, 3, pc);
+}
+
+void swiglu_clamp_rows(const float* gate_up, float* out, int n, int rows, float limit, void* stream) {
+    // CUDA :2407: grid(ceil(n/256), rows) x 256 — row-major gate|up pairs of n floats each. No
+    // wrapper-side validation there; guard the degenerate shapes like the sibling launchers and
+    // replay the flattened launch per 65535-row chunk (grid.y's ceiling; mul_sigmoid's pattern).
+    if (n <= 0 || rows <= 0) return;
+    const int blocks = (n + 255) / 256;
+    for (int r = 0; r < rows; r += 65535) {
+        const int chunk = rows - r < 65535 ? rows - r : 65535;
+        const uint64_t bufs[2] = {strata_vk_compat::off(gate_up) + (uint64_t)r * 2 * n * 4,
+                                  strata_vk_compat::off(out) + (uint64_t)r * n * 4};
+        const uint64_t sizes[2] = {(uint64_t)chunk * 2 * n * 4, (uint64_t)chunk * n * 4};
+        const uint32_t pc[4] = {(uint32_t)n, bits(limit), (uint32_t)blocks, 0u};
+        vk::kernel_launch_sized(pl_swiglu_rows(), blocks * chunk, bufs, sizes, 2, pc);
+    }
 }
 
 void add_scaled(const ScaledRows& rows, int count, int n, void* stream) {

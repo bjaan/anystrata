@@ -494,6 +494,33 @@ int main() {
             check(b.second < 1e-5, "swiglu_clamp within rel 1e-5 (exp vs expf)");
         }
 
+        // swiglu_clamp_rows (Task 2.8): rows of gate|up pairs (CUDA :873), n 1024 and an odd 300
+        // (the tail guard), rows 3: same exp-vs-expf caveat as swiglu_clamp -> rel 1e-5.
+        for (int n : {1024, 300}) {
+            const int rows = 3; const float limit = 7.0f;
+            std::vector<float> gu(size_t(rows) * 2 * n), out(size_t(rows) * n);
+            for (auto& v : gu) v = u(rng) * 4.f;
+            gu[0] = limit + 1.f; gu[n] = -limit - 1.f;
+            const uint64_t ag = a.alloc(gu.size() * 4), ao = a.alloc(out.size() * 4);
+            vk::copy_h2d((void*)ag, gu.data(), gu.size() * 4, nullptr);
+            vk::fill_d((void*)ao, 0, out.size() * 4, nullptr);
+            poly::swiglu_clamp_rows((const float*)strata_vk_compat::wrap(ag),
+                                    (float*)strata_vk_compat::wrap(ao), n, rows, limit, nullptr);
+            std::vector<float> got(out.size(), 0.f);
+            vk::copy_d2h(got.data(), (void*)ao, got.size() * 4, nullptr);
+            std::vector<float> ref(out.size());
+            for (int r = 0; r < rows; ++r)
+                for (int i = 0; i < n; ++i) {
+                    const float g = std::fmin(gu[size_t(r) * 2 * n + i], limit);
+                    const float up = std::fmin(std::fmax(gu[size_t(r) * 2 * n + n + i], -limit), limit);
+                    ref[size_t(r) * n + i] = g / (1.0f + std::exp(-g)) * up;
+                }
+            auto b = arm_bits(got, ref);
+            std::printf("  swiglu_clamp_rows n=%d rows=%d limit=%g: bitwise %s, worst rel %.3e (tree tol 1e-5)\n",
+                        n, rows, limit, b.first ? "yes" : "no", b.second);
+            check(b.second < 1e-5, "swiglu_clamp_rows within rel 1e-5 (exp vs expf)");
+        }
+
         // mul_sigmoid: rows=16 (heads) x n=128, g_stride=256 (bigger than n: strided gate rows),
         // plus the one_gate arm. sigmoid = 1/(1+expf(-x)) -> same transcendental caveat.
         for (int og : {0, 1}) {

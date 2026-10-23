@@ -197,11 +197,13 @@ target_link_libraries(strata_vk_kernel_conv4_silu PUBLIC strata_vk_runtime strat
 # Task 2.7: poly elementwise batch (axpy, swiglu_clamp, mul_sigmoid, add_scaled) — one .comp,
 # three -DEW_VARIANT arms (0 axpy/add_scaled pass, 1 swiglu_clamp, 2 mul_sigmoid), one launcher lib.
 set(_ew_spvs "")
-foreach(_v axpy swiglu mul_sigmoid)
+foreach(_v axpy swiglu swiglu_rows mul_sigmoid)   # Task 2.8: swiglu_rows = EW_VARIANT 3
   if(_v STREQUAL axpy)
     set(_ev 0)
   elseif(_v STREQUAL swiglu)
     set(_ev 1)
+  elseif(_v STREQUAL swiglu_rows)
+    set(_ev 3)
   else()
     set(_ev 2)
   endif()

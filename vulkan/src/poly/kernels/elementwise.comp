@@ -58,6 +58,28 @@ void main() {
     bout.v[i] = g / (1.0 + exp(-g)) * u;
 }
 
+#elif EW_VARIANT == 3
+// ---- swiglu_clamp_rows (Task 2.8): gate and up interleaved per row (gate_up + row*2n), out row*n.
+// CUDA :873 swiglu_clamp_rows_kernel, grid(n,256) x rows: elementwise, same expression as
+// variant 1, so the only freedom stays exp vs expf (rel 1e-5 family bound).
+layout(std430, binding = 0) readonly buffer GU  { float v[]; } bgu;
+layout(std430, binding = 1)           buffer OUT { float v[]; } bout;
+
+// n, limit bits, blocks per row = ceil(n/256) (the launcher replays grid.y by flattening; the
+// 65535-row chunking happens there, buffers offset like mul_sigmoid's).
+layout(push_constant) uniform PC { uint n; uint limit_bits; uint blocks; uint pad1; } pc;
+
+void main() {
+    const uint row = gl_WorkGroupID.x / pc.blocks;
+    const uint i = (gl_WorkGroupID.x % pc.blocks) * 256u + gl_LocalInvocationID.x;
+    if (i >= pc.n) return;
+    const float limit = uintBitsToFloat(pc.limit_bits);
+    const uint r2 = row * (2u * pc.n);
+    const float g = min(bgu.v[r2 + i], limit);
+    const float u = min(max(bgu.v[r2 + pc.n + i], -limit), limit);
+    bout.v[row * pc.n + i] = g / (1.0 + exp(-g)) * u;
+}
+
 #else
 // ---- mul_sigmoid: the launcher replays the wrapper's 65535-row loop by offsetting both buffers,
 // so here row is the in-chunk row and base pointers already sit at chunk start.
