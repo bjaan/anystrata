@@ -306,7 +306,7 @@ arms), inside the tree's silu/gemv-family 1e-5 bound. ctest 11/11. Model gate: l
 ran past demands 8-10 and 13, stopped at native_mmvq_slots (#11) — the expert-path's slot gather:
 port native_mmvq_slots before the next poly demand (swiglu_clamp_rows, #12).
 
-**Halt point after Task 2.8 (2026-10-23):** `strata::kernels::native_mmvq type 18` (IQ2_XS — the
+**Halt point after Task 2.8 (2026-10-23):** `strata::kernels::native_mmvq type 18` (IQ3_XXS — the
 single-matrix entry trap-by-number, NOT a demand-list name: the model's mixed-format expert stack
 demands an unported iq family format directly). native_mmvq_slots (#11) ported for 16/13/14 as
 mmvq_slots_iq2_xxs/q5_k/q6_k.comp (one W/X/Y triple per slot = 24 storage buffers, +25th iq2xxs
@@ -323,7 +323,7 @@ BITWISE across ROWS arms (512-wide ROWS=2 cases included): 9073 outputs compared
 EW_VARIANT 3 (flattened grid + 65535-row chunking, mul_sigmoid's pattern): worst rel 7.0e-7
 (exp vs expf, inside the 1e-5 family bound). native_mmvq_ids (:3194, the sibling contract) NOT
 ported — still trap-by-number; record: the next halt may demand it. ctest 11/11. Model gate:
-load 32.6 s, decode ran past #11 and #12, stopped at native_mmvq type 18.
+load 32.6 s, decode ran past #11 and #12, stopped at native_mmvq type 18 = IQ3_XXS (ggml.h:408).
 
 Phase-2 first picks by demand order: `copy2`, `rms_norm`, then the mmvq family
 (`native_quantize_q8_1`, `native_mmvq`) — matching the plan's expectation (quantize_act /
