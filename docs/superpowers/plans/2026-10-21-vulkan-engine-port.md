@@ -187,3 +187,27 @@ The goal of this phase is **not** running: it is `strata-poly`'s eleven host fil
 
 ## Test plan summary
 Unit gate every commit: `ctest --test-dir build-vk`. Model gate from Phase 2 on: `strata-poly-vk --no-graphs` must advance its trap position (strictly fewer named traps each session) and never produce output from an unimplemented path. Formal gate: Phase 5's teacher-forced harness at the fork's KL/spread numbers. Nothing merges with a silently widened tolerance or a trap that returns zeros — `missing()` exits 86 on purpose.
+
+---
+
+## Phase 7 — the `qwen35`-dense family (Swift-1.5-Qwen3.8-27B; user request 2026-10-22)
+
+The model `ukisai/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ2_XS` (arch string `qwen35`, 64 layers,
+5120 embedding, GDN hybrid + full attention every 4th layer, **dense** FFN, no routed experts)
+is not an engine family today — `src/poly/engine.cpp:992` dispatches only qwen35moe /
+glm5-next / gemma4 / deepseek4 / lfm2moe. Interim: `tools/vulkan/serve-swift27.sh`
+(llama.cpp Vulkan; measured 87 pp / 15.5 tg tok/s on this card). Engine support needs:
+
+- **7.1** Check upstream PolyStrata for a `qwen35`-dense family (merge if it exists — the
+  fork's rule is upstream engine code unchanged).
+- **7.2** If not: a new `vulkan`-side... NO — the family is engine-host code (architecture
+  neutral, CUDA-shaped): `src/poly/qwen38dense.cpp` mirrors `qwen35.cpp`'s shape minus MoE
+  routing; upstream would take it as a feature PR; the Vulkan port only needs whatever
+  kernels it demands (overlap already cleared bitwise: rms_norm, gemv_f32, conv4_silu,
+  gdn_step, mmvq iq2_xxs; outstanding: rope/head_norm_rope, attend, store_f16, bf16 paths).
+- **7.3** Gate = the model runs on `strata-poly-vk` + the Phase-5 teacher-forced harness for
+  IQ2_XS-27B (reference: the pinned llama.cpp build, which already runs the file — 87/15.5
+  baseline is on record).
+
+Order of work stays demand-driven: finish Phase 2's list for Qwen3.6 (its remaining demands
+`attend`, `head_norm_rope`, `store_f16` ARE also this model's stack — Phase 2 pays Phase 7).
