@@ -49,12 +49,14 @@ namespace {
 #include "mmvq_slots_q5_k.spv.h"     // mmvq_slots_q5_k.comp
 #include "mmvq_slots_q6_k.spv.h"     // mmvq_slots_q6_k.comp
 #include "mmvq_iq3_xxs.spv.h"       // mmvq_iq3_xxs.comp (Task 2.9, type 18 IQ3_XXS)
+#include "mmvq_iq4_xs.spv.h"        // mmvq_iq4_xs.comp (Task 2.12, type 23 IQ4_XS)
 
 constexpr int IQ_BLOCK_ELEMS = 256;
 using vk::kIq2xxsGrid;   // the grid table header (namespace strata::vk)
 using vk::kIq3xxsGrid;   // the iq3xxs grid table header
 constexpr int IQ_BLOCK_BYTES = 66;   // block_iq2_xxs
 constexpr int IQ3_BLOCK_BYTES = 98;  // block_iq3_xxs (half d + uint8 qs[96])
+constexpr int IQ4XS_BLOCK_BYTES = 146;  // block_iq4_xs (half d + uint16 scales_h + uint8 scales_l[4] + uint8 qs[128])
 constexpr int Q5K_BLOCK_BYTES = 176; // Q5KBlock (native_mmvq.cu:129)
 constexpr int Q6K_BLOCK_BYTES = 210; // Q6KBlock (native_mmvq.cu:96: ql[128]+qh[64]+scales[16]+d)
 constexpr int Q8_BLOCK_BYTES = 36;   // block_q8_1
@@ -100,7 +102,7 @@ uint64_t grid32_buffer() {
 
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream) {
-    if (ggml_type != 16 && ggml_type != 18 && ggml_type != 13 && ggml_type != 14) {
+    if (ggml_type != 16 && ggml_type != 18 && ggml_type != 23 && ggml_type != 13 && ggml_type != 14) {
         // the CUDA wrapper would throw/exit here too — name the type instead (never compute with a
         // wrong decoder); shape is not validated for a type this port does not run.
         const std::string name = "strata::kernels::native_mmvq type " + std::to_string(ggml_type);
@@ -115,6 +117,8 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
         std::fprintf(stderr, "mmvq14 n_in %d n_out %d ncols %d\n", n_in, n_out, ncols);
     if (std::getenv("STRATA_VK_TRACE_MMVQ18") && ggml_type == 18)
         std::fprintf(stderr, "mmvq18 n_in %d n_out %d ncols %d\n", n_in, n_out, ncols);
+    if (std::getenv("STRATA_VK_TRACE_MMVQ23") && ggml_type == 23)
+        std::fprintf(stderr, "mmvq23 n_in %d n_out %d ncols %d\n", n_in, n_out, ncols);
     validate_shape(n_in, ncols, IQ_BLOCK_ELEMS);   // 256 elems for both iq2_xxs and q5_k
     if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
     validate_pointer(weights);
@@ -162,6 +166,17 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
         const uint64_t sizes[4] = {w_sz, x_sz, y_sz, sizeof(kIq2xxsGrid)};
         const uint32_t pc[3] = {(uint32_t)n_in, (uint32_t)n_out, (uint32_t)ncols};
         vk::kernel_launch_sized(k, (int)((n_out + 3) / 4), bufs, sizes, 4, pc);
+    } else if (ggml_type == 23) {  // IQ4_XS: Fmt<23> = {qk 256, ipb 8, step 4}, no grid table
+        static const vk::Kernel k = vk::kernel_load(
+            "native_mmvq_iq4_xs", mmvq_iq4_xs_spv, mmvq_iq4_xs_spv_len,
+            /*storage buffers*/ 3, /*push bytes*/ 12, /*workgroup*/ THREADS,
+            /*force 32-wide subgroups*/ true);
+        const uint64_t w_sz = uint64_t(n_out) * nb * IQ4XS_BLOCK_BYTES;
+        const uint64_t bufs[3]  = {strata_vk_compat::off(weights), strata_vk_compat::off(x_q8_1),
+                                   strata_vk_compat::off(y)};
+        const uint64_t sizes[3] = {w_sz, x_sz, y_sz};
+        const uint32_t pc[3] = {(uint32_t)n_in, (uint32_t)n_out, (uint32_t)ncols};
+        vk::kernel_launch_sized(k, (int)((n_out + 3) / 4), bufs, sizes, 3, pc);
     } else {  // ggml_type == 18 (IQ3_XXS): Fmt<18> = {qk 256, ipb 8, step 2} - same grid/launch as 16
         static const vk::Kernel k = vk::kernel_load(
             "native_mmvq_iq3_xxs", mmvq_iq3_xxs_spv, mmvq_iq3_xxs_spv_len,

@@ -1,0 +1,106 @@
+// vulkan/src/kernels/mmvq_iq4_xs.comp - native_mmvq for ggml_type 23 (IQ4_XS).
+//
+// Clone of mmvq_iq3_xxs.comp with the dot swapped to vec_dot_iq4_xs_q8_1 (iq_kernels.cu:296-313).
+// Fmt<23> (iq_kernels.cu:619) is {qk 256, ipb 8, step 4}: the k-lane loop is k = lane, lane+32,
+// ... < nb*8, with kbx = k/8 and iqs = 4*(k%8) - each dot call covers one 32-value sub-block
+// (iqs/4 = the sub-block, the q8_1 block of the super-block). Same launch geometry as 16/18
+// (mmvq_kernel<TY=23> default: block (32,4), grid ceil(n_out/4)); iq_kernels.cu:699-701 pins
+// mmvq_kernel bitwise-equal to mmvq_multi_kernel, so this matches the CUDA answer bitwise (the
+// parity test asserts it).
+//
+// Workgroup 128 = 4 subgroups of 32 (force_subgroup32; the tree's warp laws): subgroup lane =
+// tid%32, subrow = tid/32; row = group*4 + subrow, so `row >= n_out` returns whole subgroups and
+// every shuffle partner stays active.
+//
+// block_iq4_xs is 146 bytes (ggml-common.h:454-460: half d @0, uint16 scales_h @2, uint8
+// scales_l[QK_K/64=4] @4, uint8 qs[QK_K/2=128] @8) - NOT 4-aligned, so W is uint words and every
+// field is assembled byte-by-byte (wb/w32). No grid table: IQ4_XS decodes nibbles through the
+// 16-entry kvalues_iq4nl (ggml-common.h:1120), inlined below as 4 packed uint32 words.
+// block_q8_1 is 36 B = 9 words (word 0 = ds, low half d; words 1..8 = qs[0..31]).
+//
+// The CUDA SIMD ops are emulated exactly, 4 scalar byte lanes each:
+//   get_int_from_table_16  -> the byte_perm tree unpacks the 8 nibbles of aux_q4 into
+//                            v.x = (kv[n0],kv[n2],kv[n4],kv[n6]) and v.y = (kv[n1],kv[n3],kv[n5],kv[n7])
+//                            (verified against iq_kernels.cu:49-74 byte_perm selectors 0x6420/0x7531)
+//   ggml_cuda_dp4a         -> signed byte-dot of 4 pairs into acc (exact int32; gfx1013 dp4a route
+//                            is a later optimization, as in the iq2_xxs header note)
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer W    { uint  v[]; } bw;   // IQ4_XS blocks, 146 B each
+layout(std430, binding = 1) readonly buffer X    { uint  v[]; } bx;   // q8_1 columns, 36 B blocks
+layout(std430, binding = 2)           buffer Y    { float v[]; } by;   // ncols * n_out floats
+
+layout(push_constant) uniform PC { uint n_in; uint n_out; uint ncols; } pc;
+
+// kvalues_iq4nl (ggml-common.h:1120-1122) packed little-endian: -127,-104,-83,-65 |
+// -49,-35,-22,-10 | 1,13,25,38 | 53,69,89,113 (two's-complement bytes).
+uint kq(uint n) {
+    const uint t[4] = uint[4](0xBFAD9881u, 0xF6EADDCFu, 0x26190D01u, 0x71594535u);
+    return (t[n >> 2u] >> (8u * (n & 3u))) & 255u;
+}
+
+// one byte of W at byte offset B (blocks are 146 B = not 4-aligned)
+uint wb(uint B) { return (bw.v[B >> 2u] >> (8u * (B & 3u))) & 0xFFu; }
+// the uint32 at byte offset B of W, assembled byte-by-byte (never shift a word past its end)
+uint w32(uint B) { return wb(B) | (wb(B + 1u) << 8u) | (wb(B + 2u) << 16u) | (wb(B + 3u) << 24u); }
+
+int sbyte(uint a, uint i) {
+    const uint b = (a >> (8u * i)) & 255u;
+    return b >= 128u ? int(b) - 256 : int(b);
+}
+int dp4a(int a, int b, int c) {
+    for (uint i = 0u; i < 4u; ++i) c += sbyte(uint(a), i) * sbyte(uint(b), i);
+    return c;
+}
+
+// vec_dot_iq4_xs_q8_1(bq4 = row block kbx, bq8_1 = x column + kbx*8 + iqs/4, iqs) - same ops, same order.
+float iq4_xs_dot(uint b0, uint xw, uint kbx, uint iqs) {
+    const uint blk = b0 + kbx * 146u;                    // the block's first byte
+    const uint qs  = blk + 8u;                           // qs[0..31] words
+    const uint xb  = xw + (kbx * 8u + iqs / 4u) * 9u;    // q8_1 block word 0 (ds)
+    int sumi = 0;
+    for (uint j = 0u; j < 4u; ++j) {
+        const uint aux_q4 = w32(qs + 4u * (iqs + j));    // get_int_b4(bq4->qs, iqs + j)
+        // get_int_from_table_16: v.x = even nibbles, v.y = odd nibbles (packed as bytes)
+        uint vx = kq(aux_q4 & 15u) | (kq((aux_q4 >> 8u) & 15u) << 8u)
+                | (kq((aux_q4 >> 16u) & 15u) << 16u) | (kq((aux_q4 >> 24u) & 15u) << 24u);
+        uint vy = kq((aux_q4 >> 4u) & 15u) | (kq((aux_q4 >> 12u) & 15u) << 8u)
+                | (kq((aux_q4 >> 20u) & 15u) << 16u) | (kq((aux_q4 >> 28u) & 15u) << 24u);
+        const uint u0 = bx.v[xb + 1u + j];               // get_int_b4(bq8_1[iqs/4].qs, j)
+        const uint u1 = bx.v[xb + 1u + j + 4u];          // get_int_b4(..., j + 4)
+        sumi = dp4a(int(vx), int(u0), sumi);
+        sumi = dp4a(int(vy), int(u1), sumi);
+    }
+    // two-level 6-bit scale: scales_l[iqs/8] low 4 bits + scales_h high 2 bits
+    const uint sl = wb(blk + 4u + iqs / 8u);
+    const uint sh = wb(blk + 2u) | (wb(blk + 3u) << 8u);
+    const int ls = int(((sl >> (iqs & 0x04u)) & 0x0Fu) | (((sh >> (iqs / 2u)) & 0x03u) << 4));
+    sumi *= ls - 32;
+    // __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds), then * sumi (same association as CUDA)
+    const float dw = unpackHalf2x16(wb(blk) | (wb(blk + 1u) << 8u)).x;
+    const float d8 = unpackHalf2x16(bx.v[xb]).x;
+    return dw * d8 * float(sumi);
+}
+
+void main() {
+    const uint tid  = gl_GlobalInvocationID.x;
+    const uint lane = tid & 31u;
+    // CUDA row = blockIdx.x*4 + threadIdx.y: the subrow is the LOCAL 128-thread index / 32.
+    const uint row  = gl_WorkGroupID.x * 4u + ((tid & 127u) >> 5u);
+    if (row >= pc.n_out) return;                   // whole 32-lane subgroups leave together
+    const uint nb = pc.n_in / 256u;
+    const uint b0 = row * nb * 146u;
+    for (uint c = 0u; c < pc.ncols; ++c) {
+        const uint xw = c * nb * 72u;              // column c: nb*8 blocks x 9 words
+        float s = 0.0;
+        for (uint k = lane; k < nb * 8u; k += 32u)          // Fmt<23>: ipb 8, step 4
+            s += iq4_xs_dot(b0, xw, k / 8u, 4u * (k % 8u));
+        for (uint o = 16u; o > 0u; o >>= 1u)                // warp_sum's xor tree, 16,8,4,2,1
+            s += subgroupShuffleXor(s, o);
+        if (lane == 0u) by.v[c * pc.n_out + row] = s;
+    }
+}

@@ -47,10 +47,10 @@ header helpers, one row per header) | `n/a` (decision `n/a`).
 | q8_1 (add_rms_norm_q8_1, swiglu_quantize_q8_1) | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | todo |
 | q4_0 / q5_0 / q8_0 (mmvq + f32 pair) | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | todo |
 | q4_k / q5_k / q6_k / q2_0 / q2_k / q3_k (mmvq + f32 pair) | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | todo |
-| iq4_xs / iq4_nl (mmvq + f32 pair) | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | todo |
+| iq4_xs / iq4_nl (mmvq + f32 pair) | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | iq4_xs mmvq **ported+parity-green** (Task 2.12, mmvq_iq4_xs.comp, bitwise); iq4_nl mmvq + the f32 pair todo |
 | native_mmvq_slots (types 16/13/14; others: false with nothing launched, exactly CUDA slots_kind==0) | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu:3178 + :1710 slots kernel, iq_kernels.cu:3491 mmvq_slots_kernel<16> | native_mmvq_vk_parity.cpp (slots: bitwise y_slots == y_single AND host refs; unported type returns false, y poison untouched) | 24-25 storage bindings (w/x/y per slot + iq2xxs grid), flattened (gx,count) grid, macro per-slot dot | translate | **ported+parity-green** (mmvq_slots_iq2_xxs/q5_k/q6_k.comp + native_mmvq_vk.cpp; pair + ids still todo) |
 | native_mmvq_pair / native_mmvq_ids | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | todo |
-| native_mmvq (iq2_xxs + q5_k + q6_k; other types trap-by-name `native_mmvq type <n>`) | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu:3110 + iq_kernels.cu launch_mmvq<16> + native_q5_k_mmvq + native_q6_k_mmvq | native_mmvq_vk_parity.cpp (bitwise) | `__shfl` (warp_sum), `__vcmpne4/__vsubss4/dp4a` (scalar-emulated), `iq2xxs_grid` (arena-uploaded table), fp contraction (the CUDA leg builds with --use_fast_math; the vk dot mirrors the fused order) | translate | **ported+parity-green** (vulkan/src/kernels/mmvq_iq2_xxs.comp, mmvq_q5_k.comp, mmvq_q6_k.comp, native_mmvq_vk.cpp; iq-family row: format 16 iq2_xxs, format 13 q5_k, format 14 q6_k. Other types trap by number) |
+| native_mmvq (iq2_xxs + q5_k + q6_k + iq3_xxs + iq4_xs; other types trap-by-name `native_mmvq type <n>`) | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu:3110 + iq_kernels.cu launch_mmvq<16> + native_q5_k_mmvq + native_q6_k_mmvq | native_mmvq_vk_parity.cpp (bitwise) | `__shfl` (warp_sum), `__vcmpne4/__vsubss4/dp4a` (scalar-emulated), `iq2xxs_grid` (arena-uploaded table), fp contraction (the CUDA leg builds with --use_fast_math; the vk dot mirrors the fused order) | translate | **ported+parity-green** (vulkan/src/kernels/mmvq_iq2_xxs.comp, mmvq_q5_k.comp, mmvq_q6_k.comp, mmvq_iq3_xxs.comp, mmvq_iq4_xs.comp, native_mmvq_vk.cpp; iq-family row: format 16 iq2_xxs, format 13 q5_k, format 14 q6_k, format 18 iq3_xxs, format 23 iq4_xs. Other types trap by number) |
 | q8_1 interleave: native_quantize_q8_1_il / native_q8_1_interleave / native_mmvq_il / native_q8_1_il_cp | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | todo |
 | native_moe_combine / _multi / _hits / _multi_hits / _multi_hits_gated | native_moe.hpp | src/kernels/cuda/native_moe.cu | native_expert_parity.cpp, native_multi_parity.cpp | `__shared__`, `__ldg` | translate | todo |
 | moe_hit_grouped_s2 / _dev / _multi / _cpu_order, moe_hit_select / _multi, moe_hit_add, moe_grouped_s2, moe_group_resident (setters host-side) | s2_expert_grouped.hpp | src/kernels/cuda/s2_expert_grouped.cu | s2_expert_grouped_parity.cpp, native_grouped_parity.cpp, decode_cluster_parity.cpp | `__shfl`, `__shared__`, `__ldg` | translate | todo |
@@ -215,7 +215,8 @@ Re-run with `STRATA_VK_STUBS=log` enumerates the rest of the qwen35moe decode pa
 | 14 | `strata::poly::head_norm_rope` | poly: head_norm_rope kernels — **PORTED (Task 2.10)** |
 | 15 | `strata::poly::store_f16` | poly: store_f16_kernel/_at — **store_f16 PORTED (Task 2.10)**; _at todo |
 | 16 | `strata::poly::attend` | poly: attn_score/softmax/value/… kernels — **PORTED (Task 2.11)** |
-| 17 | `strata::kernels::native_mmvq` type 23 (IQ4_XS) | native_mmvq family — the run's CURRENT halt |
+| 17 | `strata::kernels::native_mmvq` type 23 (IQ4_XS) | native_mmvq family — **PORTED (Task 2.12)** |
+| 18 | `strata::kernels::native_mmvq` type 8 (Q8_0) | native_mmvq family — the run's CURRENT halt |
 
 (The log arm returns untouched outputs, so entries after #1 are the path's *shape*, not a
 guaranteed per-token sequence; the first trap, `copy2`, is exact — the default arm stops there.)
@@ -414,3 +415,17 @@ chained full-span rejection + piece-local bind). ctest 13/13. Model gate: load 3
 10496/10496 experts in VRAM, decode ran through all ported poly demands incl. attend, stopped at
 `strata-vk: strata::kernels::native_mmvq type 23 has no Vulkan implementation yet` (demand #17 —
 IQ4_XS; port it next, the iq3_xxs template is the proven shape to extend).
+
+**Halt point after Task 2.12 (2026-10-23):** `strata::kernels::native_mmvq` **type 8 (Q8_0)** —
+demand #17 cleared: IQ4_XS (type 23) is PORTED bitwise. mmvq_iq4_xs.comp clones the iq3_xxs
+template with Fmt<23> = {qk 256, ipb 8, step 4} (iqs = 4*(k%8), one 32-value sub-block per dot
+call): 146-byte unaligned blocks assembled byte-wise (wb/w32), the two-level 6-bit scale decode
+(scales_l low 4 + scales_h high 2), and the nibble->kvalues_iq4nl path — the CUDA
+get_int_from_table_16 byte_perm tree emulated and VERIFIED against a host prmt model (even
+nibbles -> v.x, odd -> v.y). No grid table (the table rides inlined in the .comp). Parity: 5
+iq4_xs shapes (2048x64 c1/c2, 2048x768 c1, 768x64 c3, 256x3 c1) BITWISE — full suite
+11383/11383 outputs, 0 differ; ctest 13/13. Model gate: load 36.5 s, 10496/10496 experts in VRAM,
+the decode walked past all IQ-type mmvq legs and stopped at
+`strata-vk: strata::kernels::native_mmvq type 8 has no Vulkan implementation yet` (demand #18 —
+Q8_0 mmvq, the down-expert format of this UD-IQ2_XXS quant; vec_dot_q8_0_q8_1 in
+native_mmvq.cu is the shape to port — integer dot, 32-elem blocks, no SIMD emu needed).
