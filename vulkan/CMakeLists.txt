@@ -381,7 +381,20 @@ add_custom_command(OUTPUT ${_iq4xs_inc}
   COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_iq4xs_spv} ${_iq4xs_inc} mmvq_iq4_xs
   DEPENDS ${_iq4xs_spv})
 add_custom_target(mmvq_iq4_xs.spv_h DEPENDS ${_iq4xs_inc})
-add_dependencies(strata_vk_kernel_native_mmvq mmvq_q5_k.spv_h mmvq_q6_k.spv_h mmvq_iq3_xxs.spv_h mmvq_iq4_xs.spv_h mmvq_slots_iq2_xxs.spv_h mmvq_slots_q5_k.spv_h mmvq_slots_q6_k.spv_h)
+# Task 2.13: the Q8_0 (type 8) variant, same pattern (mmvq_q8_0.comp -> its own embedded .spv.h;
+# 34-byte blocks, no grid table - pure dp4a over int8 qs with fp16 scales).
+set(_q80_spv ${CMAKE_CURRENT_BINARY_DIR}/spv/mmvq_q8_0.spv)
+add_custom_command(OUTPUT ${_q80_spv}
+  COMMAND ${CMAKE_COMMAND} -E env VK_GLSLC_MODE=${GLSLC_MODE} VK_GLSLC_TOOL=${GLSLC_TOOL}
+          ${VK_GLSLC} --target-env=vulkan1.3 -O ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/mmvq_q8_0.comp -o ${_q80_spv}
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/mmvq_q8_0.comp ${VK_GLSLC}
+  COMMENT "vk-glslc(${GLSLC_MODE}) mmvq_q8_0.comp")
+set(_q80_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/mmvq_q8_0.spv.h)
+add_custom_command(OUTPUT ${_q80_inc}
+  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_q80_spv} ${_q80_inc} mmvq_q8_0
+  DEPENDS ${_q80_spv})
+add_custom_target(mmvq_q8_0.spv_h DEPENDS ${_q80_inc})
+add_dependencies(strata_vk_kernel_native_mmvq mmvq_q5_k.spv_h mmvq_q6_k.spv_h mmvq_iq3_xxs.spv_h mmvq_iq4_xs.spv_h mmvq_q8_0.spv_h mmvq_slots_iq2_xxs.spv_h mmvq_slots_q5_k.spv_h mmvq_slots_q6_k.spv_h)
 strata_vk_kernel(copy2 SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels LAUNCHER src/poly/kernels/copy2_vk.cpp)
 
 # Task 2.5: poly gdn_step — five CUDA kernels, one launcher lib. gdn_norm/gdn_out compile per dim

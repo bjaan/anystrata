@@ -299,6 +299,49 @@ float q6_k_ref(const uint8_t* wr, const uint8_t* xcol, int nb, int row, int rows
     return a[row_in_group];   // lane i's post-tree value answers row0+i
 }
 
+// ---- Q8_0 (type 8, Task 2.13): transcription of small_q8_dot(Q80Block) (native_mmvq.cu:888-900).
+// Q80Block bytes: half d @0, int8 qs[32] @2 (34 B). v[i] = load_int_b2(qs, iqs+i) = the two u16
+// pair (exact as a u32 read); u[i] = (int*)(x->qs)[iqs+i]; sumi = the two-dp4a chain (exact int);
+// d0*d1 is exact in fp32 (11+11-bit mantissas). Returns dm and sumi: the kbx accumulation
+// `tmp += dm * float(sumi)` answers UNFUSED on this device (contraction probe, 2026-10-23: the
+// fma(dm, sumi, acc) host arm differed on 36-3649/rows=1 outputs; the unfused arm below matches
+// BITWISE on all 7879 q8_0 outputs — glslc's OpFMul+OpFAdd survives NIR without contracting here).
+void q8_0_dot_df(const uint8_t* w, const uint8_t* x, int iqs, float& dm, int& sumi) {  // x = one q8_1 block
+    sumi = 0;
+    for (int i = 0; i < 2; ++i)
+        sumi = dp4a(uint32_t(rd_i32(w + 2 + 4 * (iqs + i))),
+                    uint32_t(rd_i32(x + 4 + 4 * (iqs + i))), sumi);
+    dm = f16_to_f32(rd_u16(w)) * f16_to_f32(rd_u16(x));
+}
+
+// emulate native_small_mmvq_kernel<Q80Block, 8, SmallK> for one (row, column): tid = 0..127,
+// kbx = tid/4 + 32t (Qi=8 -> T=4, BLOCKS_PER_ITER=32), kqs = 2*(tid%4); x block = kbx (KBY=1).
+// rows==1: all four subrows sum one row; rows==4: subrow i does row0+i. warp 0 sums
+// subrow-ascending then the xor tree; lane i writes row0+i.
+float q8_0_ref(const uint8_t* wr, const uint8_t* xcol, int nb, int row, int rows, int row_in_group) {
+    float part[4][32];
+    for (int s = 0; s < 4; ++s) for (int l = 0; l < 32; ++l) part[s][l] = 0.f;
+    for (int tid = 0; tid < 128; ++tid) {
+        const int s = tid / 32, lane = tid % 32, kqs = 2 * (tid % 4);
+        const int r = (rows == 1) ? row : row + row_in_group;
+        float acc = 0.f;
+        for (int kbx = tid / 4; kbx < nb; kbx += 32) {
+            float dm; int sumi;
+            q8_0_dot_df(wr + (size_t(r) * nb + kbx) * 34, xcol + size_t(kbx) * 36, kqs, dm, sumi);
+            // probe: UNFUSED accumulation (glslc kept OpFMul+OpFAdd for this dot shape)
+            const float term = dm * float(sumi);
+            acc = acc + term;
+        }
+        part[s][lane] = acc;
+    }
+    float a[32];
+    for (int l = 0; l < 32; ++l)
+        a[l] = ((part[0][l] + part[1][l]) + part[2][l]) + part[3][l];
+    float n[32];
+    for (int o = 16; o > 0; o >>= 1) { for (int l = 0; l < 32; ++l) n[l] = a[l] + a[l ^ o]; std::memcpy(a, n, sizeof a); }
+    return a[row_in_group];   // lane i's post-tree value answers row0+i
+}
+
 }  // namespace
 
 using namespace strata;
@@ -665,6 +708,82 @@ int main(int argc, char** argv) {
     // :1710-1755 / iq mmvq_slots_kernel :3491-3501): matrix i is w[i] times x[i] into y[i], one
     // column each, and per-slot work is the SAME partition as the single-launch kernel — so
     // y_slots == y_single BITWISE is the strongest check; we additionally assert the host refs.
+    // ---- type 8 (Q8_0, Task 2.13): n_in 2048 -> nb 64 >= 32 -> rows=1 (SmallK=false);
+    // 768/256 -> nb 24/8 < 32 -> rows=4 (SmallK=true). x side is always q8_1 (36 B), W is Q8_0 (34 B).
+    const struct { int n_in, n_out, ncols; } q8_shapes[] = {
+        {2048, 64, 1}, {2048, 768, 2}, {2048, 2048, 3}, {768, 64, 2}, {256, 7, 1}};
+    for (const auto& s : q8_shapes) {
+        const int nb = s.n_in / 32;
+        const int rows = (nb < 32) ? 4 : 1;           // mirrors the launcher's SmallK pick
+        std::mt19937 rng(7700 + s.n_in * 5 + s.ncols);
+        std::uniform_real_distribution<float> dsc(0.0009765625f, 0.03125f);   // d in [2^-10, 2^-5)
+        std::vector<uint8_t> W(size_t(s.n_out) * nb * 34);
+        for (auto& blk : W) blk = uint8_t(rng() & 0xFF);                      // random int8 qs
+        for (int r = 0; r < s.n_out; ++r)
+            for (int b = 0; b < nb; ++b) {            // sane fp16 d (bytes 0-1)
+                const uint16_t dh = f16_rn((rng() & 1) ? -dsc(rng) : dsc(rng));
+                std::memcpy(W.data() + (size_t(r) * nb + b) * 34, &dh, 2);
+            }
+        std::vector<float> x(size_t(s.n_in) * s.ncols);
+        for (auto& v : x) v = float(int(rng() % 2001) - 1000) / 250.0f;
+
+        const uint64_t w_sz = W.size(), w_pad = (w_sz + 3) & ~3ull;
+        const uint64_t x_sz = size_t(s.n_in) / 32 * s.ncols * 36;
+        const uint64_t y_sz = size_t(s.ncols) * s.n_out * 4;
+        const uint64_t ax = a.alloc(x.size() * 4), aq = a.alloc(x_sz);
+        const uint64_t aw = a.alloc(w_pad + 4), ay = a.alloc(y_sz);
+        vk::copy_h2d((void*)ax, x.data(), x.size() * 4, nullptr);
+        vk::copy_h2d((void*)aw, W.data(), w_sz, nullptr);
+        vk::fill_d((void*)ay, 0xFE, y_sz, nullptr);
+        kernels::native_quantize_q8_1((const float*)strata_vk_compat::wrap(ax), strata_vk_compat::wrap(aq),
+                                      s.n_in, s.ncols, strata_vk_compat::wrap(1000));
+        std::vector<uint8_t> Q(x_sz);
+        vk::copy_d2h(Q.data(), (void*)aq, x_sz, nullptr);
+
+        kernels::native_mmvq(8, strata_vk_compat::wrap(aw), strata_vk_compat::wrap(aq),
+                             (float*)strata_vk_compat::wrap(ay), s.n_in, s.n_out, s.ncols,
+                             strata_vk_compat::wrap(1000));
+        std::vector<float> y(size_t(s.ncols) * s.n_out);
+        vk::copy_d2h(y.data(), (void*)ay, y_sz, nullptr);
+
+        int shape_fails = 0;
+        for (int c = 0; c < s.ncols; ++c) {
+            const uint8_t* xcol = Q.data() + size_t(c) * nb * 36;
+            if (rows == 1) {
+                for (int r = 0; r < s.n_out; ++r) {
+                    const float ref = q8_0_ref(W.data(), xcol, nb, r, 1, 0);
+                    const float got = y[size_t(c) * s.n_out + r];
+                    ++compared;
+                    if (got != ref) {
+                        if (shape_fails < 8) {
+                            uint32_t gb, rb; std::memcpy(&gb, &got, 4); std::memcpy(&rb, &ref, 4);
+                            std::printf("  MISMATCH q80 n_in %d ncols %d r %d: got %.9g ref %.9g (bits %08x/%08x)\n",
+                                        s.n_in, c, r, got, ref, gb, rb);
+                        }
+                        ++shape_fails; ++fails;
+                    }
+                }
+            } else {
+                for (int g = 0; g < (s.n_out + 3) / 4; ++g)
+                    for (int i = 0; i < 4 && g * 4 + i < s.n_out; ++i) {
+                        const int r = g * 4 + i;
+                        const float ref = q8_0_ref(W.data(), xcol, nb, g * 4, 4, i);
+                        const float got = y[size_t(c) * s.n_out + r];
+                        ++compared;
+                        if (got != ref) {
+                            if (shape_fails < 8) {
+                                uint32_t gb, rb; std::memcpy(&gb, &got, 4); std::memcpy(&rb, &ref, 4);
+                                std::printf("  MISMATCH q80 n_in %d ncols %d r %d: got %.9g ref %.9g (bits %08x/%08x)\n",
+                                            s.n_in, c, r, got, ref, gb, rb);
+                            }
+                            ++shape_fails; ++fails;
+                        }
+                    }
+            }
+        }
+        std::printf("native_mmvq q8_0 vk vs reference: n_in %d n_out %d ncols %d rows %d: %d outputs, %d differ bitwise\n",
+                    s.n_in, s.n_out, s.ncols, rows, s.ncols * s.n_out, shape_fails);
+    }
     // Mixed slots across types: iq2_xxs expert dims (2048 x 768), q5_k (2048 x 2048 style), q6_k.
     const int slots_cases = 0; (void)slots_cases;
     {
