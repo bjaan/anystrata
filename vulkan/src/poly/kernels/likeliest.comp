@@ -1,0 +1,84 @@
+// vulkan/src/poly/kernels/likeliest.comp - the poly sampler argmax, one workgroup of 1024.
+//
+// Line-by-line translation of src/poly/kernels.cu's likeliest_kernel (:1827, wrapper :2663
+// <<<1, 1024>>> - ALWAYS one block, 1024 threads, whatever n is), with block_max (:58-67) and
+// block_sum (:42-50) inlined and WARP = 32:
+//   m = -INF; for (i = tid; i < n; i += 1024) m = fmaxf(m, x[i]);
+//   block_max: fmaxf xor tree offsets 16,8,4,2,1 -> subgroupShuffleXor 16..1 in the SAME order
+//     (offsets <= 16 never cross a 32-lane aligned block, so the value is per-warp whether the
+//     subgroup runs 32 or 64 wide on gfx1013 - the rms_norm.comp argument);
+//     part[wid] then m = fmaxf over part[0..31] IN ORDER;
+//   second strided pass: at = min over indices with x[i] == m EXACTLY (integer min: order-free);
+//     sum += expf(x[i] - m) only where x[i] > m - 20.0f;
+//   warp-min at via xor 16..1 (order-free), first[wid] = at by lane 0;
+//   block_sum for `sum` reusing part: xor 16..1 (per-warp order fixed), s = 0; += part[k] k=0..31;
+//   thread 0: at = min(at, first[k]) k=1..31; token = at < n ? at : 0; prob = 1.0f / sum.
+// The TOKEN is an integer result: bitwise (index equality) expected.  `prob` rides the tree's exp
+// vs expf rel 1e-5 bound (elementwise.comp's swiglu law - not documented twins).
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+layout(local_size_x = 1024) in;
+
+layout(std430, binding = 0) readonly buffer X { float v[]; } bx;
+layout(std430, binding = 1) buffer OUT { uint v[]; } bo;   // [token, prob bits]
+
+layout(push_constant) uniform PC { uint n; uint pad0; uint pad1; uint pad2; } pc;
+
+shared float part[32];
+shared uint first[32];
+
+float fmaxf_vk(float a, float b) {
+    if (isnan(a)) return b;
+    if (isnan(b)) return a;
+    return max(a, b);
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint n = pc.n;
+    // Value-identical to CUDA's `for (i = tid; i < n; i += 1024)` strided walk, but with the
+    // bound re-checked INSIDE the body: glslc -O turns the bare header loop into a hoisted
+    // do-while whose first read (x[tid] for tid >= n) folds garbage into m/sum on RADV.
+    const uint iters = (n + 1023u) / 1024u;
+    float m = uintBitsToFloat(0xFF800000u);   // -INFINITY, the CUDA initializer
+    // fmaxf's NaN-IGNORING semantics: GLSL max() propagates NaN (that's why the n=5 shape with a
+    // garbage-lane read gave token 2 not 0); fmaxf_vk returns the non-NaN operand.
+    #define FMAXF(a, b) fmaxf_vk((a), (b))
+    for (uint k = 0u; k < iters; ++k) {
+        const uint i = tid + k * 1024u;
+        if (i >= n) break;
+        m = FMAXF(m, bx.v[i]);
+    }
+    // block_max: warp xor tree, then the serial fmaxf fold over part[0..31] in order.
+    for (uint o = 16u; o > 0u; o >>= 1u) m = FMAXF(m, subgroupShuffleXor(m, o));
+    if ((tid & 31u) == 0u) part[tid >> 5u] = m;
+    barrier();
+    for (int k = 0; k < 32; ++k) m = FMAXF(m, part[k]);
+    barrier();
+
+    uint at = n;
+    float sum = 0.0;
+    for (uint k = 0u; k < iters; ++k) {
+        const uint i = tid + k * 1024u;
+        if (i >= n) break;
+        if (bx.v[i] == m) at = min(at, i);
+        if (bx.v[i] > m - 20.0f) sum += exp(bx.v[i] - m);
+    }
+    for (uint o = 16u; o > 0u; o >>= 1u) at = min(at, subgroupShuffleXor(at, o));
+    if ((tid & 31u) == 0u) first[tid >> 5u] = at;
+    // block_sum for `sum` (part is free: block_max's trailing barrier above).
+    float s = sum;
+    for (uint o = 16u; o > 0u; o >>= 1u) s += subgroupShuffleXor(s, o);
+    if ((tid & 31u) == 0u) part[tid >> 5u] = s;
+    barrier();
+    s = 0.0;
+    for (int k = 0; k < 32; ++k) s += part[k];
+    barrier();
+
+    if (tid != 0u) return;
+    for (uint k = 1u; k < 32u; ++k) at = min(at, first[k]);
+    bo.v[0] = at < n ? at : 0u;
+    bo.v[1] = floatBitsToUint(1.0 / s);
+}

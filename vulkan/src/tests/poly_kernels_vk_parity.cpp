@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -793,6 +794,68 @@ int main() {
         bool untouched = true;
         for (size_t i = 0; i < (size_t)pos * n && untouched; ++i) if (got[i] != 0xA5A5) untouched = false;
         check(untouched, "store_f16 leaves the rows before pos alone");
+    }
+
+    // ---- Task 2.19: likeliest — the CUDA body (kernels.cu:1827) transcribed exactly: the
+    //      strided max/sum partitions of a 1024-thread block, the xor trees 16..1, the in-order
+    //      part[0..31] folds. TOKEN is an integer: equality expected (first index of the max,
+    //      ties included). prob = 1/sum rides the exp-vs-expf rel 1e-5 bound (elementwise law).
+    {
+        auto ref_likeliest = [](const std::vector<float>& x) {
+            const int n = (int)x.size();
+            const float NINF = -std::numeric_limits<float>::infinity();
+            // thread t's strided partial max (CUDA :1831-1832)
+            std::vector<float> ms(1024, NINF);
+            for (int t = 0; t < 1024; ++t)
+                for (int i = t; i < n; i += 1024) ms[t] = std::fmax(ms[t], x[i]);
+            // block_max (:58): per-warp xor butterfly -- EVERY lane updates each round against
+            // its (lane^o) partner (reads see the OLD round); then lane 0 of each warp writes
+            // part[wid]; thread 0 folds m = part[0]; fmaxf over part[1..31] in order.
+            for (int o = 16; o > 0; o >>= 1) {
+                std::vector<float> old = ms;
+                for (int t = 0; t < 1024; ++t) ms[t] = std::fmax(ms[t], old[(t & ~31) | ((t & 31) ^ o)]);
+            }
+            float m = ms[0];
+            for (int k = 1; k < 32; ++k) m = std::fmax(m, ms[k * 32]);
+            // second strided pass (:1836-1839): at = min over x[i] == m (integer, order-free);
+            // per-thread partial sums of expf over x[i] > m - 20.
+            int at = n;
+            std::vector<float> sums(1024, 0.0f);
+            for (int t = 0; t < 1024; ++t)
+                for (int i = t; i < n; i += 1024) {
+                    if (x[i] == m) at = std::min(at, i);
+                    if (x[i] > m - 20.0f) sums[t] += std::expf(x[i] - m);
+                }
+            // warp butterfly again (float +=, all lanes per round), part = lane 0 of each warp,
+            // then block_sum's fold s = 0; s += part[k] for k = 0..31 IN ORDER (:46-47).
+            for (int o = 16; o > 0; o >>= 1) {
+                std::vector<float> old = sums;
+                for (int t = 0; t < 1024; ++t) sums[t] = sums[t] + old[(t & ~31) | ((t & 31) ^ o)];
+            }
+            float s = 0.0f;
+            for (int k = 0; k < 32; ++k) s += sums[k * 32];
+            poly::Likeliest r; r.token = at < n ? at : 0; r.prob = 1.0f / s;
+            return r;
+        };
+        std::mt19937 rng(97);
+        std::uniform_real_distribution<float> u(-30.f, 30.f);
+        const int shapes[] = {5, 1024, 151936 / 4, 151936};   // tiny, exact block, sub-block, full-vocab-ish
+        for (const int n : shapes) {
+            std::vector<float> x(n);
+            for (auto& v : x) v = u(rng);
+            if (n > 10) { const float mx = u(rng); x[n / 3] = x[n / 7] = x[n - 1] = mx;
+                          for (auto& v : x) v = std::fmin(v, mx); }  // tie at the max: the FIRST index wins
+            const uint64_t ax = a.alloc((size_t)n * 4), ao = a.alloc(8);
+            vk::copy_h2d((void*)ax, x.data(), (size_t)n * 4, nullptr);
+            poly::Likeliest got{ -1, 0.f };
+            poly::likeliest((const float*)strata_vk_compat::wrap(ax), n, &got, nullptr);
+            const poly::Likeliest ref = ref_likeliest(x);
+            const bool tok = got.token == ref.token;
+            const double rel = std::fabs((double)got.prob - ref.prob) / std::fmax(1e-9f, std::fabs((double)ref.prob));
+            if (!tok) std::printf("  likeliest n=%d token got %d want %d\n", n, got.token, ref.token);
+            std::printf("  likeliest n=%d: token %d (ref %d), prob rel %.3e\n", n, got.token, ref.token, rel);
+            check(tok && rel < 1e-5, "likeliest token-equal + prob rel 1e-5");
+        }
     }
 
     std::printf("poly_kernels_vk_parity %s\n", fails == 0 ? "PASS" : "FAIL");
