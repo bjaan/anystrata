@@ -68,7 +68,12 @@ uint64_t piece_room(uint64_t off) {
     return 0;
 }
 
-void arena_add(uint64_t bytes) {
+uint64_t arena_add(uint64_t bytes) {   // returns the base the region was PLACED at (cursor
+                                       // bump applied under g_m BEFORE placement - Task 4.1:
+                                       // alloc() used to capture g_cursor before the bump, so a
+                                       // concurrent alloc that ended a piece returned an offset
+                                       // in the dead tail while the copy landed at the bumped
+                                       // base -> straddled spans / garbage tensors under batching)
     VkDevice dev = (VkDevice)vk_handle();
     const DeviceInfo& d = device_info();
     uint64_t max_alloc = d.max_allocation_size ? d.max_allocation_size : (64ull << 20);
@@ -83,8 +88,15 @@ void arena_add(uint64_t bytes) {
     if (bytes && bytes <= max_alloc && !g_pieces.empty()) {
         const Piece& last = g_pieces.back();
         const uint64_t room = last.base + last.size - g_cursor;
-        if (room < bytes) g_cursor = last.base + last.size;   // end the piece under the cursor
+        if (room < bytes) {
+            if (getenv("STRATA_VK_DEBUG_ARENA"))
+                std::fprintf(stderr, "arena_add(%llu B): bump %llu -> %llu\n",
+                             (unsigned long long)bytes, (unsigned long long)g_cursor,
+                             (unsigned long long)(last.base + last.size));
+            g_cursor = last.base + last.size;   // end the piece under the cursor
+        }
     }
+    const uint64_t placed_at = g_cursor;
     if (g_cursor + bytes + slack > d.free_bytes)
         throw std::runtime_error("vk_runtime: out of VRAM growing the arena by " + std::to_string(bytes >> 20) + " MiB");
     while (bytes) {
@@ -105,6 +117,11 @@ void arena_add(uint64_t bytes) {
         g_cursor += sz;
         bytes -= sz;
     }
+    if (getenv("STRATA_VK_DEBUG_ARENA"))
+        std::fprintf(stderr, "arena_add: placed_at %llu last_piece_end %llu slack_ok cursor_now %llu\n",
+                     (unsigned long long)placed_at, (unsigned long long)g_pieces.back().base,
+                     (unsigned long long)g_cursor);
+    return placed_at;
 }
 
 VkBuffer g_stage = VK_NULL_HANDLE;
@@ -132,13 +149,18 @@ void stage_ensure(uint64_t bytes) {
 }
 
 VkCommandPool g_pool = VK_NULL_HANDLE;
+std::mutex g_pm;   // guards g_pend/g_inflight AND pool/queue ops; ALWAYS the leaf lock
+void ensure_cmd_pool() {
+    if (g_pool) return;
+    VkDevice dev = (VkDevice)vk_handle();
+    VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    cpi.queueFamilyIndex = vk_queue_family();
+    RT(vkCreateCommandPool(dev, &cpi, nullptr, &g_pool));
+}
 VkCommandBuffer begin() {
     VkDevice dev = (VkDevice)vk_handle();
-    if (!g_pool) {
-        VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-        cpi.queueFamilyIndex = vk_queue_family();
-        RT(vkCreateCommandPool(dev, &cpi, nullptr, &g_pool));
-    }
+    std::lock_guard<std::mutex> plk(g_pm);   // g_pool allocate is not thread-safe: the eager
+    ensure_cmd_pool();                       // copy path and the batched path share this pool
     VkCommandBuffer cb;
     VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     ai.commandPool = g_pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
@@ -148,7 +170,91 @@ VkCommandBuffer begin() {
     RT(vkBeginCommandBuffer(cb, &bi));
     return cb;
 }
+
+// ---------- Phase 4.1: deferred-submit batching ----------
+// kernel_launch_sized records into a PENDING primary command buffer (ONE_TIME_SUBMIT) with a
+// per-pending descriptor POOL (cap kMaxSetsPerCB sets, pool recreated with the next pending
+// buffer at flush — never a create/destroy per launch, which was a real slice of the old
+// overhead). flush() = end + submit with a VkFence, NO wait; flush_wait() additionally waits
+// every in-flight fence, then frees the command buffers and destroys the pools (a pool may
+// only be reset/destroyed once its bound sets stop executing). Flush(+wait) points:
+// stream_sync/device_sync/event_record, and the top of every copy/fill path.
+// The staging hazard (why copies stay EAGER, not recorded): copy_chunk captures the SOURCE
+// ADDRESS of g_stage into the command buffer, not its bytes — a later host memcpy into the
+// same stage would corrupt a not-yet-submitted copy. So each copy first flush_waits all
+// pending GPU work, then runs its own submit+vkQueueWaitIdle as before. The engine only
+// copies at token boundaries and staging windows, so eager copies cost little.
+// STRATA_VK_BATCH=0 restores the per-launch begin/submit/wait path (A/B toggle).
+uint32_t max_sets_per_cb() {
+    static uint32_t v = getenv("STRATA_VK_MAX_SETS") ? (uint32_t)atoi(getenv("STRATA_VK_MAX_SETS")) : 512u;
+    return v;   // descriptor sets (== dispatches) per pending CB
+}
+constexpr uint32_t kMaxBufsPerSet = 64;      // pool sizing headroom; kernels use far fewer
+constexpr uint32_t kMaxInFlight = 8;         // queued-but-unreaped CBs before pend_flush waits the oldest
+struct PendingCB { VkCommandBuffer cb = VK_NULL_HANDLE; VkDescriptorPool dp = VK_NULL_HANDLE;
+                   uint32_t sets = 0; };
+struct InFlight { VkFence fence; VkCommandBuffer cb; VkDescriptorPool dp; };
+PendingCB g_pend;
+std::vector<InFlight> g_inflight;
+uint32_t batch_on() {
+    static uint32_t v = getenv("STRATA_VK_BATCH") ? (uint32_t)atoi(getenv("STRATA_VK_BATCH")) : 1u;
+    return v;
+}
+void pend_begin_locked() {   // g_pm held
+    VkDevice dev = (VkDevice)vk_handle();
+    ensure_cmd_pool();
+    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = g_pool; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
+    RT(vkAllocateCommandBuffers(dev, &cai, &g_pend.cb));
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    RT(vkBeginCommandBuffer(g_pend.cb, &bi));
+    VkDescriptorPoolSize psz{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, max_sets_per_cb() * kMaxBufsPerSet};
+    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpi.maxSets = max_sets_per_cb(); dpi.poolSizeCount = 1; dpi.pPoolSizes = &psz;
+    RT(vkCreateDescriptorPool(dev, &dpi, nullptr, &g_pend.dp));
+    g_pend.sets = 0;
+}
+void pend_flush_locked() {   // g_pm held; end+submit with a fence, NO wait
+    if (!g_pend.cb) return;
+    VkDevice dev = (VkDevice)vk_handle();
+    // depth cap: never leave more than kMaxInFlight CBs queued without reaping, so a 128-token
+    // prefill can't pile up command buffers (and their pools) faster than the GPU drains.
+    if (g_inflight.size() >= kMaxInFlight) {
+        RT(vkWaitForFences(dev, 1, &g_inflight.front().fence, VK_TRUE, ~0ull));
+        vkDestroyFence(dev, g_inflight.front().fence, nullptr);
+        vkFreeCommandBuffers(dev, g_pool, 1, &g_inflight.front().cb);
+        vkDestroyDescriptorPool(dev, g_inflight.front().dp, nullptr);
+        g_inflight.erase(g_inflight.begin());
+    }
+    RT(vkEndCommandBuffer(g_pend.cb));
+    VkFence f; VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    RT(vkCreateFence(dev, &fi, nullptr, &f));
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1; si.pCommandBuffers = &g_pend.cb;
+    RT(vkQueueSubmit((VkQueue)vk_default_queue(), 1, &si, f));
+    g_inflight.push_back(InFlight{f, g_pend.cb, g_pend.dp});
+    g_pend = PendingCB{};
+}
+void flush_wait() {          // flush pending, then wait ALL in-flight fences (all queue ops under g_pm)
+    std::lock_guard<std::mutex> plk(g_pm);
+    pend_flush_locked();
+    VkQueue q = (VkQueue)vk_default_queue();
+    RT(vkQueueWaitIdle(q));   // drains EVERYTHING (incl. other threads' recorded work)
+    if (g_inflight.empty()) return;
+    VkDevice dev = (VkDevice)vk_handle();
+    for (auto& x : g_inflight) {
+        vkDestroyFence(dev, x.fence, nullptr);
+        vkFreeCommandBuffers(dev, g_pool, 1, &x.cb);
+        vkDestroyDescriptorPool(dev, x.dp, nullptr);
+    }
+    g_inflight.clear();
+}
 void end_submit(VkCommandBuffer cb) {
+    // ONE g_pm critical section: pool-free and vkQueueSubmit/vkQueueWaitIdle are not thread-safe;
+    // with batching, background swap threads (copies) and the main thread (launch flushes)
+    // genuinely interleave here.
+    std::lock_guard<std::mutex> plk(g_pm);
     VkDevice dev = (VkDevice)vk_handle();
     RT(vkEndCommandBuffer(cb));
     VkQueue q = (VkQueue)vk_default_queue();
@@ -183,9 +289,10 @@ std::unordered_map<uint64_t, KernelImpl> g_kernels;    // keyed by pipeline hand
 
 DevicePtr Arena::alloc(uint64_t bytes) {
     std::lock_guard<std::mutex> lk(g_m);
-    uint64_t at = g_cursor;
-    arena_add(bytes);
-    return at;
+    // Task 4.1 fix: the base MUST come from after arena_add()'s piece-boundary bump; the old
+    // `at = g_cursor` pre-capture handed the caller a dead-tail offset whenever a concurrent
+    // alloc had ended the piece under the cursor.
+    return arena_add(bytes);
 }
 uint64_t Arena::used() const { std::lock_guard<std::mutex> lk(g_m); return g_cursor; }
 uint64_t Arena::capacity() const { std::lock_guard<std::mutex> lk(g_m); return g_cursor; }
@@ -201,18 +308,26 @@ Arena& Arena::instance() { static Arena a; return a; }
 std::atomic<uint64_t> g_stream_token{1};
 void* stream_create() { return (void*)(uintptr_t) g_stream_token.fetch_add(1); }
 void stream_destroy(void*) {}
-void stream_sync(void*) { RT(vkQueueWaitIdle((VkQueue)vk_default_queue())); }
-void device_sync() { RT(vkDeviceWaitIdle((VkDevice)vk_handle())); }
+void stream_sync(void*) { flush_wait(); }
+void device_sync() { std::lock_guard<std::mutex> plk(g_pm); pend_flush_locked();
+                     RT(vkDeviceWaitIdle((VkDevice)vk_handle()));
+                     VkDevice dev = (VkDevice)vk_handle();
+                     for (auto& x : g_inflight) { vkDestroyFence(dev, x.fence, nullptr);
+                         vkFreeCommandBuffers(dev, g_pool, 1, &x.cb);
+                         vkDestroyDescriptorPool(dev, x.dp, nullptr); }
+                     g_inflight.clear(); }
 
 struct Ev { };
 void* event_create() { return new Ev{}; }
 void event_destroy(void* e) { delete (Ev*)e; }
-void event_record(void*, void*) { RT(vkQueueWaitIdle((VkQueue)vk_default_queue())); }
+// host-clock timing: the queue must be idle when the event is recorded
+void event_record(void*, void*) { flush_wait(); }
 void event_wait(void*, void*) {}
 float event_elapsed(void*, void*) { return 0.f; }
 
 void copy_h2d(void* dst, const void* src, uint64_t bytes, void*) {
     std::lock_guard<std::mutex> lk(g_m);
+    flush_wait();   // eager-copy rule: never let a stage write race a recorded stage copy
     uint64_t at = (uint64_t)(uintptr_t)dst, off = 0;
     while (off < bytes) {
         uint64_t n = bytes - off < (2ull << 20) ? bytes - off : (2ull << 20);
@@ -225,6 +340,7 @@ void copy_h2d(void* dst, const void* src, uint64_t bytes, void*) {
 }
 void copy_d2h(void* dst, const void* src, uint64_t bytes, void*) {
     std::lock_guard<std::mutex> lk(g_m);
+    flush_wait();   // the d2h result is what the sampler needs: right sync point
     uint64_t at = (uint64_t)(uintptr_t)src, off = 0;
     while (off < bytes) {
         uint64_t n = bytes - off < (2ull << 20) ? bytes - off : (2ull << 20);
@@ -237,6 +353,7 @@ void copy_d2h(void* dst, const void* src, uint64_t bytes, void*) {
 }
 void fill_d(void* dst, uint8_t byte, uint64_t bytes, void*) {
     std::lock_guard<std::mutex> lk(g_m);
+    flush_wait();   // eager-copy rule (fill writes the shared stage too)
     stage_ensure(1ull << 20);
     const uint64_t chunk = g_stage_size;
     uint64_t off = 0;
@@ -295,6 +412,9 @@ void kernel_launch_sized(const Kernel& k, int groups_x, const uint64_t* buffers,
     if (n_buffers != impl.n_buffers) throw std::runtime_error("vk_runtime: kernel buffer count mismatch");
     VkDevice dev = (VkDevice)vk_handle();
     std::vector<VkDescriptorBufferInfo> dbi(n_buffers);
+    std::lock_guard<std::mutex> alk(g_m);   // g_pieces is grown under g_m (Arena::alloc); with
+                                            // deferred submits, launches now genuinely overlap
+                                            // background arena growth - read pieces under the lock.
     for (int i = 0; i < n_buffers; i++) {
         uint64_t po; VkBuffer pb = piece_of(buffers[i], sizes[i], po);
         if (!pb) {
@@ -302,18 +422,56 @@ void kernel_launch_sized(const Kernel& k, int groups_x, const uint64_t* buffers,
             for (auto& p : g_pieces)
                 if (p.base + p.size > buffers[i] && p.base < buffers[i] + sizes[i])
                     pieces += " [" + std::to_string(p.base) + "," + std::to_string(p.base + p.size) + "]";
+            if (getenv("STRATA_VK_DEBUG_ARENA")) {
+                for (int d = 0; d < n_buffers; d++)
+                    std::fprintf(stderr, "  arg %d: off %llu size %llu\n", d,
+                                 (unsigned long long)buffers[d], (unsigned long long)sizes[d]);
+                std::fprintf(stderr, "  all pieces:\n");
+                for (auto& p : g_pieces)
+                    std::fprintf(stderr, "    [%llu,%llu)\n", (unsigned long long)p.base,
+                                 (unsigned long long)(p.base + p.size));
+            }
             throw std::runtime_error("vk_runtime: kernel argument " + std::to_string(i) +
                                      " of " + impl.name + " crosses an arena piece (offset " + std::to_string(buffers[i]) +
                                      ", " + std::to_string(sizes[i]) + " bytes; " + pieces + ")");
         }
         dbi[i] = VkDescriptorBufferInfo{pb, po, sizes[i]};
     }
-    VkDescriptorPool dp; VkDescriptorPoolSize psz{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (uint32_t)n_buffers};
-    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    dpi.maxSets = 1; dpi.poolSizeCount = 1; dpi.pPoolSizes = &psz;
-    RT(vkCreateDescriptorPool(dev, &dpi, nullptr, &dp));
+    if (!batch_on()) {   // A/B fallback: the old per-launch pool + submit + wait
+        VkDescriptorPool dp; VkDescriptorPoolSize psz{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (uint32_t)n_buffers};
+        VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        dpi.maxSets = 1; dpi.poolSizeCount = 1; dpi.pPoolSizes = &psz;
+        RT(vkCreateDescriptorPool(dev, &dpi, nullptr, &dp));
+        VkDescriptorSet ds; VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dai.descriptorPool = dp; dai.descriptorSetCount = 1; dai.pSetLayouts = &impl.dsl;
+        RT(vkAllocateDescriptorSets(dev, &dai, &ds));
+        std::vector<VkWriteDescriptorSet> wr(n_buffers);
+        for (int i = 0; i < n_buffers; i++) {
+            wr[i] = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            wr[i].dstSet = ds; wr[i].dstBinding = (uint32_t)i; wr[i].descriptorCount = 1;
+            wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr[i].pBufferInfo = &dbi[i];
+        }
+        vkUpdateDescriptorSets(dev, (uint32_t)n_buffers, wr.data(), 0, nullptr);
+        VkCommandBuffer cb = begin();
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, impl.pipe);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, impl.layout, 0, 1, &ds, 0, nullptr);
+        if (impl.pc_bytes && push_constants)
+            vkCmdPushConstants(cb, impl.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, impl.pc_bytes, push_constants);
+        vkCmdDispatch(cb, (uint32_t)groups_x, 1, 1);
+        end_submit(cb);
+        vkDestroyDescriptorPool(dev, dp, nullptr);
+        return;
+    }
+    // Batched path: allocate the set from the PENDING pool (one per pending CB, recycled at
+    // flush) and record bind+push+dispatch into the pending CB. When the CB hits the set cap,
+    // end/submit it with a fence (no wait) and open a fresh CB+pool pair.
+    std::lock_guard<std::mutex> plk(g_pm);
+    if (!g_pend.cb || g_pend.sets >= max_sets_per_cb()) {
+        pend_flush_locked();      // submit the full CB (if any), fence, no wait
+        pend_begin_locked();      // fresh CB + fresh descriptor pool
+    }
     VkDescriptorSet ds; VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    dai.descriptorPool = dp; dai.descriptorSetCount = 1; dai.pSetLayouts = &impl.dsl;
+    dai.descriptorPool = g_pend.dp; dai.descriptorSetCount = 1; dai.pSetLayouts = &impl.dsl;
     RT(vkAllocateDescriptorSets(dev, &dai, &ds));
     std::vector<VkWriteDescriptorSet> wr(n_buffers);
     for (int i = 0; i < n_buffers; i++) {
@@ -322,14 +480,23 @@ void kernel_launch_sized(const Kernel& k, int groups_x, const uint64_t* buffers,
         wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr[i].pBufferInfo = &dbi[i];
     }
     vkUpdateDescriptorSets(dev, (uint32_t)n_buffers, wr.data(), 0, nullptr);
-    VkCommandBuffer cb = begin();
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, impl.pipe);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, impl.layout, 0, 1, &ds, 0, nullptr);
+    vkCmdBindPipeline(g_pend.cb, VK_PIPELINE_BIND_POINT_COMPUTE, impl.pipe);
+    vkCmdBindDescriptorSets(g_pend.cb, VK_PIPELINE_BIND_POINT_COMPUTE, impl.layout, 0, 1, &ds, 0, nullptr);
     if (impl.pc_bytes && push_constants)
-        vkCmdPushConstants(cb, impl.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, impl.pc_bytes, push_constants);
-    vkCmdDispatch(cb, (uint32_t)groups_x, 1, 1);
-    end_submit(cb);
-    vkDestroyDescriptorPool(dev, dp, nullptr);
+        vkCmdPushConstants(g_pend.cb, impl.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, impl.pc_bytes, push_constants);
+    vkCmdDispatch(g_pend.cb, (uint32_t)groups_x, 1, 1);
+    // In CB, consecutive dispatches carry NO declared dependency: RADV may overlap their
+    // storage-buffer reads/writes (eager mode's per-launch wait was an implicit barrier). Insert
+    // an explicit full memory barrier after each dispatch so the batch stays bitwise-ordered.
+    // This is far cheaper than the per-launch submit+vkQueueWaitIdle it replaces.
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                       VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(g_pend.cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 1, &mb, 0, nullptr, 0, nullptr);
+    g_pend.sets++;
 }
 
 }  // namespace strata::vk

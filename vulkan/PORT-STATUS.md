@@ -561,3 +561,44 @@ tok/s (length), 10 of 10 guessed right, ids
 poly traps left: add_bias, softcap, store_q8/_at, store_f16_at, moe_sum, route_rows,
 permute_groups, attend_batch, dsa/geglu/hc/kda/dsv4/idx families, gemm_f32 -- NONE demanded by
 the gate. ctest 13/13; native_mmvq_vk_parity total now 49500 outputs compared, 0 differ.
+
+## Phase 4.1: deferred-submit batching (2026-10-23)
+kernel_launch_sized now records into a PENDING primary command buffer (ONE_TIME_SUBMIT) with one
+shared descriptor POOL per pending CB (cap 512 sets; STRATA_VK_MAX_SETS env); flush() = end +
+vkQueueSubmit with a VkFence (NO wait); flush_wait() reaps. Flush(+wait) points: stream_sync /
+device_sync / event_record, and the TOP of every copy_h2d / copy_d2h / fill_d (the d2h after the
+likeliest scratch is the sampler's natural sync point). Pending CBs bounded two ways: 512 sets
+(=dispatches) per CB, and kMaxInFlight=8 unreaped CBs (pend_flush waits+reaps the oldest fence).
+STRATA_VK_BATCH=0 restores the per-launch path (A/B toggle, compiled in).
+
+THE STAGING HAZARD (why copies stay EAGER): copy_chunk records the stage buffer's ADDRESS, not
+its bytes. With deferred submits, a host memcpy into g_stage for the NEXT copy would corrupt a
+not-yet-run copy of the PREVIOUS one. Fix chosen: every copy/fill flush_waits pending GPU work
+first (and g_stage itself is only ever touched under g_m + after a queue drain). The engine only
+copies at token boundaries + staging windows, so the eager copies cost little vs ~600
+launches/token. A ring of N stage buffers is the later optimization if copy count grows.
+
+THREE REAL RACES BATCHING EXPOSED (all fixed here; each silent under eager's implicit drain):
+1. Arena::alloc captured g_cursor BEFORE arena_add()'s piece-boundary bump -> the caller got a
+   dead-tail offset while the region sat at the bumped base (straddle throws + wrong tensors once
+   swap threads' allocs raced ahead of recorded launches). Fixed: arena_add returns placed_at.
+2. kernel_launch_sized read g_pieces unlocked while background threads push_back (vector realloc).
+   Fixed: piece resolution under g_m (leaf order g_km -> g_m -> g_pm; sync paths take g_pm only).
+3. THE BIG ONE: consecutive dispatches INSIDE one command buffer carry NO declared dependency --
+   RADV overlaps them and storage-buffer hazards scramble the tensor stream (garbage ids, then
+   straddle throws from corrupted slot pointers; STRATA_VK_MAX_SETS=1 was bitwise-correct while
+   >=2 was not: the bisect that named it). Eager mode was safe because each dispatch was its own
+   submit+wait (an implicit full-device barrier). Fixed: vkCmdPipelineBarrier (COMPUTE+TRANSFER,
+   full RW memory barrier) after each batched dispatch -- still ~3x faster than submit+wait.
+4. vkQueueSubmit/WaitIdle + pool allocate/free from copy threads vs launch-thread flushes: all
+   queue/pool ops now under g_pm (begin/end_submit/pend_* take it; one queue underneath anyway).
+
+MEASURED (Qwen3.6-35B-A3B UD-IQ2_XXS, BC-250, 2 runs each, medians; ids IDENTICAL in both modes):
+  gate                     BATCH=0            BATCH=1
+  16-tok gate prompt       5.0 tok/s          14.6 tok/s
+  16-tok gate decode       4.3 tok/s          12.7 tok/s
+  128-tok run prompt       5.7 tok/s          14.7 tok/s
+  128-tok run decode       7.7 tok/s          24.3 tok/s   <- headline: ~3.2x
+Gates: ctest 13/13; 16-tok ids == 220,18,24,16,13,198,48,25,3437,369,220,16,22,2942,220,17 both
+modes (3x); 128-tok ids identical BATCH=0 vs BATCH=1 (diff clean); git diff main..HEAD -- src
+include == 0.
