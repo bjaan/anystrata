@@ -62,7 +62,14 @@ void conv4_silu(const float* x, float* state, const float* w, float* out, int ch
     }
     // The walk arm: state in place, snapshots per snap_of().
     if (stride >> 32) throw std::runtime_error("conv4_silu: snapshot stride exceeds uint32");
-    const uint64_t snap_span = snap && stride ? stride * (uint64_t)__builtin_popcount(snaps) * 4 : ospan;   // slots = set bits
+    // Touched extent: slot j (j < popcount(snaps)) writes 3*channel floats at snap + j*stride,
+    // so the last write ends at (popcount-1)*stride + 3*channels floats -- NOT popcount*stride
+    // (the extra tail pushed the span past the arena's piece boundary once speculation wrote
+    // snapshots; Task 2.19, same fix as gdn_step's state-snap arm).
+    const uint64_t conv_state = (uint64_t)channels * 3 * 4;
+    const uint64_t snap_span = (snap && stride && snaps)
+        ? ((uint64_t)__builtin_popcount(snaps) - 1u) * (uint64_t)stride * 4 + conv_state
+        : ospan;
     const uint64_t bufs[5] = {xo, so, wo, oo, no};
     const uint64_t sizes[5] = {xspan, (uint64_t)channels * 3 * 4, (uint64_t)channels * 4 * 4,
                                ospan, snap_span};

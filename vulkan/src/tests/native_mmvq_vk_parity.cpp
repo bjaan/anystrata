@@ -177,7 +177,7 @@ float vdot_iq2_s(const uint8_t* bq2, const uint8_t* q8, int iqs) {
 }
 
 // ---- IQ4_XS (type 23, Task 2.12): kvalues_iq4nl (ggml-common.h:1120-1122) as a host table, and
-// vec_dot_iq4_xs_q8_1 (iq_kernels.cu:296-313) transcribed verbatim. block_iq4_xs is 146 B (half d
+// vec_dot_iq4_xs_q8_1 (iq_kernels.cu:296-313) transcribed verbatim. block_iq4_xs is 136 B (half d
 // @0, uint16 scales_h @2, uint8 scales_l[4] @4, uint8 qs[128] @8); q8 = the q8_1 block's byte 0
 // (word 0 = ds, bytes 4..35 = qs). No grid table — the nibbles decode through kvalues_iq4nl.
 const int8_t kIq4nl[16] = { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
@@ -682,17 +682,18 @@ int main(int argc, char** argv) {
     }
     // ---- type 23 (IQ4_XS, Task 2.12): Fmt<23> = {qk 256, ipb 8, step 4} - same ROWS=4 grid
     // ceil(n_out/4) launch as 16/18; blocks are 146 B, no grid table (kvalues_iq4nl inlined).
-    const Shape iq4_shapes[] = {{2048, 64, 1}, {2048, 64, 2}, {2048, 768, 1}, {768, 64, 3}, {256, 3, 1}};
+    const Shape iq4_shapes[] = {{2048, 64, 1}, {2048, 64, 2}, {2048, 768, 1}, {768, 64, 3}, {256, 3, 1},
+                                {512, 2048, 1}, {512, 2048, 8}};   // Task 2.19: the model's IQ4_XS ffn_down shape (blk 34/38: n_in 512, n_out 2048)
     for (const Shape& s : iq4_shapes) {
         const int nb = s.n_in / 256;
         std::mt19937 rng(5300 + s.n_in * 13 + s.ncols);
         std::uniform_real_distribution<float> sc(0.0009765625f, 0.03125f);   // d in [2^-10, 2^-5)
-        std::vector<uint8_t> W(size_t(s.n_out) * nb * 146);
+        std::vector<uint8_t> W(size_t(s.n_out) * nb * 136);
         for (auto& blk : W) blk = uint8_t(rng() & 0xFF);                     // random legal bytes
         for (int r = 0; r < s.n_out; ++r)
             for (int b = 0; b < nb; ++b) {
                 const uint16_t dh = f16_rn((rng() & 1) ? -sc(rng) : sc(rng));
-                std::memcpy(W.data() + (size_t(r) * nb + b) * 146, &dh, 2);  // finite fp16 scale
+                std::memcpy(W.data() + (size_t(r) * nb + b) * 136, &dh, 2);  // finite fp16 scale
             }
         std::vector<float> x(size_t(s.n_in) * s.ncols);
         for (auto& v : x) v = float(int(rng() % 2001) - 1000) / 250.0f;
@@ -719,12 +720,12 @@ int main(int argc, char** argv) {
         int shape_fails = 0;
         for (int c = 0; c < s.ncols; ++c)
             for (int r = 0; r < s.n_out; ++r) {
-                const uint8_t* wr = W.data() + size_t(r) * nb * 146;
+                const uint8_t* wr = W.data() + size_t(r) * nb * 136;
                 const uint8_t* xcol = Q.data() + size_t(c) * nb * 8 * 36;
                 float part[32] = {0.f};
                 for (int k = 0; k < nb * 8; ++k) {                          // lane k%32's call k
                     const int kbx = k / 8, iqs = 4 * (k % 8);               // Fmt<23>: step 4
-                    part[k % 32] += vdot_iq4_xs(wr + kbx * 146, xcol + size_t(kbx * 8 + iqs / 4) * 36, iqs);
+                    part[k % 32] += vdot_iq4_xs(wr + kbx * 136, xcol + size_t(kbx * 8 + iqs / 4) * 36, iqs);
                 }
                 float acc[32], nxt[32];
                 std::memcpy(acc, part, sizeof part);

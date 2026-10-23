@@ -96,7 +96,7 @@ header helpers, one row per header) | `n/a` (decision `n/a`).
 | launch_pdl / pdl_* (programmatic dependent launch) | pdl.hpp | (host launch glue; pdl helpers) | pdl_parity.cpp | cudaGraph, PDL (programmatic dependent launch) | n/a (NVIDIA PDL/graph feature — run with --no-graphs; the Vulkan port uses its own submission ordering) | n/a |
 | poly: gemv_kernel, dequant_q8_kernel | src/poly/kernels.cu (no include/strata header) | src/poly/kernels.cu | none (poly engine tests) | `__shared__`, `__constant__` | translate | **gemv_kernel ported via the gemv_f32 launcher (Task 2.4): vulkan/src/poly/kernels/gemv.comp (5 workgroup-size variants), gemv_vk.cpp, unit poly_kernels_vk_parity BITWISE on 5 shapes; dequant_q8_kernel todo** |
 | poly: rms_norm, copy2 (launchers) | include/strata/poly/kernels.hpp | src/poly/kernels.cu | unit poly_kernels_vk_parity + model-run advance | `__shfl`, `__shared__` (rms_norm block_sum) | translate | **ported+parity-green** (vulkan/src/poly/kernels/{rms_norm,copy2}.comp, *_vk.cpp) |
-| poly: layer_norm_kernel, bf16_to_f32_kernel, store_f16_kernel/**PORTED 2.10**/_at, store_q8_kernel/_at, add_bias_kernel, axpy_kernel, add_scaled_kernel, mul_sigmoid_kernel, softcap_kernel, likeliest_kernel | src/poly/kernels.cu | src/poly/kernels.cu | unit poly_kernels_vk_parity | none | translate | **axpy/add_scaled/mul_sigmoid PORTED (Task 2.7): vulkan/src/poly/kernels/elementwise.comp (EW_VARIANT arms) + elementwise_vk.cpp; parity: axpy/add_scaled bitwise, mul_sigmoid rel 5.0e-7 (exp vs expf, tree tol 1e-5); rest todo** |
+| poly: layer_norm_kernel, bf16_to_f32_kernel, store_f16_kernel/**PORTED 2.10**/_at, store_q8_kernel/_at, add_bias_kernel, axpy_kernel, add_scaled_kernel, mul_sigmoid_kernel, softcap_kernel, likeliest_kernel | src/poly/kernels.cu | src/poly/kernels.cu | unit poly_kernels_vk_parity | none | translate | **axpy/add_scaled/mul_sigmoid PORTED (Task 2.7): vulkan/src/poly/kernels/elementwise.comp (EW_VARIANT arms) + elementwise_vk.cpp; parity: axpy/add_scaled bitwise, mul_sigmoid rel 5.0e-7 (exp vs expf, tree tol 1e-5); likeliest PORTED (Task 2.19): likeliest.comp + likeliest_vk.cpp, parity token-bitwise + prob rel 6.96e-8; store_q8/_at, add_bias, softcap, store_f16_at, route_rows/permute_groups/moe_sum (moe router families) still todo** |
 | poly: hc_mix/read/post/head/mean kernels | src/poly/kernels.cu | src/poly/kernels.cu | hc_persist_parity.cpp (host-side contract) | `__shfl`, `__shared__` | translate | todo |
 | poly: kda_conv/_rows/_state, kda_step/gates/state/out kernels | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | todo |
 | poly: gdn_norm/gates/state/state_reg/out kernels | src/poly/kernels.cu | src/poly/kernels.cu | gdn_parity.cpp (host-side contract) | `__shfl`, `__shared__` | translate | **gdn_step PORTED (Task 2.5): gdn_norm.comp/gdn_gates.comp/gdn_state.comp (plain+reg<1,2,4,8>)/gdn_out.comp + gdn_vk.cpp; unit poly_gdn_vk_parity rel_l1 <= 1.6e-7 vs both contraction arms (tree tol 1e-5)** |
@@ -536,3 +536,28 @@ added -> 31068 total compared, 0 differ**. ctest 13/13. Model gate: load 34.2 s,
 experts, and the halt moves from `native_mmvq type 11` to `strata::poly::likeliest` — the mmvq
 family is fully walked through the first decode step; the next halt is a poly-path kernel
 (likeliest_kernel, src/poly/kernels.cu, still todo in the poly table).
+
+**COMPLETION after Task 2.19 (2026-10-23): THE 16-TOKEN GATE COMPLETES — no halt.** Demand #24
+cleared: likeliest as likeliest.comp (one workgroup of 1024, the CUDA <<<1,1024>>> mirrored;
+the strided loops re-guard their bound INSIDE the body -- glslc -O hoists a bare `for (i=tid;
+i<n; i+=1024)` into a do-while whose first read past the buffer folds garbage into m/sum on
+RADV) + likeliest_vk.cpp (writes an 8-byte arena scratch, copies back with copy_d2h: the CUDA
+kernel writes the pinned HOST Likeliest through unified addressing; Vulkan kernels see only the
+arena). fmaxf's NaN-IGNORING semantics emulated (GLSL max propagates). Parity (4 shapes incl.
+the model's vocab 151936, ties forced at the max): **token INDEX equal every shape (ties
+included), prob rel <= 7.0e-8 (exp vs expf)**. The trap chain after that halt found two real
+bugs BEHIND it: (1) mmvq_iq4_xs.comp/launcher declared block_iq4_xs as 146 bytes -- the struct
+is half+u16+4+128 = 136 (the old parity test transcribed the same wrong stride, so it agreed
+with itself: fixed to 136 everywhere, + the model's 512x2048 shapes; IQ4_XS rows read true
+bytes now, blk 34/38's NaN gone). (2) gdn_vk.cpp + conv4_silu_vk.cpp over-declared the snap
+buffer's span as popcount(snaps)*stride: the last slot writes only its own 3ch / head*dim*dim
+payload, so (popcount-1)*stride + payload is the touched extent; the phantom tail crossed an
+arena piece once snapshot speculation actually ran (it never did while blk 34 NaN'd -- the
+first draft's "all-zero ids" was likeliest reading NaN logits, whose argmax falls to token 0).
+Gate (exact command, qids): 18-token prefill 5.1-5.7 tok/s, generated 16 tokens 4.37-5.36
+tok/s (length), 10 of 10 guessed right, ids
+`220,18,24,16,13,198,48,25,3437,369,220,16,22,2942,220,17` = " 391.\nQ: 17 x 23" --
+**'391' present (17x23, the semantic check passes)**; --top-probs 3 confident (0.90/0.83/0.98).
+poly traps left: add_bias, softcap, store_q8/_at, store_f16_at, moe_sum, route_rows,
+permute_groups, attend_batch, dsa/geglu/hc/kda/dsv4/idx families, gemm_f32 -- NONE demanded by
+the gate. ctest 13/13; native_mmvq_vk_parity total now 49500 outputs compared, 0 differ.

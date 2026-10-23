@@ -134,10 +134,19 @@ void gdn_step(float* qkv, float* alpha, float* beta, const float* dt, const floa
         const vk::Kernel& k = pl_state(dim, &per);
         const size_t blocks = (size_t)n_head * ((dim + columns - 1) / columns);
         const uint64_t bufs[6] = {qo, ao, bo, so, oo, no};
+        // The snap arm writes each snapshot token's STATE (n_head*dim*dim floats) at snap +
+        // j*stride, j < popcount(snaps): the touched extent is (popcount-1)*stride + layer, NOT
+        // popcount*stride - declaring the whole stride tail (this launch's snap start already
+        // sits layer-offset deep in the buffer) pushed the span past the arena piece it lives in
+        // (Task 2.19: "kernel argument 5 of gdn_state_reg_4 crosses an arena piece" once the
+        // model reached snapshot speculation).
+        const size_t snap_layer = (uint64_t)n_head * dim * dim;
+        const size_t snap_extent = (snap && stride && snaps)
+                                       ? ((size_t)__builtin_popcount(snaps) - 1u) * stride + snap_layer
+                                       : (size_t)0;
         const uint64_t sizes[6] = {row_n * (size_t)rows * 4, gates * 4, gates * 4,
-                                   (uint64_t)n_head * dim * dim * 4, (uint64_t)rows * d_inner * 4,
-                                   (snap && stride) ? stride * (size_t)__builtin_popcount(snaps) * 4
-                                                    : (uint64_t)rows * d_inner * 4};
+                                   snap_layer * 4, (uint64_t)rows * d_inner * 4,
+                                   snap_extent ? snap_extent * 4 : (uint64_t)rows * d_inner * 4};
         const uint32_t pc[8] = {(uint32_t)dim, (uint32_t)n_head, (uint32_t)k_heads, (uint32_t)rows,
                                 (uint32_t)columns, (uint32_t)(stride & 0xFFFFFFFFu), (uint32_t)(stride >> 32), snaps};
         if (blocks > 0x7FFFFFFFLL) throw std::runtime_error("gdn_step: state grid overflows");

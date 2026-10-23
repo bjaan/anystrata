@@ -12,8 +12,8 @@
 // tid%32, subrow = tid/32; row = group*4 + subrow, so `row >= n_out` returns whole subgroups and
 // every shuffle partner stays active.
 //
-// block_iq4_xs is 146 bytes (ggml-common.h:454-460: half d @0, uint16 scales_h @2, uint8
-// scales_l[QK_K/64=4] @4, uint8 qs[QK_K/2=128] @8) - NOT 4-aligned, so W is uint words and every
+// block_iq4_xs is 136 bytes (ggml-common.h:454-460: half d @0, uint16 scales_h @2, uint8
+// scales_l[QK_K/64=4] @4, uint8 qs[QK_K/2=128] @8 = 136) - NOT 4-aligned, so W is uint words and every
 // field is assembled byte-by-byte (wb/w32). No grid table: IQ4_XS decodes nibbles through the
 // 16-entry kvalues_iq4nl (ggml-common.h:1120), inlined below as 4 packed uint32 words.
 // block_q8_1 is 36 B = 9 words (word 0 = ds, low half d; words 1..8 = qs[0..31]).
@@ -30,7 +30,7 @@
 
 layout(local_size_x = 128) in;
 
-layout(std430, binding = 0) readonly buffer W    { uint  v[]; } bw;   // IQ4_XS blocks, 146 B each
+layout(std430, binding = 0) readonly buffer W    { uint  v[]; } bw;   // IQ4_XS blocks, 136 B each
 layout(std430, binding = 1) readonly buffer X    { uint  v[]; } bx;   // q8_1 columns, 36 B blocks
 layout(std430, binding = 2)           buffer Y    { float v[]; } by;   // ncols * n_out floats
 
@@ -59,7 +59,7 @@ int dp4a(int a, int b, int c) {
 
 // vec_dot_iq4_xs_q8_1(bq4 = row block kbx, bq8_1 = x column + kbx*8 + iqs/4, iqs) - same ops, same order.
 float iq4_xs_dot(uint b0, uint xw, uint kbx, uint iqs) {
-    const uint blk = b0 + kbx * 146u;                    // the block's first byte
+    const uint blk = b0 + kbx * 136u;                    // the block's first byte
     const uint qs  = blk + 8u;                           // qs[0..31] words
     const uint xb  = xw + (kbx * 8u + iqs / 4u) * 9u;    // q8_1 block word 0 (ds)
     int sumi = 0;
@@ -93,7 +93,7 @@ void main() {
     const uint row  = gl_WorkGroupID.x * 4u + ((tid & 127u) >> 5u);
     if (row >= pc.n_out) return;                   // whole 32-lane subgroups leave together
     const uint nb = pc.n_in / 256u;
-    const uint b0 = row * nb * 146u;
+    const uint b0 = row * nb * 136u;
     for (uint c = 0u; c < pc.ncols; ++c) {
         const uint xw = c * nb * 72u;              // column c: nb*8 blocks x 9 words
         float s = 0.0;

@@ -64,7 +64,7 @@ using vk::kIq2sGrid;     // the iq2s grid table header (1024 x uint64)
 constexpr int IQ_BLOCK_BYTES = 66;   // block_iq2_xxs
 constexpr int IQ2S_BLOCK_BYTES = 82; // block_iq2_s (half d + qs[64] + qh[8] + scales[8])
 constexpr int IQ3_BLOCK_BYTES = 98;  // block_iq3_xxs (half d + uint8 qs[96])
-constexpr int IQ4XS_BLOCK_BYTES = 146;  // block_iq4_xs (half d + uint16 scales_h + uint8 scales_l[4] + uint8 qs[128])
+constexpr int IQ4XS_BLOCK_BYTES = 136;  // block_iq4_xs: half d + uint16 scales_h + uint8 scales_l[4] + uint8 qs[128] = 2+2+4+128 (Task 2.19: 146 was a byte-sum mistake; the model's IQ4_XS expert rows are 136 B)
 constexpr int Q5K_BLOCK_BYTES = 176; // Q5KBlock (native_mmvq.cu:129)
 constexpr int Q4K_BLOCK_BYTES = 144; // Q4KBlock (native_mmvq.cu:139: dm + scales[12] + qs[128])
 constexpr int Q2K_BLOCK_BYTES = 84;  // Q2KBlock (native_mmvq.cu:102: scales[16] + qs[64] + dm half2)
