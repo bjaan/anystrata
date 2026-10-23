@@ -51,6 +51,42 @@ make build                           # build/bin/{strata,strata-poly,libstrata_k
 make test                            # the front end against a fake engine; no GPU, no model
 ```
 
+## Box setup — CliffsNotes
+
+Guest, both cards:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends git cmake build-essential gcc-13 nvidia-cuda-toolkit linux-headers-amd64
+python3 -m venv ~/venv-strata && ~/venv-strata/bin/pip install -r tools/requirements.txt   # offline pack tools only
+nvcc --version | tail -1                                        # CUDA 12.4.131
+g++-13 --version | head -1                                      # template default is 14.2; nvcc 12.4 accepts <= 13 (#1645)
+cmake --version | head -1                                       # 3.31.6, needs >= 3.24
+python3 --version; curl --version | head -1                     # make test needs both
+nvidia-smi --query-gpu=driver_version --format=csv,noheader     # 550.163.01
+ls /lib/modules/$(uname -r)/updates/dkms/ | head -1             # DKMS module must exist for the running kernel
+sudo apt-get install -y --no-install-recommends linux-headers-amd64   # before the first reboot after an apt kernel upgrade
+df -h /                                                         # toolkit costs ~8 GB
+```
+
+Pascal — GTX 1080 Ti, compute 6.1:
+
+```bash
+nvcc --list-gpu-arch | grep -q compute_61                       # CUDA 13 has no sm_61; stay on 12.4
+nvidia-smi --query-gpu=driver_version --format=csv,noheader     # 550 is below CUDA 13's requirement (>= 580)
+git clone https://github.com/robertkarl/UnbiasedStrata && cd UnbiasedStrata
+JOBS=4 make test                                                # no GPU, no model
+JOBS=4 make build CUDA_ARCHS=61                                 # -DSTRATA_EXPERIMENTAL_SM60=ON, -ccbin /usr/bin/g++-13; 15 min, 398 MB, 53 warnings
+```
+
+Ada — RTX 4090, compute 8.9:
+
+```bash
+git clone https://github.com/robertkarl/UnbiasedStrata && cd UnbiasedStrata
+make test
+make build CUDA_ARCHS=89                                        # 6m40 on 16 cores, 557 MB, 0 warnings
+```
+
 ## Run
 
 ```
