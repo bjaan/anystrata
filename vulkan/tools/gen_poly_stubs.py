@@ -121,7 +121,9 @@ void blas_destroy(void* blas) { if (blas) cublasDestroy((cublasHandle_t) blas); 
               "swiglu_clamp": "vulkan/src/poly/kernels/elementwise_vk.cpp",
               "mul_sigmoid": "vulkan/src/poly/kernels/elementwise_vk.cpp",
               "add_scaled": "vulkan/src/poly/kernels/elementwise_vk.cpp",
-              "swiglu_clamp_rows": "vulkan/src/poly/kernels/elementwise_vk.cpp"}
+              "swiglu_clamp_rows": "vulkan/src/poly/kernels/elementwise_vk.cpp",
+              "head_norm_rope": "vulkan/src/poly/kernels/head_norm_rope_vk.cpp",
+              "store_f16": "vulkan/src/poly/kernels/store_f16_vk.cpp"}
     poly = [d for d in poly if d["qual"].rsplit("::", 1)[1] not in PORTED]
     # every header contract function must appear; the ones WITH bodies (inline helpers) do not need traps
     with open(HDR) as f:

@@ -96,14 +96,14 @@ header helpers, one row per header) | `n/a` (decision `n/a`).
 | launch_pdl / pdl_* (programmatic dependent launch) | pdl.hpp | (host launch glue; pdl helpers) | pdl_parity.cpp | cudaGraph, PDL (programmatic dependent launch) | n/a (NVIDIA PDL/graph feature — run with --no-graphs; the Vulkan port uses its own submission ordering) | n/a |
 | poly: gemv_kernel, dequant_q8_kernel | src/poly/kernels.cu (no include/strata header) | src/poly/kernels.cu | none (poly engine tests) | `__shared__`, `__constant__` | translate | **gemv_kernel ported via the gemv_f32 launcher (Task 2.4): vulkan/src/poly/kernels/gemv.comp (5 workgroup-size variants), gemv_vk.cpp, unit poly_kernels_vk_parity BITWISE on 5 shapes; dequant_q8_kernel todo** |
 | poly: rms_norm, copy2 (launchers) | include/strata/poly/kernels.hpp | src/poly/kernels.cu | unit poly_kernels_vk_parity + model-run advance | `__shfl`, `__shared__` (rms_norm block_sum) | translate | **ported+parity-green** (vulkan/src/poly/kernels/{rms_norm,copy2}.comp, *_vk.cpp) |
-| poly: layer_norm_kernel, bf16_to_f32_kernel, store_f16_kernel/_at, store_q8_kernel/_at, add_bias_kernel, axpy_kernel, add_scaled_kernel, mul_sigmoid_kernel, softcap_kernel, likeliest_kernel | src/poly/kernels.cu | src/poly/kernels.cu | unit poly_kernels_vk_parity | none | translate | **axpy/add_scaled/mul_sigmoid PORTED (Task 2.7): vulkan/src/poly/kernels/elementwise.comp (EW_VARIANT arms) + elementwise_vk.cpp; parity: axpy/add_scaled bitwise, mul_sigmoid rel 5.0e-7 (exp vs expf, tree tol 1e-5); rest todo** |
+| poly: layer_norm_kernel, bf16_to_f32_kernel, store_f16_kernel/**PORTED 2.10**/_at, store_q8_kernel/_at, add_bias_kernel, axpy_kernel, add_scaled_kernel, mul_sigmoid_kernel, softcap_kernel, likeliest_kernel | src/poly/kernels.cu | src/poly/kernels.cu | unit poly_kernels_vk_parity | none | translate | **axpy/add_scaled/mul_sigmoid PORTED (Task 2.7): vulkan/src/poly/kernels/elementwise.comp (EW_VARIANT arms) + elementwise_vk.cpp; parity: axpy/add_scaled bitwise, mul_sigmoid rel 5.0e-7 (exp vs expf, tree tol 1e-5); rest todo** |
 | poly: hc_mix/read/post/head/mean kernels | src/poly/kernels.cu | src/poly/kernels.cu | hc_persist_parity.cpp (host-side contract) | `__shfl`, `__shared__` | translate | todo |
 | poly: kda_conv/_rows/_state, kda_step/gates/state/out kernels | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | todo |
 | poly: gdn_norm/gates/state/state_reg/out kernels | src/poly/kernels.cu | src/poly/kernels.cu | gdn_parity.cpp (host-side contract) | `__shfl`, `__shared__` | translate | **gdn_step PORTED (Task 2.5): gdn_norm.comp/gdn_gates.comp/gdn_state.comp (plain+reg<1,2,4,8>)/gdn_out.comp + gdn_vk.cpp; unit poly_gdn_vk_parity rel_l1 <= 1.6e-7 vs both contraction arms (tree tol 1e-5)** |
 | poly: conv4_silu/_rows/_state, shortconv/_rows/_state kernels | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | **conv4_silu (all three kernels: walk/rows/state) ported (Task 2.4): vulkan/src/poly/kernels/conv4_silu.comp, conv4_state.comp, conv4_silu_vk.cpp, unit poly_kernels_vk_parity rel 5.9e-7 (tree tol 1e-5); shortconv todo** |
 | poly: swiglu_clamp/_rows, geglu/_rows kernels | src/poly/kernels.cu | src/poly/kernels.cu | unit poly_kernels_vk_parity | none | translate | **swiglu_clamp PORTED (Task 2.7, elementwise.comp): parity rel 7.0e-7 (exp vs expf); swiglu_clamp_rows PORTED (Task 2.8, elementwise.comp EW_VARIANT 3: rows of gate|up pairs, flattened grid + 65535-row chunking like mul_sigmoid; parity worst rel reported in-test); geglu todo** |
 | poly: dsa_keys/softmax, idx_store/pool/weigh, route_kernel, moe_sum_kernel | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | todo |
-| poly: attn_score/softmax/value/group/ungroup/softmax_block/scale, head_norm_rope kernels | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | `__shfl`, `__shared__`, `cp.async` (some paths), `asm volatile` | fp32-fallback for the cp.async/mma-attn paths; ordered-FP32 score/softmax otherwise | todo |
+| poly: attn_score/softmax/value/group/ungroup/softmax_block/scale, head_norm_rope kernels | src/poly/kernels.cu | src/poly/kernels.cu | unit poly_kernels_vk_parity (head_norm_rope) | `__shfl`, `__shared__`, `cp.async` (some paths), `asm volatile` | fp32-fallback for the cp.async/mma-attn paths; ordered-FP32 score/softmax otherwise | **head_norm_rope PORTED (Task 2.10): vulkan/src/poly/kernels/head_norm_rope.comp (-DHNR_THREADS=128/256) + head_norm_rope_vk.cpp; parity rel 7e-7..1.2e-6 all arms (host pow table + Cody-Waite + in-kernel Taylor sin/cos — the CUDA libdevice drifts vs RADV v_sin/v_cos, see the halt para); attn_* family todo (the current halt)** |
 | poly dsv4: rope/state/squeeze/idx_score/select kernels | src/poly/kernels_dsv4.cu | src/poly/kernels_dsv4.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | todo |
 | poly dsv4: attend/attend_rows/permute kernels | src/poly/kernels_dsv4.cu | src/poly/kernels_dsv4.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | todo |
 | bf16_bits.hpp (bf16_from_f32 / f32_from_bf16 inline) | bf16_bits.hpp | (header-inline) | none | none | host-free | compiled-unchanged (n/a for device) |
@@ -212,9 +212,9 @@ Re-run with `STRATA_VK_STUBS=log` enumerates the rest of the qwen35moe decode pa
 | 11 | `strata::kernels::native_mmvq_slots` | native_mmvq / _pair / _slots / _ids — **PORTED (Task 2.8, types 16/13/14)** |
 | 12 | `strata::poly::swiglu_clamp_rows` | poly: swiglu_clamp/_rows — **PORTED (Task 2.8)** |
 | 13 | `strata::poly::add_scaled` | poly: add_scaled_kernel — **PORTED (Task 2.7)** |
-| 14 | `strata::poly::head_norm_rope` | poly: head_norm_rope kernels |
-| 15 | `strata::poly::store_f16` | poly: store_f16_kernel/_at |
-| 16 | `strata::poly::attend` | poly: attn_score/softmax/value/… kernels |
+| 14 | `strata::poly::head_norm_rope` | poly: head_norm_rope kernels — **PORTED (Task 2.10)** |
+| 15 | `strata::poly::store_f16` | poly: store_f16_kernel/_at — **store_f16 PORTED (Task 2.10)**; _at todo |
+| 16 | `strata::poly::attend` | poly: attn_score/softmax/value/… kernels — the run's CURRENT halt |
 
 (The log arm returns untouched outputs, so entries after #1 are the path's *shape*, not a
 guaranteed per-token sequence; the first trap, `copy2`, is exact — the default arm stops there.)
@@ -324,6 +324,30 @@ EW_VARIANT 3 (flattened grid + 65535-row chunking, mul_sigmoid's pattern): worst
 (exp vs expf, inside the 1e-5 family bound). native_mmvq_ids (:3194, the sibling contract) NOT
 ported — still trap-by-number; record: the next halt may demand it. ctest 11/11. Model gate:
 load 32.6 s, decode ran past #11 and #12, stopped at native_mmvq type 18 = IQ3_XXS (ggml.h:408).
+
+**Halt point after Task 2.10 (2026-10-23):** `strata::poly::attend` (demand #16 — the run walks
+straight past #14/#15: head_norm_rope + store_f16 both ported this task, one demand each, and the
+900 s gate ends at `strata-vk: strata::poly::attend has no Vulkan implementation yet`).
+head_norm_rope as vulkan/src/poly/kernels/head_norm_rope.comp (HNR_THREADS=128/256 variants =
+the CUDA launcher's `dim >= 256 ? 256 : 128`, kernels.cu:2445; one workgroup per token-and-head,
+the block_sum xor chain + part-walk line-for-line, NeoX pairing, mrope axes / freq / on-card at
+arms all wired — the engine passes axes+sections+at together (qwen35.cpp:351/386) and the kernel
+takes them as independent bindings) + head_norm_rope_vk.cpp (7 storage buffers; the theta_scale^j
+mantissa table is host-pow'd ONCE per (theta,half) and cached — RADV's hardware pow drifts ~4e-6
+rel where CUDA's powf is ~1 ulp, and `pow` in .comp has no honest path; the rope angle then goes
+through a three-word Cody-Waite 2*pi reduction + pi/2 quadrant fold + Taylor sin/cos in-kernel,
+because glslc's sin/cos land on v_sin_f32/v_cos_f32 whose own reduction drifts ~2e-6 abs and
+WRAPS at large angles (probe: 0.43 rel at 1e6 rad) — and the freq divide goes through double per
+PORT-NOTES law 2 (the f32 `/` and one Newton step both left 1.2e-5; the double path lands at
+1.1e-6). Parity (poly_kernels_vk_parity, +7 checks): all six head_norm_rope arms rel <= 1.3e-6
+vs a host transcription (double ss, launcher-matched pow table, f32-rounded libm trig) — the
+tree tol is 1e-5; the pure-norm tail and on-card `at` arms included. store_f16 as store_f16.comp
++ store_f16_vk.cpp: f16 pairs built with f16_rn_bits (NOT packHalf2x16, law 1), u32 words —
+**BITWISE** against the host f32_to_f16 over 1600 values incl. 0/-0/±1 and prior-row-untouched.
+store_f16_at (kernels.cu:522, the at_-reading replay arm) stays a trap — the recording_ path is
+--no-graphs territory; if attend's launcher wants it, port it then. ctest 11/11. Model gate: load
+32.1 s, 10496/10496 experts in VRAM, decode ran past #14 and #15 and stopped at attend (#16),
+the last big demand of the decode path.
 
 **Halt point after Task 2.9 (2026-10-23):** `strata::poly::head_norm_rope` (demand #14 — the
 pre-digested order holds; store_f16 #15 and any type-8 Q8_0 / slots-18 demand did NOT show up).

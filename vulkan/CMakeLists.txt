@@ -224,6 +224,31 @@ add_library(strata_vk_kernel_elementwise STATIC src/poly/kernels/elementwise_vk.
 target_include_directories(strata_vk_kernel_elementwise PUBLIC ${STRATA_ROOT}/include ${STRATA_ROOT}/src/poly ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
 target_link_libraries(strata_vk_kernel_elementwise PUBLIC strata_vk_runtime strata_vk_compat)
 
+# Task 2.10: poly head_norm_rope - two workgroup-size variants (-DHNR_THREADS=N matching the
+# CUDA launcher's `dim >= 256 ? 256 : 128`, kernels.cu:2445), same shape as rms_norm above.
+set(_hnr_spvs "")
+foreach(_n 128 256)
+  set(_spv ${CMAKE_CURRENT_BINARY_DIR}/spv/head_norm_rope_${_n}.spv)
+  add_custom_command(OUTPUT ${_spv}
+    COMMAND ${CMAKE_COMMAND} -E env VK_GLSLC_MODE=${GLSLC_MODE} VK_GLSLC_TOOL=${GLSLC_TOOL}
+            ${VK_GLSLC} --target-env=vulkan1.3 -O -DHNR_THREADS=${_n}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels/head_norm_rope.comp -o ${_spv}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels/head_norm_rope.comp ${VK_GLSLC}
+    COMMENT "vk-glslc head_norm_rope.comp HNR_THREADS=${_n}")
+  set(_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/head_norm_rope_${_n}.spv.h)
+  add_custom_command(OUTPUT ${_inc}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} head_norm_rope_${_n}
+    DEPENDS ${_spv})
+  list(APPEND _hnr_spvs ${_inc})
+endforeach()
+add_library(strata_vk_kernel_head_norm_rope STATIC src/poly/kernels/head_norm_rope_vk.cpp ${_hnr_spvs})
+target_include_directories(strata_vk_kernel_head_norm_rope PUBLIC ${STRATA_ROOT}/include ${STRATA_ROOT}/src/poly ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
+target_link_libraries(strata_vk_kernel_head_norm_rope PUBLIC strata_vk_runtime strata_vk_compat)
+
+# Task 2.10: poly store_f16 (the f16 KV write; store_f16_at stays a trap - no card-time row
+# read wired for it yet). f16 packing is RN via f16_rn_bits, NOT packHalf2x16 (law 1).
+strata_vk_kernel(store_f16 SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels COMP store_f16.comp LAUNCHER src/poly/kernels/store_f16_vk.cpp)
+
 strata_vk_kernel(native_quantize_q8_1 COMP quantize_q8_1.comp LAUNCHER src/kernels/native_quantize_q8_1_vk.cpp)
 # Task 2.2: native_mmvq for IQ2_XXS (type 16) — the model's routed experts. The .spv embeds under
 # the entry point's name (native_mmvq.spv.h) so the launcher includes it like the others.
@@ -417,7 +442,7 @@ add_test(NAME native_mmvq_vk_parity COMMAND native_mmvq_vk_parity --selftest)
 # Task 2.1: unit parity for the model-demanded trio (poly's copy2/rms_norm + the q8_1 quantizer).
 add_executable(poly_kernels_vk_parity src/tests/poly_kernels_vk_parity.cpp)
 target_include_directories(poly_kernels_vk_parity PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
-target_link_libraries(poly_kernels_vk_parity PRIVATE strata_vk_kernel_copy2 strata_vk_kernel_rms_norm strata_vk_kernel_native_quantize_q8_1 strata_vk_kernel_gemv strata_vk_kernel_conv4_silu strata_vk_kernel_elementwise strata_vk_poly_kernels strata_vk_runtime strata_vk_compat strata_vk_stubs)   # stubs LAST: missing() for the poly trap lib; real launchers already resolved
+target_link_libraries(poly_kernels_vk_parity PRIVATE strata_vk_kernel_copy2 strata_vk_kernel_rms_norm strata_vk_kernel_native_quantize_q8_1 strata_vk_kernel_gemv strata_vk_kernel_conv4_silu strata_vk_kernel_elementwise strata_vk_kernel_head_norm_rope strata_vk_kernel_store_f16 strata_vk_poly_kernels strata_vk_runtime strata_vk_compat strata_vk_stubs)   # stubs LAST: missing() for the poly trap lib; real launchers already resolved
 # strata_vk_poly_kernels supplies the host-defined sum_threads() the rms_norm launcher asks for; its
 # traps stay dormant here (the test calls only ported entry points).
 add_test(NAME poly_kernels_vk_parity COMMAND poly_kernels_vk_parity)
@@ -539,6 +564,7 @@ target_link_libraries(strata-poly-vk PRIVATE
   strata_vk_kernel_copy2 strata_vk_kernel_rms_norm strata_vk_kernel_native_quantize_q8_1
   strata_vk_kernel_native_mmvq
   strata_vk_kernel_gemv strata_vk_kernel_conv4_silu strata_vk_kernel_gdn strata_vk_kernel_elementwise
+  strata_vk_kernel_head_norm_rope strata_vk_kernel_store_f16
   strata_vk_poly_kernels strata_vk_core
   ggml-cpu ggml-base
   strata_vk_compat strata_vk_stubs                      # stubs last: they only let the link complete

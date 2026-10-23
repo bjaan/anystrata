@@ -552,6 +552,167 @@ int main() {
         }
     }
 
+    // ---- Task 2.10: head_norm_rope — the CUDA body (kernels.cu:994-1022) transcribed in the
+    //      same term order. The ss sum is host-double (the rel 1e-5 bound absorbs the fp32
+    //      strided/warp partition, rms_norm precedent); pow/cos/sin land on RADV's hardware
+    //      approximations vs CUDA's libdevice on the real GPU, so rel 1e-5 is the contract
+    //      here (swiglu/mul_sigmoid precedent), NOT bitwise. Arms: plain rope, freq, mrope
+    //      axes (the model's sections form), on-card `at`, x_stride != dim (the q arm),
+    //      unweighted, and the n_rot < dim pass-through tail.
+    {
+        auto ref_hnr = [](const std::vector<float>& x, int x_stride, const float* w, std::vector<float>& y,
+                          int dim, int heads, int n_rot, float theta_scale, long long pos, int rows, float eps,
+                          const float* freq, const int32_t* axes, int sections) {
+            const int half = n_rot / 2;
+            for (int blk = 0; blk < rows * heads; ++blk) {
+                const size_t base = (size_t)blk * x_stride;
+                double ss = 0.0;
+                for (int i = 0; i < dim; ++i) { float v = x[base + i]; ss += (double)v * v; }
+                const float scale = (float)(1.0 / std::sqrt(ss / dim + eps));
+                const int tok = blk / heads;
+                const float own = (float)(pos + tok);
+                for (int i = 0; i < dim; ++i) {
+                    float out;
+                    if (i >= n_rot) {
+                        const float v = x[base + i];
+                        out = w ? (v * scale) * w[i] : v * scale;
+                    } else {
+                        const int j = i < half ? i : i - half;
+                        const float p = axes ? (float)axes[(size_t)tok * 3 + (j % sections) % 3] : own;
+                        const float turn = p * (float) std::pow((double) theta_scale, (double) j);  // launcher table
+                        const float theta = freq ? turn / freq[j] : turn;
+                        const float x0 = w ? (x[base + j] * scale) * w[j] : x[base + j] * scale;
+                        const float x1 = w ? (x[base + j + half] * scale) * w[j + half] : x[base + j + half] * scale;
+                        const float cs = (float) std::cos((double) theta), sn = (float) std::sin((double) theta);
+                        out = i < half ? (float)((double) x0 * cs - (double) x1 * sn)
+                                       : (float)((double) x0 * sn + (double) x1 * cs);
+                    }
+                    y[(size_t)blk * dim + i] = out;
+                }
+            }
+        };
+        const int dim = 128, heads = 4, rows = 3, n_rot = 128;   // the 128-thread arm
+        const float theta_scale = 0.93f, eps = 1e-6f;
+        std::vector<float> x((size_t)rows * heads * dim), w(dim), fr(n_rot / 2);
+        std::mt19937 rng(210); std::uniform_real_distribution<float> u(-3.f, 3.f);
+        for (auto& v : x) v = u(rng);
+        for (auto& v : w) v = u(rng);
+        for (auto& v : fr) v = u(rng) < 0.f ? 1.f : 1.f / (1.f + std::fabs(u(rng)));
+        const uint64_t ax = a.alloc(x.size() * 4), aw = a.alloc(w.size() * 4);
+        const uint64_t af = a.alloc(fr.size() * 4), ay = a.alloc(x.size() * 4);
+        vk::copy_h2d((void*)ax, x.data(), x.size() * 4, nullptr);
+        vk::copy_h2d((void*)aw, w.data(), w.size() * 4, nullptr);
+        vk::copy_h2d((void*)af, fr.data(), fr.size() * 4, nullptr);
+        std::vector<int32_t> axes((size_t)rows * 3, 0);
+        for (int t = 0; t < rows; ++t) { axes[t*3] = 7 + t; axes[t*3+1] = 2 + t; axes[t*3+2] = 5 - t; }
+        const uint64_t aax = a.alloc(axes.size() * 4);
+        vk::copy_h2d((void*)aax, axes.data(), axes.size() * 4, nullptr);
+        // host-built pos table for the at arm (two u32 words, little-endian, like the engine's at_)
+        long long at_pos = 4093;   // the launch-replay arm: within the documented contract (the .comp's
+                           // Cody-Waite word costs grow with q ~ pos/2pi: measured <= 3e-7 to
+                           // pos 4000, the tree's max-context tier; PORT-STATUS records the bound)
+        const uint64_t aat = a.alloc(8);
+        vk::copy_h2d((void*)aat, &at_pos, 8, nullptr);
+        const auto run_cmp = [&](const char* what, int xs, const float* wp, const float* fp,
+                                 const int32_t* axp, int sec, long long pos, const long long* atp) {
+            poly::head_norm_rope((const float*)strata_vk_compat::wrap(ax), xs,
+                                 wp ? (const float*)strata_vk_compat::wrap(aw) : nullptr,
+                                 (float*)strata_vk_compat::wrap(ay), dim, heads, n_rot, theta_scale,
+                                 pos, rows, eps, nullptr,
+                                 fp ? (const float*)strata_vk_compat::wrap(af) : nullptr,
+                                 axp ? (const int32_t*)strata_vk_compat::wrap(aax) : nullptr, sec,
+                                 atp ? (const long long*)strata_vk_compat::wrap(aat) : nullptr);
+            std::vector<float> got(x.size(), 0.f), ref(x.size(), 0.f);
+            vk::copy_d2h(got.data(), (void*)ay, got.size() * 4, nullptr);
+            // the host reference reads x/w/freq/axes exactly as the launcher handed them
+            ref_hnr(x, xs, wp ? w.data() : nullptr, ref, dim, heads, n_rot, theta_scale,
+                    atp ? at_pos : pos, rows, eps, fp ? fr.data() : nullptr, axp, sec);
+            double worst = 0.0;
+            for (size_t i = 0; i < got.size(); ++i)
+                worst = std::fmax(worst, std::fabs((double)got[i] - ref[i]) /
+                                       std::fmax(1.0, std::fabs((double)ref[i])));
+            std::printf("  head_norm_rope %s: worst rel %.3e (tol 1e-5)\n", what, worst);
+            check(worst < 1e-5, what);
+        };
+        run_cmp("head_norm_rope plain rope weighted", dim, &w[0], nullptr, nullptr, 1, 42, nullptr);
+        run_cmp("head_norm_rope unweighted", dim, nullptr, nullptr, nullptr, 1, 42, nullptr);
+        run_cmp("head_norm_rope freq arm", dim, &w[0], &fr[0], nullptr, 1, 42, nullptr);
+        run_cmp("head_norm_rope mrope axes", dim, &w[0], nullptr, axes.data(), 3, 42, nullptr);
+        run_cmp("head_norm_rope on-card at", dim, &w[0], nullptr, nullptr, 1, 0, &at_pos);
+    }
+    // 256-thread arm, n_rot < dim: the tail passes through normed only (kernels.cu:1010-1012).
+    {
+        const int dim = 256, heads = 2, rows = 2, n_rot = 128;
+        const float theta_scale = 0.9f, eps = 1e-6f;
+        // x holds the qg_ shape: blocks heads at x_stride = 2*dim apart (the padding is real).
+        std::vector<float> x((size_t)rows * heads * 2 * dim), w(dim);
+        std::mt19937 rng(211); std::uniform_real_distribution<float> u(-3.f, 3.f);
+        for (auto& v : x) v = u(rng);
+        for (auto& v : w) v = u(rng);
+        const uint64_t ax = a.alloc(x.size() * 4), aw = a.alloc(w.size() * 4);
+        const uint64_t ay = a.alloc((size_t)rows * heads * dim * 4);
+        vk::copy_h2d((void*)ax, x.data(), x.size() * 4, nullptr);
+        vk::copy_h2d((void*)aw, w.data(), w.size() * 4, nullptr);
+        poly::head_norm_rope((const float*)strata_vk_compat::wrap(ax), 2 * dim,
+                             (const float*)strata_vk_compat::wrap(aw), (float*)strata_vk_compat::wrap(ay),
+                             dim, heads, n_rot, theta_scale, 900, rows, eps, nullptr, nullptr, nullptr, 1, nullptr);
+        std::vector<float> got((size_t)rows * heads * dim, 0.f), ref(got.size(), 0.f);
+        vk::copy_d2h(got.data(), (void*)ay, got.size() * 4, nullptr);
+        {   // the reference walks x with the same stride the launcher read
+            const int xs = 2 * dim;
+            double ss;
+            for (int b = 0; b < rows * heads; ++b) {
+                ss = 0.0;
+                for (int i = 0; i < dim; ++i) { float v = x[(size_t)b * xs + i]; ss += (double)v * v; }
+                const float scale = (float)(1.0 / std::sqrt(ss / dim + eps));
+                const int half = n_rot / 2;
+                const float own = (float)(900 + b / heads);
+                for (int i = 0; i < dim; ++i) {
+                    if (i >= n_rot) { ref[(size_t)b * dim + i] = (x[(size_t)b*xs + i] * scale) * w[i]; continue; }
+                    const int j = i < half ? i : i - half;
+                    const float turn = own * (float) std::pow((double) theta_scale, (double) j);  // launcher table
+                    const float x0 = (x[(size_t)b*xs + j] * scale) * w[j];
+                    const float x1 = (x[(size_t)b*xs + j + half] * scale) * w[j + half];
+                    const float cs = (float) std::cos((double) turn), sn = (float) std::sin((double) turn);
+                    ref[(size_t)b * dim + i] = i < half ? (float)((double) x0 * cs - (double) x1 * sn)
+                                                        : (float)((double) x0 * sn + (double) x1 * cs);
+                }
+            }
+        }
+        double worst = 0.0;
+        for (size_t i = 0; i < got.size(); ++i)
+            worst = std::fmax(worst, std::fabs((double)got[i] - ref[i]) / std::fmax(1.0, std::fabs((double)ref[i])));
+        std::printf("  head_norm_rope 256 threads n_rot<dim x_stride: worst rel %.3e\n", worst);
+        check(worst < 1e-5, "head_norm_rope dim=256 (256 threads), n_rot=128 tail, x_stride=2*dim");
+    }
+
+    // ---- Task 2.10: store_f16 — BITWISE expected: f16_rn_bits is the same RN encoder the
+    //      mmvq parity suite proved byte-exact; no other arithmetic is involved.
+    {
+        const int n = 320, rows = 5; const int64_t pos = 7;
+        std::vector<float> x((size_t)n * rows);
+        std::mt19937 rng(212); std::uniform_real_distribution<float> u(-60000.f, 60000.f);
+        for (auto& v : x) v = u(rng);
+        x[0] = 0.f; x[1] = -0.f; x[2] = 1.f; x[3] = -1.f;
+        std::vector<uint16_t> cache((size_t)(pos + rows) * n, 0xA5A5);
+        const uint64_t ax = a.alloc(x.size() * 4), ac = a.alloc(cache.size() * 2);
+        vk::copy_h2d((void*)ax, x.data(), x.size() * 4, nullptr);
+        vk::copy_h2d((void*)ac, cache.data(), cache.size() * 2, nullptr);
+        poly::store_f16((const float*)strata_vk_compat::wrap(ax), (uint16_t*)strata_vk_compat::wrap(ac),
+                        n, pos, rows, nullptr);
+        std::vector<uint16_t> got(cache.size(), 0);
+        vk::copy_d2h(got.data(), (void*)ac, got.size() * 2, nullptr);
+        size_t bad = 0;
+        for (int r = 0; r < rows; ++r)
+            for (int i = 0; i < n; ++i)
+                if (got[(size_t)(pos + r) * n + i] != f32_to_f16(x[(size_t)r * n + i])) bad++;
+        check(bad == 0, "store_f16 byte-exact f16 (f16_rn arm)");
+        // the rows before pos keep their prior bytes (the kernel's window is pos*n..pos*n+all)
+        bool untouched = true;
+        for (size_t i = 0; i < (size_t)pos * n && untouched; ++i) if (got[i] != 0xA5A5) untouched = false;
+        check(untouched, "store_f16 leaves the rows before pos alone");
+    }
+
     std::printf("poly_kernels_vk_parity %s\n", fails == 0 ? "PASS" : "FAIL");
     return fails == 0 ? 0 : 1;
 }

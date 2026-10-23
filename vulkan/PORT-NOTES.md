@@ -199,3 +199,13 @@ reach them (they are in the .cu files, which stay uncompiled); dim3/vector types
    only because it has no mul-into-accumulator pair to fuse.
 7. `shared` variables must be at global scope in GLSL (not inside main); and a `continue`/`return`
    past a `barrier()` in a loop is divergent-barrier UB — guard the reduce arm with `if` instead.
+8. **`half` is a reserved word in GLSL** — a local named `half` (the rope pair count, natural from
+   the CUDA source) fails to compile. Task 2.10 renamed it `nh`.
+9. **glslc's sin/cos/pow are NOT CUDA libdevice twins on RADV.** Measured on the BC-250
+   (Task 2.10, head_norm_rope): `v_sin_f32/v_cos_f32` carry ~2e-6 ABSOLUTE drift at moderate
+   angles and wrap badly past ~4e3 rad (0.43 rel at 1e6); hardware `pow` (v_log+v_exp) drifts
+   ~4e-6 rel at theta_scale^63. The honest port: pow the mantissa table host-side in the
+   launcher (one upload, cached), reduce angles with three-word Cody-Waite 2*pi + pi/2 fold,
+   and evaluate Taylor sin/cos in-kernel (coefficients rounded f32: truncation 1.8e-9 sin,
+   1.2e-8 cos at pi/4). One Newton step on a divide does NOT fix law 2's frcr error (measured
+   no movement at all) — go through double.

@@ -1,0 +1,134 @@
+// vulkan/src/poly/kernels/head_norm_rope.comp - the poly per-head RMS norm + NeoX rotary.
+//
+// Line-by-line translation of src/poly/kernels.cu's head_norm_rope_kernel (994-1022) with
+// block_sum (42-50) and WARP = 32:
+//   one workgroup per token-and-head (blockIdx.x = tok * heads + head), a thread strides
+//   dim values; HNR_THREADS IS the CUDA launcher's `dim >= 256 ? 256 : 128` (2445) - the
+//   strided ss loop's iteration partition is part of the fp contract, so the build
+//   compiles one .spv per size (glslc -DHNR_THREADS=128|256).
+//   ss += xr[i]*xr[i] strided, then the warp_sum xor chain 16..1 (offsets <= 16 never
+//   cross a 32-lane aligned block, so it is per-warp on a wave64 gfx1013 too), part[] in
+//   order, scale = 1.0 / sqrt(ss / float(dim) + eps)                (CUDA 1005).
+//   rope: half = n_rot / 2; pair i <-> i + half (NeoX, 1014); the angle is
+//   p * pow(theta_scale, float(j)) (1016), /freq[j] with freq (1017); out =
+//   x0*cos - x1*sin / x0*sin + x1*cos (1020), x0/x1 the normed pair (1018-1019); values
+//   past n_rot pass through normed only (1010-1012).  left-to-right products
+//   (x*scale)*w exactly as the CUDA source groups them.
+// fp32 contraction + transcendental caveat: glslc -O contracts (PORT-NOTES law 6, matching
+// the CUDA build), and glslc's pow/cos/sin take RADV's hardware approximations where CUDA
+// uses libdevice powf/cosf/sinf - the parity test's rel 1e-5 is the contract (swiglu/exp
+// precedent); bitwise is NOT expected for the rope arms, only for the pure-norm tail.
+// The i64 pos/at pair: read as two u32 words, low word first, kept in int32 range
+// (positions are sequence rows, far under 2^31; the float() the CUDA body applies lands on
+// the same value), so the kernel needs no shaderInt64.
+// Aux buffers: binding 3 carries the mrope `axes` (3 int32 a token), binding 5 the on-card
+// start position (the i64's two u32 words, low first), binding 4 `freq` (n_rot/2 floats).
+// Each is bound to X with a small dummy size when its arm is off - the launcher never
+// passes a null span.
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+layout(local_size_x = HNR_THREADS) in;
+
+layout(std430, binding = 0) readonly buffer X { float v[]; } bx;   // heads*rows heads, x_stride apart
+layout(std430, binding = 1) readonly buffer W { float v[]; } bw;   // dim weights; bound to X when null
+layout(std430, binding = 2) buffer Y { float v[]; } by;            // dim values a head
+layout(std430, binding = 3) readonly buffer AUX { int v[]; } ba;   // axes: 3 int32 a token (bound to X when null)
+layout(std430, binding = 4) readonly buffer FREQ { float v[]; } bf;// n_rot/2 inverse freqs (bound to X when null)
+layout(std430, binding = 5) readonly buffer AT { uint v[]; } bt;   // at: two u32 words of the i64 (bound to X when null)
+layout(std430, binding = 6) readonly buffer MANT { float v[]; } bm;// half entries: theta_scale^j, host pow'd
+
+layout(push_constant) uniform PC {
+    uint dim; uint x_stride; uint heads; uint n_rot;
+    uint theta_bits; uint eps_bits; uint pos_lo; uint pos_hi;
+    uint sections; uint has_w; uint has_axes; uint has_freq;
+    uint has_at; uint pad0; uint pad1; uint pad2;
+} pc;
+
+shared float part[HNR_THREADS / 32];
+
+void main() {
+    const uint blk = gl_WorkGroupID.x;          // one block per head and token (CUDA blockIdx.x)
+    const uint dim = pc.dim;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint base = blk * pc.x_stride;        // CUDA 1000: xr = x + blockIdx.x * x_stride
+    const float eps = uintBitsToFloat(pc.eps_bits);
+    const float theta_scale = uintBitsToFloat(pc.theta_bits);
+
+    // CUDA 1002-1005: the head's sum of squares over the block: blockDim.x/32 warps
+    // walked in index order (part[4] at 128, part[8] at 256 threads).
+    float ss = 0.0;
+    for (uint i = tid; i < dim; i += HNR_THREADS) {
+        const float v = bx.v[base + i];
+        ss += v * v;
+    }
+    for (uint o = 16u; o > 0u; o >>= 1u) ss += subgroupShuffleXor(ss, o);
+    if ((tid & 31u) == 0u) part[tid >> 5u] = ss;
+    barrier();
+    float s = 0.0;
+    for (uint k = 0u; k < HNR_THREADS / 32u; ++k) s += part[k];
+    barrier();
+    const float scale = 1.0 / sqrt(s / float(dim) + eps);
+
+    // CUDA 1006-1007: tok = blockIdx.x / heads; own = float((at ? *at : pos) + tok).
+    const uint tok = blk / pc.heads;
+    uint p_lo = pc.pos_lo;
+    if (pc.has_at != 0u) p_lo = bt.v[0u];       // the card's row when the launch runs
+    const float own = float(int(p_lo) + int(tok));
+
+    const uint nh = pc.n_rot / 2u;            // CUDA 1008
+    const uint ob = blk * dim;                  // CUDA 1001: yr = y + blockIdx.x * dim
+    for (uint i = tid; i < dim; i += HNR_THREADS) {
+        if (i >= pc.n_rot) {                    // CUDA 1010-1012: past the rotation, norm only
+            const float v = bx.v[base + i];
+            by.v[ob + i] = pc.has_w != 0u ? (v * scale) * bw.v[i] : v * scale;
+            continue;
+        }
+        // CUDA 1014-1020: NeoX pairing, i goes with i + half; pair j turns by the position.
+        const uint j = i < nh ? i : i - nh;
+        float p = own;
+        if (pc.has_axes != 0u)                  // mrope: pair j takes axis (j % sections) % 3
+            p = float(int(ba.v[tok * 3u + (j % pc.sections) % 3u]));
+        // The angle: CUDA 1016-1017 turn = p * powf(theta_scale, j), /freq[j]. RADV's hardware
+        // pow (v_log + v_exp) drifts ~4e-6 relative at j = 63 where CUDA's libdevice powf is
+        // 1 ulp, and that lands straight on sin/cos: the launcher therefore passes the exact
+        // table m[j] = (float) pow(double theta_scale, double j) (correctly rounded, AS GOOD AS
+        // CUDA's powf gets) in binding 6, and only the p * m and /freq roundings stay shared.
+        const float turn = p * bm.v[j];
+        // The freq division: glslc/RADV lowers f32 / to a v_frcr-based approximation (the
+        // `precise` qualifier changes nothing, and one Newton step did not move the measured
+        // error either), a few ulp off CUDA's RN divide — the freq arm's 1.2e-5. Do it through
+        // f64 (RADV's v_fdiv double path is exact, per quantize_q8_1.comp's precedent) and
+        // round once: that IS CUDA's turn / freq[j] result.
+        const float theta = pc.has_freq != 0u ? float(double(turn) / double(bf.v[j])) : turn;
+        // Argument reduction before the transcendental: glslc's sin/cos land on RADV's
+        // v_sin_f32/v_cos_f32, whose own reduction drifts ~2e-6 absolute and wraps badly past
+        // a few radians (measured 0.43 rel error at 1e6 rad on gfx1013, where CUDA's libdevice
+        // sinf/cosf reduce exactly). So: Cody-Waite against three words of 2*pi to land r in
+        // [-pi, pi], fold to [-pi/4, pi/4] against two words of pi/2, and evaluate the Taylor
+        // series the CUDA libdevice uses the same shape of (truncation sin 1.8e-9, cos 1.2e-8
+        // at pi/4; f32 evaluation ~2e-8 total). Coefficients are exact rationals rounded.
+        const float q = floor(theta * 0.15915494f + 0.5);   // 1/(2*pi), f32-rounded
+        // 2*pi = 6.28125 + 0.0019353072167 + 3.876e-10: q * each word stays exact for the
+        // tree's contexts (q < 700 at 4096 rows; exact to 2^18 either way).
+        const float r = ((theta - q * 6.28125) - q * 0.0019353072f) - q * 3.876e-10f;
+        const float q2 = floor(r * 0.63661975f + 0.5);      // r / (pi/2), rounded
+        // pi/2 = 1.5707964f - 4.3711388e-8: fold r to r2 in [-pi/4, pi/4].
+        const float r2 = (r - q2 * 1.5707964) + q2 * 4.3711388e-8f;
+        const int k = (int(q2) % 4 + 4) % 4;
+        const float u = r2 * r2;
+        const float sp = r2 * (1.0 + u * (-0.16666667 + u * (0.0083333333 + u * (-0.00019841270 + u * 2.7557319e-7))));
+        const float cp = 1.0 + u * (-0.5 + u * (0.041666667 + u * (-0.0013888889 + u * 2.4801587e-5)));
+        const float sa = k == 0 ? 0.0 : k == 1 ? 1.0 : k == 2 ? 0.0 : -1.0;   // sin(k*pi/2)
+        const float ca = k == 0 ? 1.0 : k == 1 ? 0.0 : k == 2 ? -1.0 : 0.0;   // cos(k*pi/2)
+        const float cs = ca * cp - sa * sp;
+        const float sn = sa * cp + ca * sp;
+        // CUDA 1018-1019 group (xr[j] * scale) * w[j] left-to-right; the unweighted arm is
+        // xr[j] * scale alone, so keep both parentheses.
+        const float x0 = pc.has_w != 0u ? (bx.v[base + j] * scale) * bw.v[j] : bx.v[base + j] * scale;
+        const float x1 = pc.has_w != 0u ? (bx.v[base + j + nh] * scale) * bw.v[j + nh]
+                                        : bx.v[base + j + nh] * scale;
+        by.v[ob + i] = i < nh ? x0 * cs - x1 * sn : x0 * sn + x1 * cs;
+    }
+}

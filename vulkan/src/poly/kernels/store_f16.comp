@@ -1,0 +1,42 @@
+// store_f16 in Vulkan GLSL: RADV's packHalf2x16 TRUNCATES (PORT-NOTES law 1), so the f16
+// pairs are built from f16_rn_bits (the same helper quantize_q8_1.comp proves byte-exact
+// against CUDA's __float2half) and written as u32 words: word i holds values 2i (low) and
+// 2i+1 (high), matching the little-endian half* layout the CUDA body writes (516-519).
+// The launcher offsets the cache by pos * n/2 words; a half at an odd element offset is
+// impossible to word-address and this backend throws rather than fake it (n is a row width
+// the model always keeps even; q8_0 rows are multiples of 32).
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer X { float v[]; } bx;   // 2*n_words floats (odd tail padded by the bound)
+layout(std430, binding = 1) buffer D { uint v[]; } bd;             // n_words f16 pairs
+
+layout(push_constant) uniform PC { uint words; } pc;
+
+uint f16_rn_bits(float f) {
+    const uint b = floatBitsToUint(f);
+    const uint sign = (b >> 16u) & 0x8000u;
+    int exp = int((b >> 23u) & 0xFFu) - 127 + 15;
+    uint man = b & 0x7FFFFFu;
+    if (exp >= 31) return sign | 0x7C00u;                 // overflow -> infinity
+    if (exp <= 0) {                                       // subnormal/underflow: shift-and-round
+        man |= 0x800000u;
+        const uint sh = uint(1 - exp) + 13u;
+        uint h = (sh >= 32u) ? 0u : (man >> sh);
+        const uint rem = (sh >= 32u) ? 0u : (man & ((1u << sh) - 1u));
+        if (sh < 32u && (rem > (1u << (sh - 1u)) || (rem == (1u << (sh - 1u)) && (h & 1u) != 0u))) h++;
+        return sign | h;
+    }
+    uint hman = man >> 13u; uint rem = man & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (hman & 1u) != 0u)) { hman++; if (hman == 0x400u) { hman = 0u; exp++; if (exp >= 31) return sign | 0x7C00u; } }
+    return sign | (uint(exp) << 10u) | hman;
+}
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.words) return;
+    const uint lo = f16_rn_bits(bx.v[2u * i]);
+    const uint hi = f16_rn_bits(bx.v[2u * i + 1u]);        // the launcher pads the odd tail
+    bd.v[i] = lo | (hi << 16u);
+}
