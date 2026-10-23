@@ -217,7 +217,7 @@ Re-run with `STRATA_VK_STUBS=log` enumerates the rest of the qwen35moe decode pa
 | 16 | `strata::poly::attend` | poly: attn_score/softmax/value/… kernels — **PORTED (Task 2.11)** |
 | 17 | `strata::kernels::native_mmvq` type 23 (IQ4_XS) | native_mmvq family — **PORTED (Task 2.12)** |
 | 18 | `strata::kernels::native_mmvq` type 8 (Q8_0) | native_mmvq family — **PORTED (Task 2.13)** |
-| 19 | `strata::kernels::native_mmvq` type 22 (IQ4_XXS) | native_mmvq family — the run's CURRENT halt |
+| 19 | `strata::kernels::native_mmvq` type 22 (IQ2_S) | native_mmvq family — the run's CURRENT halt |
 
 (The log arm returns untouched outputs, so entries after #1 are the path's *shape*, not a
 guaranteed per-token sequence; the first trap, `copy2`, is exact — the default arm stops there.)
@@ -431,7 +431,7 @@ the decode walked past all IQ-type mmvq legs and stopped at
 Q8_0 mmvq, the down-expert format of this UD-IQ2_XXS quant; vec_dot_q8_0_q8_1 in
 native_mmvq.cu is the shape to port — integer dot, 32-elem blocks, no SIMD emu needed).
 
-**Halt point after Task 2.13 (2026-10-23):** `strata::kernels::native_mmvq` **type 22 (IQ4_XXS)** —
+**Halt point after Task 2.13 (2026-10-23):** `strata::kernels::native_mmvq` **type 22 (IQ2_S)** —
 demand #18 cleared: Q8_0 (type 8) is PORTED bitwise. mmvq_q8_0.comp transcribes
 small_mmvq<Q80Block, 8> (native_mmvq.cu:2118-2145): 32-elem blocks, small-K pick nb=n_in/32 < 32
 (ROWS=4/grid ceil(n_out/4) vs ROWS=1/grid n_out, the rows push constant), Qi=8 partition
@@ -445,5 +445,5 @@ dm and (float)sumi are both exact, so only the adds' rounding order separates th
 gate: load 31.3 s, 10496/10496 experts in VRAM, the decode walked past every type-8 leg (trace
 mmvq8 hits incl. n_in 512 -> rows=4 arm) and stopped at
 `strata-vk: strata::kernels::native_mmvq type 22 has no Vulkan implementation yet` (demand #19 —
-IQ4_XXS mmvq, iq_kernels.cu's mmvq_kernel<22> path; the iq3_xxs/iq4_xs templates are the proven
+IQ2_S mmvq, iq_kernels.cu's mmvq_kernel<22> path; the iq3_xxs/iq4_xs templates are the proven
 shapes to extend).
