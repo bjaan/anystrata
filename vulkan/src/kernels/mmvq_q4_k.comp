@@ -1,0 +1,149 @@
+// vulkan/src/kernels/mmvq_q4_k.comp - native_mmvq for ggml_type 12 (Q4_K).
+//
+// Line-by-line translation of src/kernels/cuda/native_mmvq.cu's native_q4_k_mmvq (2915-2940):
+// the ncols == 1 path is native_q4_k_mmvq_kernel<SmallK> (:731-672+759-672). blocks_per_row =
+// n_in/256 (QK/Q8K leg identical to q5_k):
+//   >= 8  -> SmallK=false: grid n_out, ROWS=1, one row per workgroup (the model's n_in=2048).
+//   <  8  -> SmallK=true:  grid ceil(n_out/4), ROWS=4 (4 subrows x 32 lanes per workgroup).
+// The wrapper pick (:2933) is n_in/256 < WARPS*WARP/16 (= 8): the same threshold and the same
+// partition as q5_k (VDR=2, QI=16, BLOCKS_PER_ITER=8, kqs = 2*(tid%16)). `rows` is the 4th push
+// constant; both partitions and both reductions are transcribed exactly. launch_multi<Q4KTraits>
+// (ncols>1) is pinned BITWISE-equal per column to the ncols=1 kernel (native_mmvq.cu:975-980), so
+// the c loop below answers every ncols the way the CUDA multi kernel does.
+//
+// The dot is q4_q8_dot (694-727) + q4_q8_dot_impl (675-692) verbatim: same word indices, same
+// scale-decode masks, same i order, same fp accumulation. Q4KBlock is 144 B = 36 uint words,
+// 4-aligned (static_asserts :139-140: dm@0, scales@4, qs@16), so every int load the CUDA code
+// performs lands on a word boundary - direct bw.v[] indexing (same as the 176 B q5_k sibling).
+// Q4_K is the q5_k family minus the qh plane: 4-bit codes only, the super-block carries dm
+// (d,dmin half2) and the 6-bit-scale/4-bit-min scales[12] decode is IDENTICAL (aux masks 0x3f3f/
+// 0xc0c0>>2, s4 >>0 / >>4 & 0x0f0f, hi-masking) - the vmmq expression is transcribed line-for-line.
+//
+// CUDA index translation (bytes -> words): qs@16: ql = (int*)(qs + 16*boff + 4*col) -> word
+// 4 + 4*boff + col; ql[0]/ql[4] are +0/+4 words. scales@4 as uint16[6]: scales[jm]/[jm+2]/[jm+4]
+// -> words 1/2/3, half 16*(jm&1). q8: (int*)bq8i->qs + col -> word 1 + col of the block;
+// q8[0]/q8[4] -> +0/+4. block_q8_1 is 36 B = 9 words (word 0 = ds, words 1..8 = qs).
+//
+// STRATA_DP4A -> the same 4-lane scalar emulation as mmvq_q5_k.comp (gfx1013 has no dp4a and the
+// shipped glslc rejects dotKHR, PORT-NOTES). Unlike q5_k there is no vh plane: v[0]/v[1] are used
+// raw through the 0x0f0f0f0f masks.
+//
+// Contraction law (PORT-NOTES "RADV arithmetic gotchas" #6): the CUDA native_mmvq.cu builds with
+// --use_fast_math and no -ffp-contract=off, so the tree's exact dot semantics are FUSED: sumf
+// accumulates via fma(d8, dot*sc, sumf) and the final `dm4f.x*sumf_d - dm4f.y*sumf_m` returns as
+// fma(-dm_y, sumf_m, dm_x*sumf_d). glslc keeps OpFMul+OpFAdd (default permits contraction) and
+// RADV's NIR fuses to exactly that; the parity test's host reference spells std::fma in the same
+// order (the q5_k lineage's verified fusion, mirrors the same order here).
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer W    { uint  v[]; } bw;   // Q4_K blocks, 36 words each
+layout(std430, binding = 1) readonly buffer X    { uint  v[]; } bx;   // q8_1 columns, 9 words/block
+layout(std430, binding = 2)           buffer Y    { float v[]; } by;   // ncols * n_out floats
+
+layout(push_constant) uniform PC { uint n_in; uint n_out; uint ncols; uint rows; } pc;
+
+int sbyte(uint a, uint i) {
+    const uint b = (a >> (8u * i)) & 255u;
+    return b >= 128u ? int(b) - 256 : int(b);
+}
+int dp4a(int a, int b, int c) {
+    for (uint i = 0u; i < 4u; ++i) c += sbyte(uint(a), i) * sbyte(uint(b), i);
+    return c;
+}
+
+// q4_q8_dot(bq4 = block at word b, bq8 = x column at word base xw, iqs), load/apply folded back
+// into the original single-call order.
+float q4_k_dot(uint b, uint xw, uint iqs) {
+    const uint boff = 2u * ((iqs / 2u) / 4u);        // bq8_offset
+    const uint col  = (iqs / 2u) % 4u;
+    const uint qsw  = b + 4u + 4u * boff + col;      // ql = int* at qs + 16*boff + 4*col bytes
+    const int vl0 = int(bw.v[qsw]);
+    const int vl1 = int(bw.v[qsw + 4u]);             // ql[4]
+    const uint j  = boff / 2u;
+    const uint sh = 16u * (j & 1u);                  // jm = j & 1 selects the half of words 1..3
+    const uint s0 = (bw.v[b + 1u] >> sh) & 0xFFFFu;
+    const uint s2 = (bw.v[b + 2u] >> sh) & 0xFFFFu;
+    const uint s4 = (bw.v[b + 3u] >> sh) & 0xFFFFu;
+    const uint hi = (j >= 2u) ? 0xFFFFFFFFu : 0u;    // uint32_t(-int32_t(j >= 2))
+    const uint aux0 = ((s0 & 0x3f3fu) & ~hi) |
+                      ((((s4 >> 0u) & 0x0f0fu) | ((s0 & 0xc0c0u) >> 2u)) & hi);
+    const uint aux1 = ((s2 & 0x3f3fu) & ~hi) |
+                      ((((s4 >> 4u) & 0x0f0fu) | ((s2 & 0xc0c0u) >> 2u)) & hi);
+    // aux is uint16_t aux[2]; sc = (const uint8_t*)aux little-endian: sc[0]=aux0 low, sc[1]=aux0 high,
+    // m = sc + 2: m[0]=aux1 low, m[1]=aux1 high.
+    const uint sc0 = aux0 & 0xFFu,        sc1 = (aux0 >> 8u) & 0xFFu;
+    const uint m0  = aux1 & 0xFFu,        m1  = (aux1 >> 8u) & 0xFFu;
+    float sumf_d = 0.0;
+    float sumf_m = 0.0;
+    for (uint i = 0u; i < 2u; ++i) {
+        const int v0i = (vl0 >> int(4u * i)) & 0x0f0f0f0f;
+        const int v1i = (vl1 >> int(4u * i)) & 0x0f0f0f0f;
+        // bq8i = bq8 + boff + i: word base xw + (boff + i)*9; u = (int*)qs + col -> +1+col, +5+col
+        const uint xb = xw + (boff + i) * 9u;
+        const int u0 = int(bx.v[xb +  1u + col]);
+        const int u1 = int(bx.v[xb +  5u + col]);
+        const int dot1 = dp4a(v0i, u0, dp4a(v1i, u1, 0));
+        const int dot2 = dp4a(0x01010101, u0, dp4a(0x01010101, u1, 0));
+        const float d8 = unpackHalf2x16(bx.v[xb]).x; // __low2float(bq8i->ds)
+        sumf_d += d8 * float(dot1 * int(i == 0u ? sc0 : sc1));   // contraction(on): -> fma
+        sumf_m += d8 * float(dot2 * int(i == 0u ? m0  : m1));
+    }
+    const vec2 dm4f = unpackHalf2x16(bw.v[b]);       // __half22float2(bq4->dm)
+    return dm4f.x * sumf_d - dm4f.y * sumf_m;
+}
+
+// double-buffered across columns (max 8) so each c's reduction reads only its own writes
+shared float sh[8][4][4][32];
+
+void main() {
+    const uint tid    = gl_LocalInvocationID.x;      // CUDA tid = 32*threadIdx.y + threadIdx.x
+    const uint lane   = tid & 31u;
+    const uint subrow = tid >> 5u;                   // threadIdx.y
+    const uint nb     = pc.n_in / 256u;              // blocks_per_row
+    const uint row0   = (pc.rows == 4u) ? gl_WorkGroupID.x * 4u : gl_WorkGroupID.x;
+    const uint kqs    = 2u * (tid % 16u);            // VDR * (tid % (QI/VDR))
+    const uint maxc   = min(pc.ncols, 8u);
+    for (uint c = 0u; c < maxc; ++c) {
+        float t0 = 0.0, t1 = 0.0, t2 = 0.0, t3 = 0.0;
+        const uint xc = c * (nb * 8u) * 9u;          // column c's x base (words)
+        for (uint kbx = tid / 16u; kbx < nb; kbx += 8u) {   // BLOCKS_PER_ITER = VDR*WARPS*WARP/QI
+            const uint xb = xc + kbx * 8u * 9u;      // kby = kbx * QK/Q8K q8 blocks
+            const uint wb = kbx * 36u;
+            // inner `for (i = 0; i < ROWS; ++i)` in the same order; the row guard keeps the
+            // partial-row-group read in-bounds exactly like the CUDA source's comment.
+            if (pc.rows == 1u) {
+                t0 += q4_k_dot(row0 * nb * 36u + wb, xb, kqs);
+            } else {
+                if (row0 + 0u < pc.n_out) t0 += q4_k_dot((row0 + 0u) * nb * 36u + wb, xb, kqs);
+                if (row0 + 1u < pc.n_out) t1 += q4_k_dot((row0 + 1u) * nb * 36u + wb, xb, kqs);
+                if (row0 + 2u < pc.n_out) t2 += q4_k_dot((row0 + 2u) * nb * 36u + wb, xb, kqs);
+                if (row0 + 3u < pc.n_out) t3 += q4_k_dot((row0 + 3u) * nb * 36u + wb, xb, kqs);
+            }
+        }
+        sh[c][subrow][0u][lane] = t0;
+        if (pc.rows == 4u) {           // ROWS=1: CUDA partial[..][i>0] is never written; keep the
+            sh[c][subrow][1u][lane] = t1;   // slots untouched (zero) so the sum stays exact.
+            sh[c][subrow][2u][lane] = t2;
+            sh[c][subrow][3u][lane] = t3;
+        }
+        groupMemoryBarrier(); barrier();
+        // CUDA: warp 0 only (threadIdx.y > 0 returned) sums tmp + partial[l] l = 0..WARPS-2
+        // ascending = sh[0]+sh[1]+sh[2]+sh[3] (all 4 SUBROWS, whatever ROWS is: for rows==1 the
+        // other three subrows hold the same row's t0 partials).
+        if (subrow == 0u) {
+            for (uint i = 0u; i < pc.rows; ++i) {
+                float acc = sh[c][0u][i][lane];
+                acc = acc + sh[c][1u][i][lane];
+                acc = acc + sh[c][2u][i][lane];
+                acc = acc + sh[c][3u][i][lane];
+                for (uint o = 16u; o > 0u; o >>= 1u) acc += subgroupShuffleXor(acc, o);   // warp_sum tree
+                if (lane == i && row0 + i < pc.n_out) by.v[c * pc.n_out + row0 + i] = acc;
+            }
+        }
+        groupMemoryBarrier(); barrier();             // next c must not race this c's reads
+    }
+}

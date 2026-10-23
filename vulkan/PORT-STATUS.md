@@ -218,7 +218,7 @@ Re-run with `STRATA_VK_STUBS=log` enumerates the rest of the qwen35moe decode pa
 | 17 | `strata::kernels::native_mmvq` type 23 (IQ4_XS) | native_mmvq family — **PORTED (Task 2.12)** |
 | 18 | `strata::kernels::native_mmvq` type 8 (Q8_0) | native_mmvq family — **PORTED (Task 2.13)** |
 | 19 | `strata::kernels::native_mmvq` type 22 (IQ2_S) | native_mmvq family — **PORTED (Task 2.14)** |
-| 20 | `strata::kernels::native_mmvq` type 12 (Q4_K) | native_mmvq family — the run's CURRENT halt |
+| 20 | `strata::kernels::native_mmvq` type 12 (Q4_K) | native_mmvq family — **PORTED (Task 2.15)** |
 
 (The log arm returns untouched outputs, so entries after #1 are the path's *shape*, not a
 guaranteed per-token sequence; the first trap, `copy2`, is exact — the default arm stops there.)
@@ -464,3 +464,22 @@ load 35.0 s, 10496/10496 experts in VRAM, the decode walked 8 type-22 legs (trac
 stopped at `strata-vk: strata::kernels::native_mmvq type 12 has no Vulkan implementation yet`
 (demand #20 — Q4_K mmvq, native_q4_k_mmvq in native_mmvq.cu: the Fmt<12> geometry is
 {qk 256, ipb QI4_K/VDR, step VDR} — super-block scale decode, no grid table).
+
+**Halt point after Task 2.15 (2026-10-23): FIRST TOKEN — no halt.** Demand #20 cleared: Q4_K
+(type 12) is PORTED bitwise. mmvq_q4_k.comp clones the q5_k template — Q4KBlock is the 144 B =
+36-word sibling (static_asserts native_mmvq.cu:139-140: dm half2 @0, scales[12] @4, qs[128] @16,
+4-aligned, direct word indexing), q4_q8_dot/q4_q8_dot_impl (675-727) verbatim: the SAME 6-bit
+scale + 4-bit min aux decode (0x3f3f/0xc0c0>>2, s4 >>0 / >>4 & 0x0f0f, hi-masking, sc/m = aux
+byte split) and the same DP4A pair structure, minus the qh plane (v masked straight through
+0x0f0f0f0f). Wrapper pick (:2933) n_in/256 < WARPS*WARP/16 = 8 -> ROWS=4 grid ceil(n_out/4),
+else ROWS=1 grid n_out — identical to q5_k (VDR=2, QI=16, BPI=8, kqs = 2*(tid%16)); rows is the
+4th push constant. Contraction mirrors the q5_k lineage (fused fma sumf arms + final
+fma(-dm_y, sumf_m, dm_x*sumf_d)) — matched BITWISE first try, no probe needed. Parity: 7 q4_k
+shapes (2048x64 c1, 2048x768 c1/c3, 768x64 c2, 768x3 c1, 256x3 c2, 256x768 c1) — full suite now
+24522/24522 outputs, 0 differ; ctest 13/13. slots stays types 16/13/14 (the unported-type-12
+slots arm in the parity test unchanged). Model gate (fresh binary): load 31.5 s, 10496/10496
+experts in VRAM, prompt 2.4 tok/s, **generated 1 token (first token emitted — the whole mmvq
+family the model routes is now ported)**; the run exits clean with no `has no Vulkan
+implementation yet` line. Candidates for the NEXT halt (deeper/multi-token runs): mmvq types 11
+(Q3_K)/10 (Q2_K)/7 (IQ1_S) if a tensor uses them, native_mmvq_slots beyond 16/13/14, or the
+sampler batch route (row_norm/softcap/moe_sum/permute_groups).

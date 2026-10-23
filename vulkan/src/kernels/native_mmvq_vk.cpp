@@ -53,6 +53,7 @@ namespace {
 #include "mmvq_iq4_xs.spv.h"        // mmvq_iq4_xs.comp (Task 2.12, type 23 IQ4_XS)
 #include "mmvq_q8_0.spv.h"          // mmvq_q8_0.comp (Task 2.13, type 8 Q8_0)
 #include "mmvq_iq2_s.spv.h"         // mmvq_iq2_s.comp (Task 2.14, type 22 IQ2_S)
+#include "mmvq_q4_k.spv.h"          // mmvq_q4_k.comp (Task 2.15, type 12 Q4_K)
 
 constexpr int IQ_BLOCK_ELEMS = 256;
 using vk::kIq2xxsGrid;   // the grid table header (namespace strata::vk)
@@ -63,6 +64,7 @@ constexpr int IQ2S_BLOCK_BYTES = 82; // block_iq2_s (half d + qs[64] + qh[8] + s
 constexpr int IQ3_BLOCK_BYTES = 98;  // block_iq3_xxs (half d + uint8 qs[96])
 constexpr int IQ4XS_BLOCK_BYTES = 146;  // block_iq4_xs (half d + uint16 scales_h + uint8 scales_l[4] + uint8 qs[128])
 constexpr int Q5K_BLOCK_BYTES = 176; // Q5KBlock (native_mmvq.cu:129)
+constexpr int Q4K_BLOCK_BYTES = 144; // Q4KBlock (native_mmvq.cu:139: dm + scales[12] + qs[128])
 constexpr int Q6K_BLOCK_BYTES = 210; // Q6KBlock (native_mmvq.cu:96: ql[128]+qh[64]+scales[16]+d)
 constexpr int Q8_BLOCK_BYTES = 36;   // block_q8_1
 constexpr int Q80_BLOCK_BYTES = 34;  // Q80Block (native_mmvq.cu:149: half d + int8 qs[32], align 2)
@@ -120,7 +122,7 @@ uint64_t grid_iq2s_buffer() {
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream) {
     if (ggml_type != 16 && ggml_type != 18 && ggml_type != 23 && ggml_type != 22 && ggml_type != 13 && ggml_type != 14 &&
-        ggml_type != 8) {
+        ggml_type != 8 && ggml_type != 12) {
         // the CUDA wrapper would throw/exit here too — name the type instead (never compute with a
         // wrong decoder); shape is not validated for a type this port does not run.
         const std::string name = "strata::kernels::native_mmvq type " + std::to_string(ggml_type);
@@ -141,6 +143,8 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
         std::fprintf(stderr, "mmvq8 n_in %d n_out %d ncols %d\n", n_in, n_out, ncols);
     if (std::getenv("STRATA_VK_TRACE_MMVQ22") && ggml_type == 22)
         std::fprintf(stderr, "mmvq22 n_in %d n_out %d ncols %d\n", n_in, n_out, ncols);
+    if (std::getenv("STRATA_VK_TRACE_MMVQ12") && ggml_type == 12)
+        std::fprintf(stderr, "mmvq12 n_in %d n_out %d ncols %d\n", n_in, n_out, ncols);
     if (ggml_type == 8) {
         // small_mmvq<Q80Block, 8> (native_mmvq.cu:2118-2145): 32-element blocks; SmallK when
         // n_in/32 < 2*WARPS*WARP/Qi (= 32) -> ROWS=4 grid ceil(n_out/4), else ROWS=1 grid n_out.
@@ -181,6 +185,20 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
         // SmallK: n_in/QK < BLOCKS_PER_ITER (WARPS*WARP/32 = 4, VDR=1) -> ROWS=4; else ROWS=1
         // (native_mmvq.cu:2974-2978)
         const uint32_t rows = (nb < 4u) ? 4u : 1u;
+        const uint32_t pc[4] = {(uint32_t)n_in, (uint32_t)n_out, (uint32_t)ncols, rows};
+        vk::kernel_launch_sized(k, rows == 4u ? int((n_out + 3) / 4) : n_out, bufs, sizes, 3, pc);
+    } else if (ggml_type == 12) {  // Q4_K: 144 B blocks = 36 words (mmvq_q4_k.comp, Task 2.15)
+        static const vk::Kernel k = vk::kernel_load(
+            "native_mmvq_q4_k", mmvq_q4_k_spv, mmvq_q4_k_spv_len,
+            /*storage buffers*/ 3, /*push bytes*/ 16, /*workgroup*/ THREADS,
+            /*force 32-wide subgroups*/ true);
+        const uint64_t w_sz = uint64_t(n_out) * nb * Q4K_BLOCK_BYTES;
+        const uint64_t bufs[3] = {strata_vk_compat::off(weights), strata_vk_compat::off(x_q8_1),
+                                  strata_vk_compat::off(y)};
+        const uint64_t sizes[3] = {w_sz, x_sz, y_sz};
+        // SmallK: n_in/QK < WARPS*WARP/16 = 8 (native_mmvq.cu:2933) -> ROWS=4; else ROWS=1 —
+        // the identical pick to q5_k (same VDR=2, QI=16, BLOCKS_PER_ITER=8 partition).
+        const uint32_t rows = (nb < 8u) ? 4u : 1u;
         const uint32_t pc[4] = {(uint32_t)n_in, (uint32_t)n_out, (uint32_t)ncols, rows};
         vk::kernel_launch_sized(k, rows == 4u ? int((n_out + 3) / 4) : n_out, bufs, sizes, 3, pc);
     } else if (ggml_type == 16) {
