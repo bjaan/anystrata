@@ -219,6 +219,7 @@ Re-run with `STRATA_VK_STUBS=log` enumerates the rest of the qwen35moe decode pa
 | 18 | `strata::kernels::native_mmvq` type 8 (Q8_0) | native_mmvq family — **PORTED (Task 2.13)** |
 | 19 | `strata::kernels::native_mmvq` type 22 (IQ2_S) | native_mmvq family — **PORTED (Task 2.14)** |
 | 20 | `strata::kernels::native_mmvq` type 12 (Q4_K) | native_mmvq family — **PORTED (Task 2.15)** |
+| 21 | `strata::poly::gemv_bf16` | poly: gemv_kernel<uint16_t> — **PORTED (Task 2.16)** |
 
 (The log arm returns untouched outputs, so entries after #1 are the path's *shape*, not a
 guaranteed per-token sequence; the first trap, `copy2`, is exact — the default arm stops there.)
@@ -483,3 +484,20 @@ family the model routes is now ported)**; the run exits clean with no `has no Vu
 implementation yet` line. Candidates for the NEXT halt (deeper/multi-token runs): mmvq types 11
 (Q3_K)/10 (Q2_K)/7 (IQ1_S) if a tensor uses them, native_mmvq_slots beyond 16/13/14, or the
 sampler batch route (row_norm/softcap/moe_sum/permute_groups).
+
+**Halt point after Task 2.16 (2026-10-23):** `strata::kernels::native_mmvq` **type 10 (Q2_K)** —
+demand #21 cleared: the 18-token prompt run's `gemv_bf16 has no Vulkan implementation yet` is gone
+and the prefill advances to the mmvq family's Q2_K leg (the candidate list's type 10, now
+measured). gemv_bf16 as gemv_bf16.comp — the f32 gemv.comp's line-for-line twin with the CUDA
+ldw(uint16_t) (kernels.cu:72, `__uint_as_float(w[i] << 16)`) swap: the w buffer binds as uint[]
+(two bf16 LE per word; even j takes word<<16, odd j word & 0xFFFF0000 — exactly the shift either
+way), and bf16->f32 is an EXACT widening, so the partition/warp-sum contract is the f32 one's,
+unchanged. Same five -DGEMV_THREADS variants (32..1024: the thread pick lives in the shared CUDA
+gemv<> wrapper); gemv_bf16_vk.cpp mirrors gemv_vk.cpp (w span = n_out*n_in*2). Parity
+(poly_kernels_vk_parity, +6 cases incl. odd-n_in word-straddle shapes 100 and 257): weights encoded
+with the tree's bf16_from_f32 (bf16_bits.hpp:37 RNE, transcribed host-side) and the reference
+decodes with the exact <<16 shift — **BITWISE 0.000e+00 on all six shapes** (the device does not
+contract `acc += w*x` here, same as f32 gemv). gen_poly_stubs.py PORTED += gemv_bf16, regen: 34
+traps. ctest 13/13. Model gate: load 33.8 s, 10496/10496 experts, halt moved from poly gemv_bf16
+to `native_mmvq type 10` (Q2_K; native_mmvq.cu's Q2_K mmvq is the next shape to port — the
+K-quants' super-block scale decode, the q4_k template's closest sibling).

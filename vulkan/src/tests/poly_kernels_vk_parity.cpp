@@ -266,6 +266,88 @@ int main() {
         }
     }
 
+    // ---- gemv_bf16 (Task 2.16): the bf16-weight twin. Host weights are encoded with the tree's
+    //      bf16_from_f32 (bf16_bits.hpp:37 round-to-nearest-even) and the reference decodes with
+    //      f32_from_bf16's exact shift (bf16_bits.hpp:50) — the same pair the .comp's word-pick +
+    //      uintBitsToFloat(bits<<16) mirrors for ldw (CUDA kernels.cu:72). The partition is the
+    //      f32 gemv's, so the sum inherits its bitwise behaviour; the rel 1e-5 bound is kept as
+    //      the family gate. Same shapes as the f32 block.
+    {
+        auto ref_gemv_bf16 = [](const std::vector<uint16_t>& w, const std::vector<float>& x,
+                                std::vector<float>& y, int n_in, int n_out, int rows_per_x, int rows,
+                                int threads) {
+            const int part = (threads + 31) / 32;
+            for (int o = 0; o < n_out; ++o)
+                for (int tok = 0; tok < rows; ++tok) {
+                    const size_t wr = (size_t)o * n_in;
+                    const size_t xr = ((size_t)tok * (n_out / rows_per_x) + o / rows_per_x) * n_in;
+                    std::vector<float> tacc(threads, 0.f);
+                    for (int i = 0; i < n_in; ++i) {
+                        // f32_from_bf16: exact (uint32)h << 16 reinterpreted
+                        uint32_t b = (uint32_t)w[wr + i] << 16; float wf;
+                        std::memcpy(&wf, &b, 4);
+                        tacc[i % threads] += wf * x[xr + i];
+                    }
+                    std::vector<float> ws(part, 0.f);
+                    for (int p = 0; p < part; ++p) {
+                        float l[32];
+                        for (int j = 0; j < 32; ++j) l[j] = (size_t)p * 32 + j < (size_t)threads ? tacc[p * 32 + j] : 0.f;
+                        for (int off = 16; off > 0; off >>= 1) {
+                            float pr[32]; for (int j = 0; j < 32; ++j) pr[j] = l[j];
+                            for (int j = 0; j < 32; ++j) l[j] = l[j] + pr[j ^ off];
+                        }
+                        ws[p] = l[0];
+                    }
+                    float s = 0.f;
+                    for (int p = 0; p < part; ++p) s += ws[p];
+                    y[(size_t)tok * n_out + o] = s;
+                }
+        };
+        // bf16_from_f32 (bf16_bits.hpp:37) transcribed: NaN quieting not exercised (uniform finite).
+        auto bf16_enc = [](float f) {
+            uint32_t i; std::memcpy(&i, &f, 4);
+            if ((i & 0x7FFFFFFFu) > 0x7F800000u) return (uint16_t)((i >> 16) | 64u);
+            i = (i + ((i >> 16) & 1u) + 0x7FFFu) & 0xFFFF0000u;
+            return (uint16_t)(i >> 16);
+        };
+        struct Case { int n_in, n_out, rows_per_x, rows; };
+        const Case cases[] = {
+            {2048, 8192, 8192, 1},      // the model's dense projection shape (512 threads)
+            {2048, 2048, 512, 2},       // rows_per_x grouping
+            {4096, 128, 128, 1},        // 1024-thread variant
+            {1000, 64, 64, 1},          // 256-thread variant
+            {100, 32, 32, 3},           // narrow-input arm: threads 32 (odd n_in: word-crossing)
+            {257, 16, 16, 1},           // odd n_in at 128 threads: a row's bf16s straddle words
+        };
+        std::mt19937 rng(131);
+        std::uniform_real_distribution<float> u(-2.f, 2.f);
+        for (const auto& c : cases) {
+            const int threads = c.n_in >= 128 ? poly::sum_threads(c.n_in) : 32;
+            std::vector<float> xf((size_t)c.rows * (c.n_out / c.rows_per_x) * c.n_in);
+            for (auto& v : xf) v = u(rng);
+            std::vector<uint16_t> w((size_t)c.n_out * c.n_in);
+            for (auto& v : w) v = bf16_enc(u(rng));
+            std::vector<float> y((size_t)c.rows * c.n_out, 0.f), ref(y.size());
+            const size_t wbytes = w.size() * 2;
+            const uint64_t aw = a.alloc(wbytes), ax = a.alloc(xf.size() * 4), ay = a.alloc(y.size() * 4);
+            vk::copy_h2d((void*)aw, w.data(), wbytes, nullptr);
+            vk::copy_h2d((void*)ax, xf.data(), xf.size() * 4, nullptr);
+            poly::gemv_bf16((const uint16_t*)strata_vk_compat::wrap(aw), (const float*)strata_vk_compat::wrap(ax),
+                            (float*)strata_vk_compat::wrap(ay), c.n_in, c.n_out, c.rows_per_x, c.rows, nullptr);
+            vk::copy_d2h(y.data(), (void*)ay, y.size() * 4, nullptr);
+            ref_gemv_bf16(w, xf, ref, c.n_in, c.n_out, c.rows_per_x, c.rows, threads);
+            double worst = 0.0; int bit = 1;
+            for (size_t i = 0; i < y.size(); ++i) {
+                if (std::memcmp(&y[i], &ref[i], 4) != 0) bit = 0;
+                worst = std::fmax(worst, std::fabs((double)y[i] - ref[i]) / std::fmax(1e-3, std::fabs((double)ref[i])));
+            }
+            std::printf("  gemv_bf16 n_in=%d n_out=%d rpx=%d rows=%d thr=%d: worst rel %.3e, bitwise %s\n",
+                        c.n_in, c.n_out, c.rows_per_x, c.rows, threads, worst, bit ? "yes" : "no");
+            check(bit == 1, "gemv_bf16 bitwise vs the f32_from_bf16 partition reference");
+            check(worst < 1e-5, "gemv_bf16 rel 1e-5 (gemv-family tol)");
+        }
+    }
+
     // ---- conv4_silu (Task 2.4): elementwise 4-tap window + SiLU, no reductions: the CUDA arms
     //      (rows>=16 no-snap -> rows+state kernels; else the token walk, with snapshots) are
     //      independent of partition for the SUM (same left-to-right term order in every arm), so

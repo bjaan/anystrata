@@ -25,7 +25,6 @@ namespace strata::poly { void dsv4_state(const float * p0, const float * p1, con
 namespace strata::poly { void geglu(const float * p0, const float * p1, float * p2, int p3, void * p4) { strata::vk_engine::missing("strata::poly::geglu"); } }
 namespace strata::poly { void geglu_rows(const float * p0, float * p1, int p2, int p3, void * p4) { strata::vk_engine::missing("strata::poly::geglu_rows"); } }
 namespace strata::poly { void gemm_f32(void * p0, const float * p1, const float * p2, float * p3, int p4, int p5, int p6, int p7) { strata::vk_engine::missing("strata::poly::gemm_f32"); } }
-namespace strata::poly { void gemv_bf16(const uint16_t * p0, const float * p1, float * p2, int p3, int p4, int p5, int p6, void * p7) { strata::vk_engine::missing("strata::poly::gemv_bf16"); } }
 namespace strata::poly { void hc_head(const float * p0, const float * p1, const float * p2, const float * p3, float * p4, float * p5, int p6, int p7, float p8, float p9, void * p10) { strata::vk_engine::missing("strata::poly::hc_head"); } }
 namespace strata::poly { void hc_mean(const float * p0, float * p1, int p2, int p3, void * p4) { strata::vk_engine::missing("strata::poly::hc_mean"); } }
 namespace strata::poly { void hc_post(const float * p0, const float * p1, float * p2, int p3, int p4, void * p5) { strata::vk_engine::missing("strata::poly::hc_post"); } }

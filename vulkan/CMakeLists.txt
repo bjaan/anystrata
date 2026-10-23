@@ -157,6 +157,27 @@ add_library(strata_vk_kernel_gemv STATIC src/poly/kernels/gemv_vk.cpp ${_gemv_sp
 target_include_directories(strata_vk_kernel_gemv PUBLIC ${STRATA_ROOT}/include ${STRATA_ROOT}/src/poly ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
 target_link_libraries(strata_vk_kernel_gemv PUBLIC strata_vk_runtime strata_vk_compat)
 
+# Task 2.16: poly gemv_bf16 — the bf16-weight twin of gemv.comp (ldw's exact 16-bit shift; the
+# partition contract is the CUDA gemv<> wrapper's, shared by both), same five -DGEMV_THREADS variants.
+set(_gemv_bf16_spvs "")
+foreach(_n 32 128 256 512 1024)
+  set(_spv ${CMAKE_CURRENT_BINARY_DIR}/spv/gemv_bf16_${_n}.spv)
+  add_custom_command(OUTPUT ${_spv}
+    COMMAND ${CMAKE_COMMAND} -E env VK_GLSLC_MODE=${GLSLC_MODE} VK_GLSLC_TOOL=${GLSLC_TOOL}
+            ${VK_GLSLC} --target-env=vulkan1.3 -O -DGEMV_THREADS=${_n}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels/gemv_bf16.comp -o ${_spv}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels/gemv_bf16.comp ${VK_GLSLC}
+    COMMENT "vk-glslc gemv_bf16.comp GEMV_THREADS=${_n}")
+  set(_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/gemv_bf16_${_n}.spv.h)
+  add_custom_command(OUTPUT ${_inc}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} gemv_bf16_${_n}
+    DEPENDS ${_spv})
+  list(APPEND _gemv_bf16_spvs ${_inc})
+endforeach()
+add_library(strata_vk_kernel_gemv_bf16 STATIC src/poly/kernels/gemv_bf16_vk.cpp ${_gemv_bf16_spvs})
+target_include_directories(strata_vk_kernel_gemv_bf16 PUBLIC ${STRATA_ROOT}/include ${STRATA_ROOT}/src/poly ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
+target_link_libraries(strata_vk_kernel_gemv_bf16 PUBLIC strata_vk_runtime strata_vk_compat)
+
 # Task 2.4: poly conv4_silu — three compiled variants of one .comp (CONV_VARIANT=0 the token-walk
 # kernel, =1 the rows kernel) plus the separate conv4_state.comp the rows arm pairs with.
 set(_conv_spvs "")
@@ -554,7 +575,7 @@ add_test(NAME native_mmvq_vk_parity COMMAND native_mmvq_vk_parity --selftest)
 # Task 2.1: unit parity for the model-demanded trio (poly's copy2/rms_norm + the q8_1 quantizer).
 add_executable(poly_kernels_vk_parity src/tests/poly_kernels_vk_parity.cpp)
 target_include_directories(poly_kernels_vk_parity PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
-target_link_libraries(poly_kernels_vk_parity PRIVATE strata_vk_kernel_copy2 strata_vk_kernel_rms_norm strata_vk_kernel_native_quantize_q8_1 strata_vk_kernel_gemv strata_vk_kernel_conv4_silu strata_vk_kernel_elementwise strata_vk_kernel_head_norm_rope strata_vk_kernel_store_f16 strata_vk_poly_kernels strata_vk_runtime strata_vk_compat strata_vk_stubs)   # stubs LAST: missing() for the poly trap lib; real launchers already resolved
+target_link_libraries(poly_kernels_vk_parity PRIVATE strata_vk_kernel_copy2 strata_vk_kernel_rms_norm strata_vk_kernel_native_quantize_q8_1 strata_vk_kernel_gemv strata_vk_kernel_gemv_bf16 strata_vk_kernel_conv4_silu strata_vk_kernel_elementwise strata_vk_kernel_head_norm_rope strata_vk_kernel_store_f16 strata_vk_poly_kernels strata_vk_runtime strata_vk_compat strata_vk_stubs)   # stubs LAST: missing() for the poly trap lib; real launchers already resolved
 # strata_vk_poly_kernels supplies the host-defined sum_threads() the rms_norm launcher asks for; its
 # traps stay dormant here (the test calls only ported entry points).
 add_test(NAME poly_kernels_vk_parity COMMAND poly_kernels_vk_parity)
@@ -689,7 +710,7 @@ target_link_libraries(strata-poly-vk PRIVATE
   strata_vk_kernel_s2_gemv strata_vk_kernel_dequant_s2   # real launchers FIRST (link-order rule above)
   strata_vk_kernel_copy2 strata_vk_kernel_rms_norm strata_vk_kernel_native_quantize_q8_1
   strata_vk_kernel_native_mmvq
-  strata_vk_kernel_gemv strata_vk_kernel_conv4_silu strata_vk_kernel_gdn strata_vk_kernel_elementwise
+  strata_vk_kernel_gemv strata_vk_kernel_gemv_bf16 strata_vk_kernel_conv4_silu strata_vk_kernel_gdn strata_vk_kernel_elementwise
   strata_vk_kernel_head_norm_rope strata_vk_kernel_store_f16 strata_vk_kernel_attend
   strata_vk_poly_kernels strata_vk_core
   ggml-cpu ggml-base

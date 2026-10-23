@@ -115,6 +115,7 @@ void blas_destroy(void* blas) { if (blas) cublasDestroy((cublasHandle_t) blas); 
     PORTED = {"copy2": "vulkan/src/poly/kernels/copy2_vk.cpp",
               "rms_norm": "vulkan/src/poly/kernels/rms_norm_vk.cpp",
               "gemv_f32": "vulkan/src/poly/kernels/gemv_vk.cpp",
+              "gemv_bf16": "vulkan/src/poly/kernels/gemv_bf16_vk.cpp",
               "conv4_silu": "vulkan/src/poly/kernels/conv4_silu_vk.cpp",
               "gdn_step": "vulkan/src/poly/kernels/gdn_vk.cpp",
               "axpy": "vulkan/src/poly/kernels/elementwise_vk.cpp",

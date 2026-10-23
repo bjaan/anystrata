@@ -1,0 +1,49 @@
+// vulkan/src/poly/kernels/gemv_bf16.comp - the poly bf16-weight GEMV, one workgroup an output row
+// a token.  Same launcher shape/kernel partition as gemv.comp (see its header for the warp_sum and
+// grid-flattening arguments); the ONLY difference is the weight load.
+//
+// CUDA side: src/poly/kernels.cu:72 ldw(const uint16_t* w, size_t i) =
+//   __uint_as_float(uint32_t(w[i]) << 16) - a bf16 -> f32 widening by an exact 16-bit shift, no
+// rounding, and the gemv_kernel<W> body otherwise identical to the fp32 one.
+//
+// GLSL side: the w buffer binds as uint[] - two bf16 per word, little-endian: bf16 at global
+// index j lives in word j>>1, its bits at (word << 16) for even j and (word & 0xFFFF0000) for odd
+// j - which is exactly uint32_t(w[j]) << 16 either way.  uintBitsToFloat is __uint_as_float. The
+// accumulation order is untouched by the load change, so the bitwise contract of the f32 gemv
+// carries over (bf16 -> f32 is lossless into the f32 accumulator).
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+layout(local_size_x = GEMV_THREADS) in;
+
+layout(std430, binding = 0) readonly buffer W { uint v[]; } bw;    // n_out x n_in bf16, two per word (LE)
+layout(std430, binding = 1) readonly buffer X { float v[]; } bx;   // rows x (n_out/rows_per_x) x n_in
+layout(std430, binding = 2) buffer Y { float v[]; } by;            // rows x n_out
+
+layout(push_constant) uniform PC { uint n_in; uint n_out; uint rows_per_x; uint pad_; } pc;
+
+shared float part[32];
+
+void main() {
+    const uint gid = gl_WorkGroupID.x;
+    const uint o   = gid % pc.n_out;          // blockIdx.x: the output row
+    const uint tok = gid / pc.n_out;          // blockIdx.y: the token
+    const uint tid = gl_LocalInvocationID.x;
+    const uint wbase = o * pc.n_in;
+    const uint xbase = (tok * (pc.n_out / pc.rows_per_x) + o / pc.rows_per_x) * pc.n_in;
+    float acc = 0.0;
+    for (uint i = tid; i < pc.n_in; i += GEMV_THREADS) {
+        const uint j    = wbase + i;                     // global bf16 index (row-crossing safe)
+        const uint word = bw.v[j >> 1u];
+        const uint bits = ((j & 1u) == 0u) ? (word << 16u) : (word & 0xFFFF0000u);
+        acc += uintBitsToFloat(bits) * bx.v[xbase + i];  // ldw()'s exact shift, same term order
+    }
+    // warp_sum: offsets 16, 8, 4, 2, 1 - the CUDA __shfl_xor chain's order, per warp.
+    for (uint s = 16u; s > 0u; s >>= 1u) acc += subgroupShuffleXor(acc, s);
+    if ((tid & 31u) == 0u) part[tid >> 5u] = acc;
+    barrier();
+    float s = 0.0;
+    for (uint k = 0u; k < GEMV_THREADS / 32u; ++k) s += part[k];
+    if (tid == 0u) by.v[tok * pc.n_out + o] = s;
+}
