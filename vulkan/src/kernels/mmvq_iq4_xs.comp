@@ -43,7 +43,7 @@ uint kq(uint n) {
     return (t[n >> 2u] >> (8u * (n & 3u))) & 255u;
 }
 
-// one byte of W at byte offset B (blocks are 146 B = not 4-aligned)
+// one byte of W at byte offset B (blocks are 136 B = not 4-aligned)
 uint wb(uint B) { return (bw.v[B >> 2u] >> (8u * (B & 3u))) & 0xFFu; }
 // the uint32 at byte offset B of W, assembled byte-by-byte (never shift a word past its end)
 uint w32(uint B) { return wb(B) | (wb(B + 1u) << 8u) | (wb(B + 2u) << 16u) | (wb(B + 3u) << 24u); }
