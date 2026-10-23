@@ -1,0 +1,94 @@
+// vulkan/src/poly/kernels/attend_softmax.comp - line-by-line translation of
+// src/poly/kernels.cu's attn_softmax_kernel (:1220-1251) with block_max/block_sum (:42-67).
+// One workgroup per (head, token) of the launch: CUDA's grid is dim3(n_head, tokens), 256
+// threads; the launcher flattens it x-fastest, so blk = token * n_head + head matches
+// CUDA 1228's (blockIdx.y * gridDim.x + blockIdx.x) * n_keys indexing (h = blk % n_head is
+// blockIdx.x, tok = blk / n_head is blockIdx.y).
+// The warp xor trees at offsets 16..1 never cross an aligned 32-lane block on gfx1013's
+// wave64 (the rms_norm/head_norm_rope precedent), so part[tid>>5] lands per CUDA warp and
+// the 8-warp combine walks k = 0..7 in order, exactly like CUDA's :47/:64.
+// The expf-vs-GLSL-exp gap rides the tree's rel 1e-5 exp-family bound (PORT-NOTES law 9;
+// elementwise/gdn precedent: the ONLY freedom is the transcendental — the mx/sum partitions
+// and the inv multiply are transcribed exactly, in the same strided order).
+// With `wt` (the transposed weights attn_value_t reads) the o[j*8] writes follow CUDA
+// 1245-1250; without, score is softmaxed in place and the unattended span rows zeroed
+// (1239-1242).  WT is bound to SC with a dummy size on the null arm and never touched.
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer SC { float v[]; } bsc;   // score[token][head][key], n_keys a head
+layout(std430, binding = 1) buffer WT { float v[]; } bwt;   // wt arm (bound to SC when null)
+layout(std430, binding = 2) readonly buffer AT { uint v[]; } bat;   // on-card pos; bound to SC when null
+
+layout(push_constant) uniform PC {
+    uint n_head, n_keys, pos, first, tokens, window, last, has_at,
+         per, wt_blocks, has_wt, pad0, pad1, pad2, pad3, pad4;
+} pc;
+
+shared float part[8];
+
+// CUDA 1026 attn_rows (window/last from the pc; int32 range, the launcher traps beyond it).
+int attn_rows(int pp, out int lo_) {
+    lo_ = (int(pc.window) > 0 && pp >= int(pc.window)) ? pp - int(pc.window) + 1 : 0;
+    return (int(pc.last) < 0 ? pp : int(pc.last)) - lo_ + 1;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint blk = gl_WorkGroupID.x;
+    const uint h = blk % pc.n_head, tok = blk / pc.n_head;
+    const int pos = pc.has_at != 0u ? int(bat.v[0u]) : int(pc.pos);
+    const int p = pos + int(pc.first);
+    // CUDA 1226-1227: the launch's span and this token's rows of it.
+    int lo_last;
+    const int nlast = attn_rows(p + int(pc.tokens) - 1, lo_last);
+    int lo;
+    const int n = attn_rows(p + int(tok), lo);
+    int lo0;
+    attn_rows(p, lo0);                 // the span starts at the FIRST token's lo (attn_span)
+    const int span = lo_last - lo0 + nlast;
+    const int own = lo - lo0;
+    const uint all = blk * pc.n_keys + uint(own);   // CUDA 1228-1229: row = all + own
+
+    // CUDA 1230-1232: mx over the token's rows, block_max (warp tree, then part[0..7] fmax in order).
+    float mx = uintBitsToFloat(0xFF800000u);   // -INFINITY (glslc has no infinite())
+    for (uint j = tid; j < uint(n); j += 256u) mx = max(mx, bsc.v[all + j]);
+    for (uint o = 16u; o > 0u; o >>= 1u) mx = max(mx, subgroupShuffleXor(mx, o));
+    if ((tid & 31u) == 0u) part[tid >> 5u] = mx;
+    barrier();
+    mx = part[0];
+    for (uint k = 1u; k < 8u; ++k) mx = max(mx, part[k]);
+    barrier();
+
+    // CUDA 1233-1238: row[j] = expf(row[j] - mx) and the same-order strided sum, block_sum.
+    float sum = 0.0;
+    for (uint j = tid; j < uint(n); j += 256u) {
+        bsc.v[all + j] = exp(bsc.v[all + j] - mx);
+        sum += bsc.v[all + j];
+    }
+    for (uint o = 16u; o > 0u; o >>= 1u) sum += subgroupShuffleXor(sum, o);
+    if ((tid & 31u) == 0u) part[tid >> 5u] = sum;
+    barrier();
+    float s = 0.0;
+    for (uint k = 0u; k < 8u; ++k) s += part[k];
+    barrier();
+    const float inv = 1.0 / s;
+
+    if (pc.has_wt == 0u) {
+        // CUDA 1239-1243: scale in place, zero the rows outside the token's.
+        for (uint j = tid; j < uint(n); j += 256u) bsc.v[all + j] *= inv;
+        for (uint j = tid; j < uint(own); j += 256u) bsc.v[blk * pc.n_keys + j] = 0.0;
+        for (uint j = uint(own) + uint(n) + tid; j < uint(span); j += 256u)
+            bsc.v[blk * pc.n_keys + j] = 0.0;
+        return;
+    }
+    // CUDA 1245-1250: the weights for attn_value_t, VALUE_QUERIES (=8) side by side a row.
+    const uint query = tok * uint(pc.per) + h % uint(pc.per);
+    const uint o = ((h / uint(pc.per)) * uint(pc.wt_blocks) + query / 8u) * (pc.n_keys * 8u) + query % 8u;
+    for (uint j = tid; j < uint(own); j += 256u) bwt.v[o + uint(j) * 8u] = 0.0;
+    for (uint j = tid; j < uint(n); j += 256u) bwt.v[o + uint(own + j) * 8u] = bsc.v[all + j] * inv;
+    for (uint j = uint(own) + uint(n) + tid; j < uint(span); j += 256u) bwt.v[o + uint(j) * 8u] = 0.0;
+}

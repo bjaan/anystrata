@@ -141,6 +141,18 @@ the arena-offset launchers would misread. `vk_doorbell_probe` (ctest) is the wit
    has to respect the chain. Straddling copies now round-trip intact (probe case D rewritten: straddling
    copy must round-trip AND a span with no piece under it must still throw by name; `vk_device_probe`
    green on both arms).
+   **Corrected (Task 2.11): the 512 MiB cap was FICTIONAL.** Vulkan exposes no max-allocation field
+   and the figure was a session-start guess; measured on this box (controller probe): buffers of
+   512 MiB, 1, 2, 4 and 8 GiB all SUCCEED, 12 GiB fails on the memory budget. `max_allocation_size`
+   is now 6 GiB by default (STRATA_VK_MAX_ALLOC still overrides), so the engine's big single
+   `cudaMalloc`s chain at far fewer boundaries. Two rules ride the arena now: (a) **piece-aligned
+   regions** — `arena_add()` bumps the cursor past a piece whose tail is shorter than the new region,
+   so every alloc that FITS one piece is single-piece by construction and no kernel span computed
+   from a region's own numbers can straddle (this was attend's halt: the score scratch landed 5 MiB
+   from a fictional 512 MiB edge); (b) genuinely oversized regions still chain and their FULL-span
+   kernel binds keep the named rejection — probe case D pins 512 MiB via `setenv` so that class stays
+   tested deterministically, and ctest `vk_piece_align` asserts (a) directly through the launcher's
+   piece_of binding path.
 4. **poly contract traps, not migrated copies.** `src/poly/kernels.cu` + `kernels_dsv4.cu` are host+device
    TUs (77/8 `<<<` launches): with no nvcc there is no "host-only migrated copy" worth extracting — the
    whole `include/strata/poly/kernels.hpp` contract (52 entries) becomes traps, generated mechanically by

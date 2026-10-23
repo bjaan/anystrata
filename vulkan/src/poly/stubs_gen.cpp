@@ -13,7 +13,6 @@
 namespace strata::vk_engine { void missing(const char* name); }
 
 namespace strata::poly { void add_bias(const float * p0, float * p1, int p2, int p3, void * p4) { strata::vk_engine::missing("strata::poly::add_bias"); } }
-namespace strata::poly { void attend(const float * p0, const uint16_t * p1, const uint16_t * p2, int64_t p3, int p4, float * p5, int p6, float * p7, int p8, int p9, int p10, float p11, void * p12, int p13, int p14, bool p15, const long long * p16, int p17, size_t p18, Kvq8 p19, Kvq8 p20) { strata::vk_engine::missing("strata::poly::attend"); } }
 namespace strata::poly { void attend_batch(void * p0, const float * p1, const uint16_t * p2, const uint16_t * p3, int64_t p4, int p5, float * p6, size_t p7, float * p8, float * p9, int p10, int p11, int p12, float p13, void * p14, int p15, int p16, bool p17, Kvq8 p18, Kvq8 p19, uint16_t * p20, uint16_t * p21, size_t p22) { strata::vk_engine::missing("strata::poly::attend_batch"); } }
 namespace strata::poly { void bf16_to_f32(const uint16_t * p0, float * p1, size_t p2, void * p3) { strata::vk_engine::missing("strata::poly::bf16_to_f32"); } }
 namespace strata::poly { void dsa_attend(void * p0, const float * p1, const uint16_t * p2, const int32_t * p3, int p4, int p5, int p6, int64_t p7, int p8, int p9, float * p10, float * p11, int p12, float * p13, int p14, int p15, float p16, void * p17) { strata::vk_engine::missing("strata::poly::dsa_attend"); } }

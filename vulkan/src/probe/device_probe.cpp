@@ -23,6 +23,10 @@
 using namespace strata;
 
 int main() {
+    // Pin the piece cap to 512 MiB for this probe (the arena's real default is now 6 GiB - the
+    // "512 MiB on RADV" figure was fictional, see vk_device.cpp): case D below owns the chained-
+    // region behaviour and must stay deterministic on that size, whatever the box's budget is.
+    setenv("STRATA_VK_MAX_ALLOC", "536870912", 0);
     const vk::DeviceInfo& d = vk::device_info();      // throws with a named reason on an unusable card
     std::printf("probe: %s: subgroup %u (forcing 32), wg invocations %u, max allocation %llu MiB, "
                 "dot=%d ssc=%d bda=%d uma=%d\n",

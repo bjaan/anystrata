@@ -1,0 +1,193 @@
+// vulkan/src/poly/kernels/attend_value.comp - the general attend() value pass, one .comp with
+// three compiled arms (-DATT_VARIANT), chosen by the launcher exactly as the CUDA wrapper
+// (src/poly/kernels.cu:2510-2548) dispatches:
+//   0 = attn_value_t_kernel<1, false> (:1499) - TILES=1: the softmax's transposed weights (wt)
+//   1 = attn_value_t_kernel<2, false>         - two query blocks a workgroup, cache read once
+//   2 = attn_value_kernel<false> (:1315)      - score in place, weights broadcast lane to lane
+// All launch VALUE_DIMS*VALUE_SHARES = 1024 threads (CUDA's size); one workgroup per CUDA block,
+// the 2D grid dim3(kv_heads*dims, blocks/y) flattened x-fastest by the launcher (gxdim carries
+// kv_heads*dims).
+//
+// fp16 cache decode is BIT-EXACT (the f16_to_float bit build shared with attend_score.comp;
+// half -> float is exact, subnormals normalized, no truncation).
+//
+// Row order IS the contract: every thread accumulates its share of the span's rows from its own
+// first row in increasing j (stride VALUE_SHARES), then the share[][] buckets are added k = 0..31
+// in order (CUDA 1340-1350 / 1553-1573 - a token's rows counted from its OWN first, so a token
+// comes out the same whatever tokens sit beside it).  The host reference transcribes that walk.
+//
+// The plain arm's __shfl_sync(0xffffffff, weight, i), i < 8 (CUDA 1275), reads an ABSOLUTE lane
+// of the 32-lane CUDA warp.  On gfx1013's wave64 a subgroup covers two CUDA warps, so the target
+// is wavebase + i, wavebase = the wave half the thread lives in (subgroup offsets under 32 never
+// cross an aligned 32-lane block - the head_norm_rope/rms_norm law; the i <= 7 read is uniform
+// across each CUDA warp).  attn_values_for's N-halving (1296-1305) only changes WHICH i a lane's
+// slot covers, never one slot's j-order, so the live-slot transcription matches every N arm bit
+// for bit.
+//
+// i64 pos/last/at: read as one u32 word, int32 range (the launcher traps beyond it); window/
+// ring/whole flow through attn_rows/attn_span exactly (kernels.cu:1026-1038).
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+#ifndef ATT_VARIANT
+#define ATT_VARIANT 0
+#endif
+
+layout(local_size_x = 1024) in;   // VALUE_DIMS (32) * VALUE_SHARES (32)
+
+#if ATT_VARIANT == 2
+layout(std430, binding = 0) readonly buffer SC { float v[]; } bsc;   // score[token][head][key]
+#else
+layout(std430, binding = 0) readonly buffer WT { float v[]; } bwt;   // transposed weights
+#endif
+layout(std430, binding = 1) readonly buffer VC { uint v[]; } bvc;    // fp16 value cache, u32 pairs
+layout(std430, binding = 2)           buffer OUT { float v[]; } bout;
+layout(std430, binding = 3) readonly buffer AT { uint v[]; } bat;    // on-card pos; bound to OUT when null
+
+layout(push_constant) uniform PC {
+    uint n_keys, dim, n_head, kv_heads, pos, first, tokens,
+         window, ring, last, has_at, gxdim, has_wt, pad0, pad1, pad2;
+} pc;
+
+// share[VALUE_QUERIES][VALUE_SHARES][VALUE_DIMS] (CUDA 1322/1508) - global scope (law 7).
+shared float share[8][32][32];
+
+float f16_to_float(uint h) {
+    const uint sign = (h >> 15u) & 1u;
+    const uint e = (h >> 10u) & 0x1Fu, m = h & 0x3FFu;
+    if (e == 0u) {
+        if (m == 0u) return uintBitsToFloat(sign << 31u);
+        uint mb = m << 13u;
+        int ee = -14;
+        while ((mb & 0x800000u) == 0u) { mb <<= 1u; ee--; }
+        return uintBitsToFloat((sign << 31u) | (uint(ee + 127) << 23u) | (mb & 0x7FFFFFu));
+    }
+    if (e == 31u) return uintBitsToFloat((sign << 31u) | 0x7F800000u | (m << 13u));
+    return uintBitsToFloat((sign << 31u) | ((e + 112u) << 23u) | (m << 13u));
+}
+
+int attn_rows(int pp, out int lo_) {
+    lo_ = (int(pc.window) > 0 && pp >= int(pc.window)) ? pp - int(pc.window) + 1 : 0;
+    return (int(pc.last) < 0 ? pp : int(pc.last)) - lo_ + 1;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint bx = gl_WorkGroupID.x % pc.gxdim, by = gl_WorkGroupID.x / pc.gxdim;  // CUDA blockIdx
+    const uint dims = (pc.dim + 31u) / 32u;
+    const int per = int(pc.n_head / pc.kv_heads);
+    const int g = int(bx / dims);
+    const uint lane = tid % 32u, s = tid / 32u;
+    const uint d = (bx % dims) * 32u + lane;
+    const int queries = int(pc.tokens) * per;
+    const int blocks = (queries + 7) / 8;                 // the group's blocks of queries
+    const int b0 = (ATT_VARIANT == 1) ? int(by) * 2 : int(by);   // CUDA 1509: blockIdx.y * TILES
+    const int q0 = int(by) * 8;                           // the plain arm's query offset (variant 2)
+    if ((ATT_VARIANT == 2 && q0 >= queries) || (ATT_VARIANT != 2 && b0 >= blocks)) return;
+    const int pos = pc.has_at != 0u ? int(bat.v[0u]) : int(pc.pos);
+    const int p = pos + int(pc.first);
+    // attn_span (CUDA 1033-1038): lo0 = the span's first row (the FIRST token's lo); the span
+    // ends at the last token's row.
+    int lo_last;
+    const int nlast = attn_rows(p + int(pc.tokens) - 1, lo_last);
+    int lo0;
+    attn_rows(p, lo0);
+    const int span = lo_last - lo0 + nlast;
+    const uint width = pc.kv_heads * pc.dim;              // halfs a cache row
+    const uint dd = min(d, pc.dim - 1u);                  // a lane past the last reads one anyway
+    int row = int(pc.ring) > 0 ? ((lo0 + int(s)) % int(pc.ring)) : lo0 + int(s);
+
+#if ATT_VARIANT == 2
+    // ---- attn_value_kernel: the lane's query's weights over the span; a row's value read once.
+    // CUDA passes the queries' weights lane to lane (__shfl_sync(w, i), :1275). An absolute
+    // subgroupShuffle is not usable here: on wave64 the target differs across the wave's two
+    // CUDA warps (not SPIR-V-uniform), and a wave32-forced pipeline is not needed - all 32
+    // lanes of a CUDA warp read the SAME weight, so each lane loads it from memory instead:
+    // identical float, identical order (the redundant broadcast load lands in L1). The
+    // attn_values_for N-halving (1296-1305) only changes which lane HOLDS w_i, never the
+    // product order per slot, so the live-slot transcription below matches every N arm.
+    const int live = min(8, queries - q0);
+    uint wq[8];
+    for (int i = 0; i < live; ++i)
+        wq[i] = (uint((q0 + i) / per) * pc.n_head + uint(g * per + (q0 + i) % per)) * pc.n_keys;
+    float acc[8];
+    for (int i = 0; i < 8; ++i) acc[i] = 0.0;
+    for (int j = int(s); j < span; j += 32) {
+        const uint e = uint(row) * width + uint(g) * pc.dim + dd;   // CUDA 1337: v = vcache + g*dim + dd
+        const uint pair = bvc.v[e >> 1u];
+        const float x = f16_to_float((e & 1u) != 0u ? (pair >> 16u) : (pair & 0xFFFFu));
+        for (int i = 0; i < live; ++i)
+            acc[i] += bsc.v[wq[i] + uint(j)] * x;   // CUDA 1275: shfl(weight, i) * x, then +=
+        row += 32;
+        if (int(pc.ring) > 0 && row >= int(pc.ring)) row -= int(pc.ring);
+    }
+    for (int i = 0; i < live; ++i) {
+        int own;
+        attn_rows(p + (q0 + i) / per, own);               // CUDA 1341-1343
+        share[i][(int(s) + 32 - ((own - lo0) % 32)) % 32][int(lane)] = acc[i];
+    }
+    barrier();
+    if (s != 0u || d >= pc.dim) return;
+    for (int i = 0; i < live; ++i) {
+        float sum = share[i][0][int(lane)];
+        for (int k = 1; k < 32; ++k) sum += share[i][k][int(lane)];
+        const int query = q0 + i;
+        bout.v[(uint(pc.first + query / per) * pc.n_head + uint(g * per + query % per)) * pc.dim + d] = sum;
+    }
+#else
+    // ---- attn_value_t_kernel: a row's VALUE_QUERIES weights lie side by side; no shuffles.
+    float acc[2][8];
+    for (int t = 0; t < 2; ++t)
+        for (int i = 0; i < 8; ++i) acc[t][i] = 0.0;
+    // CUDA 1522-1523: a tile past the group's last reads the block's first again, for nothing
+    // (the b0 >= blocks case early-outs above, so the t=0 clamp never trips)
+    const uint wb0 = (uint(g) * uint(blocks) + uint(b0)) * (pc.n_keys * 8u);
+    const uint wb1 = (uint(g) * uint(blocks) + (uint(b0 + 1) < uint(blocks) ? uint(b0 + 1) : uint(b0))) * (pc.n_keys * 8u);
+    const uint vcol = uint(g) * pc.dim + dd;
+    for (int j = int(s); j < span; j += 32) {
+        const uint e = uint(row) * width + vcol;
+        const uint pair = bvc.v[e >> 1u];
+        const float x = f16_to_float((e & 1u) != 0u ? (pair >> 16u) : (pair & 0xFFFFu));
+        acc[0][0] += bwt.v[wb0 + uint(j) * 8u + 0u] * x;
+        acc[0][1] += bwt.v[wb0 + uint(j) * 8u + 1u] * x;
+        acc[0][2] += bwt.v[wb0 + uint(j) * 8u + 2u] * x;
+        acc[0][3] += bwt.v[wb0 + uint(j) * 8u + 3u] * x;
+        acc[0][4] += bwt.v[wb0 + uint(j) * 8u + 4u] * x;
+        acc[0][5] += bwt.v[wb0 + uint(j) * 8u + 5u] * x;
+        acc[0][6] += bwt.v[wb0 + uint(j) * 8u + 6u] * x;
+        acc[0][7] += bwt.v[wb0 + uint(j) * 8u + 7u] * x;
+        if (ATT_VARIANT == 1) {
+            acc[1][0] += bwt.v[wb1 + uint(j) * 8u + 0u] * x;
+            acc[1][1] += bwt.v[wb1 + uint(j) * 8u + 1u] * x;
+            acc[1][2] += bwt.v[wb1 + uint(j) * 8u + 2u] * x;
+            acc[1][3] += bwt.v[wb1 + uint(j) * 8u + 3u] * x;
+            acc[1][4] += bwt.v[wb1 + uint(j) * 8u + 4u] * x;
+            acc[1][5] += bwt.v[wb1 + uint(j) * 8u + 5u] * x;
+            acc[1][6] += bwt.v[wb1 + uint(j) * 8u + 6u] * x;
+            acc[1][7] += bwt.v[wb1 + uint(j) * 8u + 7u] * x;
+        }
+        row += 32;
+        if (int(pc.ring) > 0 && row >= int(pc.ring)) row -= int(pc.ring);
+    }
+    for (int t = 0; t < 2; ++t) {
+        if (ATT_VARIANT == 0 && t != 0) break;
+        const int qt0 = (b0 + t) * 8, tlive = min(8, queries - qt0);
+        if (tlive <= 0) break;
+        if (t > 0) barrier();                             // CUDA 1557
+        for (int i = 0; i < tlive; ++i) {
+            int own;
+            attn_rows(p + (qt0 + i) / per, own);
+            share[i][(int(s) + 32 - ((own - lo0) % 32)) % 32][int(lane)] = acc[t][i];
+        }
+        barrier();
+        if (s == 0u && d < pc.dim)
+            for (int i = 0; i < tlive; ++i) {
+                float sum = share[i][0][int(lane)];
+                for (int k = 1; k < 32; ++k) sum += share[i][k][int(lane)];
+                const int query = qt0 + i;
+                bout.v[(uint(pc.first + query / per) * pc.n_head + uint(g * per + query % per)) * pc.dim + d] = sum;
+            }
+    }
+#endif
+}

@@ -1,7 +1,12 @@
 // vulkan/src/runtime/vk_runtime.cpp - arena, copies, kernel registry and launch.
 //
-// An arena address is a byte offset into a chain of VkBuffers: RADV caps one memory allocation at
-// maxMemoryAllocationSize (512 MiB on the BC-250), so a region larger than that becomes several pieces.
+// An arena address is a byte offset into a chain of VkBuffers: the piece cap (DeviceInfo::
+// max_allocation_size, 6 GiB by default on this box; the old "512 MiB on RADV" figure was a
+// fictional guess, disproven by measurement - 8 GiB allocates fine, the limit is the memory
+// budget), splits regions larger than a piece into several. arena_add() keeps EVERY region that
+// fits one piece single-piece by construction (the cursor bumps past a short tail), so a kernel
+// span computed from a region's own numbers can never straddle; only genuinely oversized regions
+// chain.
 // A kernel argument must land inside one piece (weights regions are laid out so that each tensor's planes
 // do; a straddling span throws at launch with a named reason rather than reading wrong bytes). Copies walk
 // the pieces. That keeps the first cut honest where CUDA's flat cudaMalloc address space is not available.
@@ -68,6 +73,18 @@ void arena_add(uint64_t bytes) {
     const DeviceInfo& d = device_info();
     uint64_t max_alloc = d.max_allocation_size ? d.max_allocation_size : (64ull << 20);
     const uint64_t slack = getenv("STRATA_VK_SLACK") ? (uint64_t)atoll(getenv("STRATA_VK_SLACK")) : (256ull << 20);
+    // Piece-aligned regions (Task 2.11 law): a region that fits inside ONE max-allocation piece
+    // never starts where a piece runs short - the cursor bumps to the next piece boundary and
+    // every such allocation is single-piece by construction. This kills the whole class of
+    // layout-dependent "kernel argument crosses an arena piece" traps: a kernel span computed
+    // from the region's own numbers can then never straddle. Regions LARGER than max_alloc
+    // still chain (piece_of throws for their internal sub-spans, unchanged) and the probe's
+    // oversized-straddle case keeps that rejection. Wasted address space <= one piece per chain.
+    if (bytes && bytes <= max_alloc && !g_pieces.empty()) {
+        const Piece& last = g_pieces.back();
+        const uint64_t room = last.base + last.size - g_cursor;
+        if (room < bytes) g_cursor = last.base + last.size;   // end the piece under the cursor
+    }
     if (g_cursor + bytes + slack > d.free_bytes)
         throw std::runtime_error("vk_runtime: out of VRAM growing the arena by " + std::to_string(bytes >> 20) + " MiB");
     while (bytes) {
@@ -158,6 +175,7 @@ void copy_chunk(bool h2d, void* host, uint64_t arena_off, uint64_t bytes) {
 struct KernelImpl {
     VkPipeline pipe; VkPipelineLayout layout; VkDescriptorSetLayout dsl;
     int n_buffers; int pc_bytes; int wg;
+    std::string name;    // debug: which launcher threw the piece error
 };
 std::unordered_map<uint64_t, KernelImpl> g_kernels;    // keyed by pipeline handle
 
@@ -262,7 +280,7 @@ Kernel kernel_load(const char* name, const uint32_t* spv, size_t spv_bytes, int 
     ci.stage = st; ci.layout = pl;
     VkPipeline pipe; RT(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &ci, nullptr, &pipe));
     vkDestroyShaderModule(dev, sm, nullptr);
-    KernelImpl impl{pipe, pl, dsl, n_storage_buffers, push_constant_bytes, workgroup_size};
+    KernelImpl impl{pipe, pl, dsl, n_storage_buffers, push_constant_bytes, workgroup_size, name};
     g_kernels[(uint64_t)pipe] = impl;
     return {pipe, pl};
 }
@@ -279,10 +297,15 @@ void kernel_launch_sized(const Kernel& k, int groups_x, const uint64_t* buffers,
     std::vector<VkDescriptorBufferInfo> dbi(n_buffers);
     for (int i = 0; i < n_buffers; i++) {
         uint64_t po; VkBuffer pb = piece_of(buffers[i], sizes[i], po);
-        if (!pb)
+        if (!pb) {
+            std::string pieces = "pieces:";
+            for (auto& p : g_pieces)
+                if (p.base + p.size > buffers[i] && p.base < buffers[i] + sizes[i])
+                    pieces += " [" + std::to_string(p.base) + "," + std::to_string(p.base + p.size) + "]";
             throw std::runtime_error("vk_runtime: kernel argument " + std::to_string(i) +
-                                     " crosses an arena piece (offset " + std::to_string(buffers[i]) +
-                                     ", " + std::to_string(sizes[i]) + " bytes)");
+                                     " of " + impl.name + " crosses an arena piece (offset " + std::to_string(buffers[i]) +
+                                     ", " + std::to_string(sizes[i]) + " bytes; " + pieces + ")");
+        }
         dbi[i] = VkDescriptorBufferInfo{pb, po, sizes[i]};
     }
     VkDescriptorPool dp; VkDescriptorPoolSize psz{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (uint32_t)n_buffers};

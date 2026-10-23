@@ -103,7 +103,7 @@ header helpers, one row per header) | `n/a` (decision `n/a`).
 | poly: conv4_silu/_rows/_state, shortconv/_rows/_state kernels | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | **conv4_silu (all three kernels: walk/rows/state) ported (Task 2.4): vulkan/src/poly/kernels/conv4_silu.comp, conv4_state.comp, conv4_silu_vk.cpp, unit poly_kernels_vk_parity rel 5.9e-7 (tree tol 1e-5); shortconv todo** |
 | poly: swiglu_clamp/_rows, geglu/_rows kernels | src/poly/kernels.cu | src/poly/kernels.cu | unit poly_kernels_vk_parity | none | translate | **swiglu_clamp PORTED (Task 2.7, elementwise.comp): parity rel 7.0e-7 (exp vs expf); swiglu_clamp_rows PORTED (Task 2.8, elementwise.comp EW_VARIANT 3: rows of gate|up pairs, flattened grid + 65535-row chunking like mul_sigmoid; parity worst rel reported in-test); geglu todo** |
 | poly: dsa_keys/softmax, idx_store/pool/weigh, route_kernel, moe_sum_kernel | src/poly/kernels.cu | src/poly/kernels.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | todo |
-| poly: attn_score/softmax/value/group/ungroup/softmax_block/scale, head_norm_rope kernels | src/poly/kernels.cu | src/poly/kernels.cu | unit poly_kernels_vk_parity (head_norm_rope) | `__shfl`, `__shared__`, `cp.async` (some paths), `asm volatile` | fp32-fallback for the cp.async/mma-attn paths; ordered-FP32 score/softmax otherwise | **head_norm_rope PORTED (Task 2.10): vulkan/src/poly/kernels/head_norm_rope.comp (-DHNR_THREADS=128/256) + head_norm_rope_vk.cpp; parity rel 7e-7..1.2e-6 all arms (host pow table + Cody-Waite + in-kernel Taylor sin/cos — the CUDA libdevice drifts vs RADV v_sin/v_cos, see the halt para); attn_* family todo (the current halt)** |
+| poly: attn_score/softmax/value/group/ungroup/softmax_block/scale, head_norm_rope kernels | src/poly/kernels.cu | src/poly/kernels.cu | unit poly_kernels_vk_parity (head_norm_rope), poly_attend_vk_parity (attend) | `__shfl`, `__shared__`, `cp.async` (some paths), `asm volatile` | fp32-fallback for the cp.async/mma-attn paths; ordered-FP32 score/softmax otherwise | **head_norm_rope PORTED (Task 2.10): vulkan/src/poly/kernels/head_norm_rope.comp (-DHNR_THREADS=128/256) + head_norm_rope_vk.cpp; parity rel 7e-7..1.2e-6 all arms (host pow table + Cody-Waite + in-kernel Taylor sin/cos — the CUDA libdevice drifts vs RADV v_sin/v_cos, see the halt para); attend PORTED (Task 2.11): the general chain — attend_score.comp (-DATT_N/-DATT_STEPS, the four reg<> variants), attend_softmax.comp, attend_value.comp (-DATT_VARIANT t1/t2/plain) + attend_vk.cpp; parity rel_l1 4e-8..1.4e-7 vs the exact-order AND naive references (exp-vs-expf family bound); split/join (dim 64 per 4) and kq8/vq8 arms trap-by-name** |
 | poly dsv4: rope/state/squeeze/idx_score/select kernels | src/poly/kernels_dsv4.cu | src/poly/kernels_dsv4.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | todo |
 | poly dsv4: attend/attend_rows/permute kernels | src/poly/kernels_dsv4.cu | src/poly/kernels_dsv4.cu | none (poly engine tests) | `__shfl`, `__shared__` | translate | todo |
 | bf16_bits.hpp (bf16_from_f32 / f32_from_bf16 inline) | bf16_bits.hpp | (header-inline) | none | none | host-free | compiled-unchanged (n/a for device) |
@@ -214,7 +214,8 @@ Re-run with `STRATA_VK_STUBS=log` enumerates the rest of the qwen35moe decode pa
 | 13 | `strata::poly::add_scaled` | poly: add_scaled_kernel — **PORTED (Task 2.7)** |
 | 14 | `strata::poly::head_norm_rope` | poly: head_norm_rope kernels — **PORTED (Task 2.10)** |
 | 15 | `strata::poly::store_f16` | poly: store_f16_kernel/_at — **store_f16 PORTED (Task 2.10)**; _at todo |
-| 16 | `strata::poly::attend` | poly: attn_score/softmax/value/… kernels — the run's CURRENT halt |
+| 16 | `strata::poly::attend` | poly: attn_score/softmax/value/… kernels — **PORTED (Task 2.11)** |
+| 17 | `strata::kernels::native_mmvq` type 23 (IQ4_XS) | native_mmvq family — the run's CURRENT halt |
 
 (The log arm returns untouched outputs, so entries after #1 are the path's *shape*, not a
 guaranteed per-token sequence; the first trap, `copy2`, is exact — the default arm stops there.)
@@ -383,3 +384,33 @@ launchers replace `strata_kernels`); `device.cu`/`pinned.cu` by the Task-1.3 twi
 not needed by this target. ggml-base/ggml-cpu come from the pinned llama.cpp submodule (the CPU
 experts), `add_subdirectory` in `vulkan/CMakeLists.txt`. Compat gaps closed on the way are listed in
 PORT-NOTES.md "Task 1.4 compat gaps".
+
+**Halt point after Task 2.11 (2026-10-23):** `strata::kernels::native_mmvq` **type 23 (IQ4_XS)** —
+demand #16 cleared and the run walks ATTEND for the whole first decode step: the halt moves to the
+mmvq family's fourth type. attend as the general chain, exactly the CUDA wrapper's dispatch
+(kernels.cu:2449-2549): attend_vk.cpp replays the chunk loop (first/keys/wt predicate/value-arm
+pick mirrored), attend_score.comp compiles the four `attn_score_reg_kernel<N, STEPS, false>`
+variants (-DATT_N/-DATT_STEPS: 4/1, 8/2, 4/2, 4/4) — THE MODEL RUNS reg<8,2>: the trace shows
+`pos=0 rows=1 chunk=256 dim=256 n_head=16 kv_heads=2 scale=0.0625 window=0 ring=0 whole=0 at=0`
+(key_length 256, NOT the pre-dugested 128), the scores_sum<N> xor tree unrolled lane-exactly
+(off 16/8 keep-and-hand, off 4/2/1 finish; which = 2·bit16 + bit8 (+ bit4 at N=8));
+attend_softmax.comp = attn_softmax_kernel (strided mx/exp/sum passes, 8-warp part[] walk, the wt
+transpose arm); attend_value.comp = the three value arms (-DATT_VARIANT: attn_value_t<1>, <2>, the
+plain kernel — its __shfl weight broadcast becomes per-lane loads, the same float in the same
+order: on wave64 an absolute subgroupShuffle is not SPIR-V-uniform). fp16 cache decode is a
+BIT-EXACT half→float bit build (subnormals normalized, the CUDA u64 read as two words + the +8
+tail slack). Parity (poly_attend_vk_parity, NEW ctest): 6 cases (dim128 plain/wt/chunked + the
+MODEL dim256 rows=1/chunked arms) — rel_l1 vs the exact-ORDER reference 4.3e-8..1.4e-7, vs the
+naive DIRECT reference 9.3e-8..3.1e-7 (tree tol 1e-5; exp-vs-expf is the only freedom, never
+bitwise claimed; worst abs dev 6e-8 on outputs of max 0.28). NOT ported, trap-by-name inside
+attend(): attn_split/join (dim 64 per 4 — the CUDA 2460 gate is evaluated so the message names the
+shape), kq8/vq8 quantized-KV, plain attn_score_kernel (non-reg dims/per). ALSO fixed the arena
+layout class attend exposed: the "512 MiB RADV max allocation" was FICTIONAL (measured: 8 GiB
+buffers allocate fine) — max_allocation_size is now 6 GiB by default, arena_add piece-aligns every
+region that fits one piece (single-piece by construction; this killed the score-scratch straddle),
+probe D pins 512 MiB via setenv to keep the chained-region arms deterministic, and ctest
+vk_piece_align guards the new law (5 checks: near-boundary realign, consecutive small allocs,
+chained full-span rejection + piece-local bind). ctest 13/13. Model gate: load 33.9 s,
+10496/10496 experts in VRAM, decode ran through all ported poly demands incl. attend, stopped at
+`strata-vk: strata::kernels::native_mmvq type 23 has no Vulkan implementation yet` (demand #17 —
+IQ4_XS; port it next, the iq3_xxs template is the proven shape to extend).

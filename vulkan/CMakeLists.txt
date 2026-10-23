@@ -249,6 +249,67 @@ target_link_libraries(strata_vk_kernel_head_norm_rope PUBLIC strata_vk_runtime s
 # read wired for it yet). f16 packing is RN via f16_rn_bits, NOT packHalf2x16 (law 1).
 strata_vk_kernel(store_f16 SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels COMP store_f16.comp LAUNCHER src/poly/kernels/store_f16_vk.cpp)
 
+# Task 2.11: poly attend - the general fp16-KV chain: one score kernel (reg<4,1,false>, the
+# model's dim-128 per=8 arm), one softmax kernel, and THREE value arms compiled from one .comp
+# (-DATT_VARIANT 0 = attn_value_t<1>, 1 = attn_value_t<2>, 2 = the plain kernel) so the launcher
+# mirrors the CUDA wrapper's value-arm pick exactly. Every other attend arm (split/join dim-64,
+# reg dim 256/512, plain score kernel, kq8/vq8) traps by name inside the launcher.
+set(_att_spvs "")
+set(_spv ${CMAKE_CURRENT_BINARY_DIR}/spv/attend_softmax.spv)
+add_custom_command(OUTPUT ${_spv}
+  COMMAND ${CMAKE_COMMAND} -E env VK_GLSLC_MODE=${GLSLC_MODE} VK_GLSLC_TOOL=${GLSLC_TOOL}
+          ${VK_GLSLC} --target-env=vulkan1.3 -O
+          ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels/attend_softmax.comp -o ${_spv}
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels/attend_softmax.comp ${VK_GLSLC}
+  COMMENT "vk-glslc attend_softmax.comp")
+set(_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/attend_softmax.spv.h)
+add_custom_command(OUTPUT ${_inc}
+  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} attend_softmax
+  DEPENDS ${_spv})
+list(APPEND _att_spvs ${_inc})
+# the four reg<> score variants the CUDA chain instantiates (kernels.cu:2488-2499)
+foreach(_ns 4_1 8_2 4_2 4_4)
+  string(REPLACE "_" ";" _nv ${_ns})
+  list(GET _nv 0 _n)
+  list(GET _nv 1 _st)
+  set(_spv ${CMAKE_CURRENT_BINARY_DIR}/spv/attend_score_${_ns}.spv)
+  add_custom_command(OUTPUT ${_spv}
+    COMMAND ${CMAKE_COMMAND} -E env VK_GLSLC_MODE=${GLSLC_MODE} VK_GLSLC_TOOL=${GLSLC_TOOL}
+            ${VK_GLSLC} --target-env=vulkan1.3 -O -DATT_N=${_n} -DATT_STEPS=${_st}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels/attend_score.comp -o ${_spv}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels/attend_score.comp ${VK_GLSLC}
+    COMMENT "vk-glslc attend_score.comp ATT_N=${_n} ATT_STEPS=${_st}")
+  set(_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/attend_score_${_ns}.spv.h)
+  add_custom_command(OUTPUT ${_inc}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} attend_score_${_ns}
+    DEPENDS ${_spv})
+  list(APPEND _att_spvs ${_inc})
+endforeach()
+foreach(_n t1 t2 plain)
+  if(_n STREQUAL "t1")
+    set(_var 0)
+  elseif(_n STREQUAL "t2")
+    set(_var 1)
+  else()
+    set(_var 2)
+  endif()
+  set(_spv ${CMAKE_CURRENT_BINARY_DIR}/spv/attend_value_${_n}.spv)
+  add_custom_command(OUTPUT ${_spv}
+    COMMAND ${CMAKE_COMMAND} -E env VK_GLSLC_MODE=${GLSLC_MODE} VK_GLSLC_TOOL=${GLSLC_TOOL}
+            ${VK_GLSLC} --target-env=vulkan1.3 -O -DATT_VARIANT=${_var}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels/attend_value.comp -o ${_spv}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels/attend_value.comp ${VK_GLSLC}
+    COMMENT "vk-glslc attend_value.comp ATT_VARIANT=${_var}")
+  set(_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/attend_value_${_n}.spv.h)
+  add_custom_command(OUTPUT ${_inc}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} attend_value_${_n}
+    DEPENDS ${_spv})
+  list(APPEND _att_spvs ${_inc})
+endforeach()
+add_library(strata_vk_kernel_attend STATIC src/poly/kernels/attend_vk.cpp ${_att_spvs})
+target_include_directories(strata_vk_kernel_attend PUBLIC ${STRATA_ROOT}/include ${STRATA_ROOT}/src/poly ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
+target_link_libraries(strata_vk_kernel_attend PUBLIC strata_vk_runtime strata_vk_compat)
+
 strata_vk_kernel(native_quantize_q8_1 COMP quantize_q8_1.comp LAUNCHER src/kernels/native_quantize_q8_1_vk.cpp)
 # Task 2.2: native_mmvq for IQ2_XXS (type 16) — the model's routed experts. The .spv embeds under
 # the entry point's name (native_mmvq.spv.h) so the launcher includes it like the others.
@@ -453,6 +514,20 @@ target_include_directories(poly_gdn_vk_parity PRIVATE ${STRATA_ROOT}/include ${C
 target_link_libraries(poly_gdn_vk_parity PRIVATE strata_vk_kernel_gdn strata_vk_poly_kernels strata_vk_runtime strata_vk_compat strata_vk_stubs)
 add_test(NAME poly_gdn_vk_parity COMMAND poly_gdn_vk_parity)
 
+# Task 2.11: poly attend parity - the general fp16-KV chain (score reg<4,1> / softmax / value).
+add_executable(poly_attend_vk_parity src/tests/poly_attend_vk_parity.cpp)
+target_include_directories(poly_attend_vk_parity PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
+target_link_libraries(poly_attend_vk_parity PRIVATE strata_vk_kernel_attend strata_vk_poly_kernels strata_vk_runtime strata_vk_compat strata_vk_stubs)
+add_test(NAME poly_attend_vk_parity COMMAND poly_attend_vk_parity)
+
+# Task 2.11: the arena's piece-align law - every region <= max allocation is single-piece by
+# construction (arena_add bumps the cursor past a short tail); oversize regions still chain and
+# keep the named full-span rejection. The bind check rides kernel_launch_sized's piece_of loop.
+add_executable(vk_piece_align src/tests/vk_piece_align.cpp)
+target_include_directories(vk_piece_align PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
+target_link_libraries(vk_piece_align PRIVATE strata_vk_kernel_store_f16 strata_vk_runtime)
+add_test(NAME vk_piece_align COMMAND vk_piece_align)
+
 # scratch diagnostic (not in ctest): one known Q8_1 block, raw bytes.
 add_executable(quant_dump src/tests/quant_dump.cpp)
 target_include_directories(quant_dump PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -564,7 +639,7 @@ target_link_libraries(strata-poly-vk PRIVATE
   strata_vk_kernel_copy2 strata_vk_kernel_rms_norm strata_vk_kernel_native_quantize_q8_1
   strata_vk_kernel_native_mmvq
   strata_vk_kernel_gemv strata_vk_kernel_conv4_silu strata_vk_kernel_gdn strata_vk_kernel_elementwise
-  strata_vk_kernel_head_norm_rope strata_vk_kernel_store_f16
+  strata_vk_kernel_head_norm_rope strata_vk_kernel_store_f16 strata_vk_kernel_attend
   strata_vk_poly_kernels strata_vk_core
   ggml-cpu ggml-base
   strata_vk_compat strata_vk_stubs                      # stubs last: they only let the link complete

@@ -1,0 +1,150 @@
+// vulkan/src/poly/kernels/attend_score.comp - the general attend() score pass: a line-by-line
+// translation of src/poly/kernels.cu's attn_score_reg_kernel<N, STEPS, false> (:1155-1214) with
+// the template arguments fixed at compile time (-DATT_N / -DATT_STEPS), mirroring the CUDA
+// wrapper's variant pick (kernels.cu:2488-2499):
+//   N=4, STEPS=1 (dim 128, per % 4 == 0)   - the <4,1,false> arm
+//   N=8, STEPS=2 (dim 256, per % 8 == 0)   - the <8,2,false> arm (Qwen3.6-35B: n_head 16,
+//                                            kv_heads 2 -> per 8, head dim 256)
+// The other reg variants and the plain attn_score_kernel trap by name in the launcher.
+//
+// Constants (kernels.cu:24): SCORE_WARPS=8, SCORE_KEYS=8, SCORE_VALUES=4, WARP=32; the template's
+// compile-time dim = SCORE_VALUES * WARP * STEPS. One workgroup of 256 threads = 8 warps = 8
+// units; a unit is (a block of SCORE_KEYS rows of the launch's span) x (one kv group):
+//   unit = blockIdx.x * 8 + tid/32; g = unit % kv_heads; k0 = unit / kv_heads * 8.
+// A warp's 32 lanes split the key's values four each (lane l takes values 4l..4l+3 of each 128-
+// value step), the group's N heads ride in registers per th step, and the scores' 32-lane parts
+// are added by the scores_sum<N> tree (:1129-1149) EXACTLY: at off with m>1 a lane keeps v[0..
+// half) and hands the other half (one exchange serves half the scores), m = half; once m==1 the
+// four finishing rounds xor v[0] alone. which = idx accumulated as 2*bit16 + bit8 (+ bit4 for
+// N=8), and lanes with (lane & (WARP/N - 1)) == 0 store it. Every tree offset is <= 16, so the
+// xor never crosses a 32-lane aligned block on a wave64 gfx1013 (the head_norm_rope/rms_norm law).
+// No barrier in this kernel: the k0 >= span early-out is uniform per warp (whole units retire).
+//
+// The fp16 cache decode is BIT-EXACT by construction: the u64 read CUDA does (:1195) is a pair
+// of u32 words here, x[j] the j-th half, expanded through the IEEE half->float bit build
+// (subnormal normalize loop; half -> float is exact in BOTH directions, no truncation).
+// The i64 pos/last/at pair: read as one u32 word, int32 range (sequence rows; the launcher
+// traps beyond it), same law as head_norm_rope.comp. window/ring/whole(last)/at replay
+// attn_rows/attn_span (kernels.cu:1026-1038) so the model's decode AND windowed calls share it.
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+#ifndef ATT_N
+#define ATT_N 4
+#endif
+#ifndef ATT_STEPS
+#define ATT_STEPS 1
+#endif
+#define ATT_DIM (4 * 32 * ATT_STEPS)
+
+layout(local_size_x = 256) in;   // SCORE_WARPS * WARP
+
+layout(std430, binding = 0) readonly buffer Q  { float v[]; } bq;    // n_head * dim a token
+layout(std430, binding = 1) readonly buffer KC { uint v[]; } bkc;    // fp16 cache: element e -> word e>>1
+layout(std430, binding = 2)           buffer SC { float v[]; } bsc;  // score[token][head][key]
+layout(std430, binding = 3) readonly buffer AT { uint v[]; } bat;    // on-card pos (two u32, low first); bound to Q when null
+
+layout(push_constant) uniform PC {
+    uint n_keys, n_head, kv_heads, pos, first, tokens, scale_bits,
+         window, ring, last, has_at, pad0, pad1, pad2, pad3, pad4;
+} pc;
+
+// CUDA's __half2float, bit-exact (identical to attend_value.comp's copy).
+float f16_to_float(uint h) {
+    const uint sign = (h >> 15u) & 1u;
+    const uint e = (h >> 10u) & 0x1Fu, m = h & 0x3FFu;
+    if (e == 0u) {
+        if (m == 0u) return uintBitsToFloat(sign << 31u);
+        uint mb = m << 13u;
+        int ee = -14;
+        while ((mb & 0x800000u) == 0u) { mb <<= 1u; ee--; }
+        return uintBitsToFloat((sign << 31u) | (uint(ee + 127) << 23u) | (mb & 0x7FFFFFu));
+    }
+    if (e == 31u) return uintBitsToFloat((sign << 31u) | 0x7F800000u | (m << 13u));
+    return uintBitsToFloat((sign << 31u) | ((e + 112u) << 23u) | (m << 13u));
+}
+
+// kernels.cu:1026-1038 (window/last from the pc; int32 range as the header says).
+int attn_rows(int pp, out int lo_) {
+    lo_ = (int(pc.window) > 0 && pp >= int(pc.window)) ? pp - int(pc.window) + 1 : 0;
+    return (int(pc.last) < 0 ? pp : int(pc.last)) - lo_ + 1;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint unit = gl_WorkGroupID.x * 8u + tid / 32u;      // CUDA 1163
+    const uint lane = tid % 32u;
+    const int g = int(unit % pc.kv_heads), k0 = int(unit / pc.kv_heads) * 8;   // CUDA 1164
+    const int pos = pc.has_at != 0u ? int(bat.v[0u]) : int(pc.pos);
+    const int p = pos + int(pc.first);
+    int lo_last;
+    const int nlast = attn_rows(p + int(pc.tokens) - 1, lo_last);   // CUDA 1166 (attn_span)
+    int lo;
+    attn_rows(p, lo);
+    const int span = lo_last - lo + nlast;
+    if (k0 >= span) return;                                        // CUDA 1167
+    const int rows = min(8, span - k0);                            // CUDA 1168
+    const int per = int(pc.n_head / pc.kv_heads);
+    const float scale = uintBitsToFloat(pc.scale_bits);
+
+    for (int th = 0; th < int(pc.tokens) * per; th += ATT_N) {     // CUDA 1169
+        const int t = th / per, h = g * per + th % per;            // CUDA 1170
+        // CUDA 1171-1176: qt + i*dim + 128*s, a float4 a step (ATT_DIM here is compile-time)
+        const uint qb = ((uint(pc.first) + uint(t)) * pc.n_head + uint(h)) * uint(ATT_DIM) + 4u * lane;
+        float y[ATT_N][ATT_STEPS][4];
+        for (int i = 0; i < ATT_N; ++i)
+            for (int s = 0; s < ATT_STEPS; ++s) {
+                const uint yb = qb + uint(i * ATT_DIM + 128 * s);
+                y[i][s][0] = bq.v[yb]; y[i][s][1] = bq.v[yb + 1u];
+                y[i][s][2] = bq.v[yb + 2u]; y[i][s][3] = bq.v[yb + 3u];
+            }
+        const uint sb = (uint(t) * pc.n_head + uint(h)) * pc.n_keys + uint(k0);   // CUDA 1177
+        int row = int(pc.ring) > 0 ? ((lo + k0) % int(pc.ring)) : lo + k0;        // CUDA 1178
+        for (int r = 0; r < rows; ++r) {
+            // CUDA 1181-1198: the row's key of this group, 4 halves a lane per step
+            const uint base = (uint(row) * pc.kv_heads + uint(g)) * uint(ATT_DIM);
+            float x[ATT_STEPS][4];
+            for (int s = 0; s < ATT_STEPS; ++s) {
+                const uint w = (base + 4u * lane + 128u * uint(s)) >> 1u;
+                const uint wa = bkc.v[w], wb = bkc.v[w + 1u];     // the CUDA u64 as two words
+                x[s][0] = f16_to_float(wa & 0xFFFFu); x[s][1] = f16_to_float(wa >> 16u);
+                x[s][2] = f16_to_float(wb & 0xFFFFu); x[s][3] = f16_to_float(wb >> 16u);
+            }
+            // CUDA 1183-1206: N accumulators, each 4 products a step, left to right
+            // (nvcc -fmad fuses the += mul into fma; glslc/RADV contracts the same - law 6,
+            // the host reference spells std::fma)
+            float v[ATT_N];
+            for (int i = 0; i < ATT_N; ++i) v[i] = 0.0;
+            for (int s = 0; s < ATT_STEPS; ++s)
+                for (int i = 0; i < ATT_N; ++i) {
+                    v[i] += y[i][s][0] * x[s][0];
+                    v[i] += y[i][s][1] * x[s][1];
+                    v[i] += y[i][s][2] * x[s][2];
+                    v[i] += y[i][s][3] * x[s][3];
+                }
+            // CUDA 1208-1210 + scores_sum<ATT_N> (1129-1149): constant-folded rounds.
+            uint which = 0u;
+            int m = ATT_N;
+            for (uint off = 16u; off > 0u; off >>= 1u) {
+                if (m > 1) {
+                    const int hs = m / 2;
+                    const bool upper = (lane & off) != 0u;
+                    for (int i = 0; i < hs; ++i) {
+                        const float send = upper ? v[i] : v[i + hs];
+                        const float keep = upper ? v[i + hs] : v[i];
+                        v[i] = keep + subgroupShuffleXor(send, off);
+                    }
+                    which = 2u * which + (upper ? 1u : 0u);
+                    m = hs;
+                } else {
+                    v[0] += subgroupShuffleXor(v[0], off);
+                }
+            }
+            if ((lane & uint(32 / ATT_N - 1)) == 0u)
+                bsc.v[sb + which * pc.n_keys + uint(r)] = v[0] * scale;   // CUDA 1210
+            ++row;                                                        // CUDA 1211
+            if (int(pc.ring) > 0 && row == int(pc.ring)) row = 0;
+        }
+    }
+}

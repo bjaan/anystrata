@@ -140,7 +140,13 @@ void init() {
       vkGetPhysicalDeviceProperties2(g_phys,&q2); }
     g_info.subgroup_size = sg.subgroupSize;
     g_info.max_workgroup_invocations = p.limits.maxComputeWorkGroupInvocations;
-        g_info.max_allocation_size = (1ull << 29);   // 512 MiB on RADV; overridable with STRATA_VK_MAX_ALLOC
+        // NOT a driver limit: Vulkan exposes no maxAllocationSize field and the "512 MiB on RADV"
+        // figure was a session-start guess, DISPROVEN on the BC-250 (probe: buffer allocations of
+        // 512 MiB, 1, 2, 4, 8 GiB all succeed; 12 GiB fails on the memory budget - llama.cpp serves
+        // the 11 GB model in big buffers here). 6 GiB sits safely inside the budget the arena's
+        // slack rule already accounts for; overridable with STRATA_VK_MAX_ALLOC (the probe pins
+        // 512 MiB to keep exercising the piece-chain paths deterministically).
+        g_info.max_allocation_size = (6ull << 30);
     if (const char* e = getenv("STRATA_VK_MAX_ALLOC")) g_info.max_allocation_size = (uint64_t)atoll(e);
     g_info.integer_dot_product = idp;
     g_info.subgroup_size_control = ssc;
