@@ -190,7 +190,18 @@ Unit gate every commit: `ctest --test-dir build-vk`. Model gate from Phase 2 on:
 
 ---
 
-## Phase 7 — the `qwen35`-dense family (Swift-1.5-Qwen3.8-27B; user request 2026-10-22)
+## Phase 7 — DROPPED 2026-10-23 (user decision)
+
+Swift-1.5-Qwen3.8-27B is DENSE: no routed experts to stream, so Strata's design gives it
+nothing (llama.cpp baseline 87/15.5 tok/s stands as the today-path, tools/vulkan/serve-swift27.sh).
+The primary test vehicle is now **chtisgit/Qwen3.6-35B-A3B-2Bit-GSQ-hybrid-GGUF**
+(12.2 GB, sha256 8e50912f...03596 verified 2026-10-23; the RCO variant was dropped — its author
+calls it inferior). Tensor mix 120 Q2_0 / 251 Q8_0 / 61 BF16 / 301 F32, arch qwen35moe: the Q8_0
+mmvq is already bitwise; the expected new demands are the Q2_0 weight path (pack-side s2_gemv/
+dequant_s2 lineage) and the no-MTP/gguf-in-place edges. Phase 5's teacher-forced harness runs on
+BOTH the UD-IQ2_XXS and this hybrid. (History of 7.1: upstream has no qwen35-dense family either.)
+
+## Phase 7-old — the `qwen35`-dense family (Swift-1.5-Qwen3.8-27B; user request 2026-10-22)
 
 The model `ukisai/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ2_XS` (arch string `qwen35`, 64 layers,
 5120 embedding, GDN hybrid + full attention every 4th layer, **dense** FFN, no routed experts)
