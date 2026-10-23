@@ -211,7 +211,19 @@ add_custom_command(OUTPUT ${_q5k_inc}
   COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_q5k_spv} ${_q5k_inc} mmvq_q5_k
   DEPENDS ${_q5k_spv})
 add_custom_target(mmvq_q5_k.spv_h DEPENDS ${_q5k_inc})
-add_dependencies(strata_vk_kernel_native_mmvq mmvq_q5_k.spv_h)
+# Task 2.6: the Q6_K (type 14) variant, same pattern (mmvq_q6_k.comp -> its own embedded .spv.h).
+set(_q6k_spv ${CMAKE_CURRENT_BINARY_DIR}/spv/mmvq_q6_k.spv)
+add_custom_command(OUTPUT ${_q6k_spv}
+  COMMAND ${CMAKE_COMMAND} -E env VK_GLSLC_MODE=${GLSLC_MODE} VK_GLSLC_TOOL=${GLSLC_TOOL}
+          ${VK_GLSLC} --target-env=vulkan1.3 -O ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/mmvq_q6_k.comp -o ${_q6k_spv}
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/mmvq_q6_k.comp ${VK_GLSLC}
+  COMMENT "vk-glslc(${GLSLC_MODE}) mmvq_q6_k.comp")
+set(_q6k_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/mmvq_q6_k.spv.h)
+add_custom_command(OUTPUT ${_q6k_inc}
+  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_q6k_spv} ${_q6k_inc} mmvq_q6_k
+  DEPENDS ${_q6k_spv})
+add_custom_target(mmvq_q6_k.spv_h DEPENDS ${_q6k_inc})
+add_dependencies(strata_vk_kernel_native_mmvq mmvq_q5_k.spv_h mmvq_q6_k.spv_h)
 strata_vk_kernel(copy2 SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels LAUNCHER src/poly/kernels/copy2_vk.cpp)
 
 # Task 2.5: poly gdn_step — five CUDA kernels, one launcher lib. gdn_norm/gdn_out compile per dim

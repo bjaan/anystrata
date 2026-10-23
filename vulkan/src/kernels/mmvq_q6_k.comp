@@ -1,0 +1,123 @@
+// vulkan/src/kernels/mmvq_q6_k.comp - native_mmvq for ggml type 14 (Q6_K), Task 2.6.
+//
+// Line-by-line translation of src/kernels/cuda/native_mmvq.cu's native_q6_k_mmvq (2955-2981):
+// the ncols == 1 path is native_q6_k_mmvq_kernel<SmallK> (:806-842). blocks_per_row = n_in/256:
+//   >= 4  -> SmallK=false: grid n_out, ROWS=1, one row per workgroup (the model's n_in=2048).
+//   <  4  -> SmallK=true:  grid ceil(n_out/4), ROWS=4 (4 subrows x 32 lanes per workgroup).
+// The SmallK threshold is WARPS*WARP/32 = 4 here (Q6_K has VDR=1: kbx = tid/32, kqs = tid%32,
+// BLOCKS_PER_ITER = 4; contrast q5_k's kbx = tid/16, step 8). `rows` is the 4th push constant;
+// both partitions and the reduction are transcribed exactly. launch_multi<Q6KTraits> (ncols>1)
+// is pinned BITWISE-equal per column to the ncols=1 kernel (native_mmvq.cu:973-978), so the c
+// loop below answers every ncols the way the CUDA multi kernel does.
+//
+// The dot is q6_q8_dot (788-803) + q6_q8_dot_impl (773-786) verbatim: same load_int_b2 word
+// pairs, same scale_offset/bq8_offset arithmetic, same i order, same fp accumulation.
+// Q6KBlock is 210 bytes (ql[128]@0, qh[64]@128, scales[16]@192, half d@208; ggml-common.h) and
+// 210 % 4 = 2: blocks are NOT 4-aligned, so W is read byte-by-byte from uint words (wb/w16/rd32,
+// the iq2_xxs precedent). load_int_b2(ptr, i32) = two uint16 LE loads combined = a plain 4-byte
+// LE read at byte 4*i32 from the field base. block_q8_1 is 36 B = 9 words (word 0 = ds, low half
+// = d8), 4-aligned per column, so X indexes words directly.
+//
+// __vsubss4 (saturating signed byte-sub) needs no saturation clamp here: vil bytes <= 0x0f,
+// vih bytes in {0,0x10,0x20,0x30}, so each (v - 0x20) byte lands in [-32, 31], inside int8;
+// the per-byte masked subtract below is bit-exact.
+//
+// Contraction law (PORT-NOTES law 6, proven for the family by the q5_k bitwise parity): the CUDA
+// build uses --use_fast_math (no -ffp-contract=off), so `sumf += d8[i] * (DP4A(vi, u[i], 0) * sc)`
+// fuses to fma(d8, dot*sc, sumf) on both legs, and the final `return d * sumf` is a plain mul
+// (no third term to fold). The parity host reference spells std::fma in that same order.
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer W    { uint  v[]; } bw;   // Q6_K blocks, 210 B each
+layout(std430, binding = 1) readonly buffer X    { uint  v[]; } bx;   // q8_1 columns, 9 words/block
+layout(std430, binding = 2)           buffer Y    { float v[]; } by;   // ncols * n_out floats
+
+layout(push_constant) uniform PC { uint n_in; uint n_out; uint ncols; uint rows; } pc;
+
+uint wb(uint B) { return (bw.v[B >> 2u] >> (8u * (B & 3u))) & 0xFFu; }
+uint w16(uint B) { return wb(B) | (wb(B + 1u) << 8u); }
+int  rd32(uint B) { return int(wb(B) | (wb(B + 1u) << 8u) | (wb(B + 2u) << 16u) | (wb(B + 3u) << 24u)); }  // load_int_b2 pair = plain 4-byte LE
+int  rsbyte(uint B) { const uint b = wb(B); return b >= 128u ? int(b) - 256 : int(b); }                    // int8 scales[]
+int  sbyte(uint a, uint i) { const uint b = (a >> (8u * i)) & 255u; return b >= 128u ? int(b) - 256 : int(b); }
+int  vsub4(int a, int b) {   // __vsubss4 byte-lane subtract; results here fit int8 ([-32,31]), no clamp
+    int r = 0;
+    for (uint i = 0u; i < 4u; ++i)
+        r |= int((((uint(a) >> (8u * i)) & 255u) - ((uint(b) >> (8u * i)) & 255u)) & 255u) << (8u * i);
+    return r;
+}
+int  dp4a(int a, int b, int c) { for (uint i = 0u; i < 4u; ++i) c += sbyte(uint(a), i) * sbyte(uint(b), i); return c; }
+
+// q6_q8_dot(w + block, x + kby, kqs) - wbase is the block's BYTE offset in W, xw the q8 column's
+// WORD offset in X for kby (x + kby).
+float q6_k_dot(uint wbase, uint xw, uint iqs) {
+    const uint bq8_offset  = 4u * (iqs / 16u) + (iqs % 16u) / 8u;
+    const uint scale_off   = 8u * (iqs / 16u) + (iqs % 16u) / 4u;
+    const uint vh_shift    = 2u * ((iqs % 16u) / 8u);
+    const int  vl = rd32(wbase + 4u * iqs);                                   // load_int_b2(ql, iqs)
+    const int  vh = rd32(wbase + 128u + 4u * (8u * (iqs / 16u) + iqs % 8u)) >> int(vh_shift);
+    float sumf = 0.0;
+    for (uint i = 0u; i < 2u; ++i) {
+        const int  sc = rsbyte(wbase + 192u + scale_off + 4u * i);            // scales[4*i] (int8)
+        const int  vil = (vl >> int(4u * i)) & 0x0f0f0f0f;
+        const int  vih = ((vh >> int(4u * i)) << 4) & 0x30303030;
+        const int  vi  = vsub4(vil | vih, 0x20202020);                        // per-byte, no cross-byte borrow
+        const uint xb  = xw + (bq8_offset + 2u * i) * 9u;                     // x[bq8_offset + 2i]
+        const int  u   = int(bx.v[xb + 1u + (iqs % 8u)]);                     // (int*)qs[iqs%8]
+        const float d8 = unpackHalf2x16(bx.v[xb]).x;                          // __low2float(ds)
+        sumf += d8 * float(dp4a(vi, u, 0) * sc);                              // -> fma (contract, law 6)
+    }
+    const float d = unpackHalf2x16(w16(wbase + 208u)).x;                      // w->d (half)
+    return d * sumf;
+}
+
+// double-buffered across columns (max 8) so each c's reduction reads only its own writes
+shared float sh[8][4][4][32];
+
+void main() {
+    const uint tid    = gl_LocalInvocationID.x;      // CUDA tid = 32*threadIdx.y + threadIdx.x
+    const uint lane   = tid & 31u;
+    const uint subrow = tid >> 5u;                   // threadIdx.y
+    const uint nb     = pc.n_in / 256u;              // blocks_per_row
+    const uint row0   = (pc.rows == 4u) ? gl_WorkGroupID.x * 4u : gl_WorkGroupID.x;
+    const uint kqs    = tid % 32u;                   // VDR = 1 for Q6_K
+    const uint maxc   = min(pc.ncols, 8u);
+    for (uint c = 0u; c < maxc; ++c) {
+        float t0 = 0.0, t1 = 0.0, t2 = 0.0, t3 = 0.0;
+        const uint xc = c * (nb * 8u) * 9u;          // column c's x base (words)
+        for (uint kbx = tid / 32u; kbx < nb; kbx += 4u) {   // BLOCKS_PER_ITER = WARPS*WARP/32 = 4
+            const uint xb = xc + kbx * 8u * 9u;      // kby = kbx * QK/Q8K q8 blocks
+            const uint wb0 = kbx * 210u;
+            if (pc.rows == 1u) {
+                t0 += q6_k_dot(row0 * nb * 210u + wb0, xb, kqs);
+            } else {
+                if (row0 + 0u < pc.n_out) t0 += q6_k_dot((row0 + 0u) * nb * 210u + wb0, xb, kqs);
+                if (row0 + 1u < pc.n_out) t1 += q6_k_dot((row0 + 1u) * nb * 210u + wb0, xb, kqs);
+                if (row0 + 2u < pc.n_out) t2 += q6_k_dot((row0 + 2u) * nb * 210u + wb0, xb, kqs);
+                if (row0 + 3u < pc.n_out) t3 += q6_k_dot((row0 + 3u) * nb * 210u + wb0, xb, kqs);
+            }
+        }
+        sh[c][subrow][0u][lane] = t0;
+        if (pc.rows == 4u) {           // ROWS=1: CUDA partial[..][i>0] is never written; keep the
+            sh[c][subrow][1u][lane] = t1;   // slots untouched (zero) so the sum stays exact.
+            sh[c][subrow][2u][lane] = t2;
+            sh[c][subrow][3u][lane] = t3;
+        }
+        groupMemoryBarrier(); barrier();
+        // CUDA :836-841: warp 0 sums tmp + partial[l] l = 0..WARPS-2 ascending, then warp_sum.
+        if (subrow == 0u) {
+            for (uint i = 0u; i < pc.rows; ++i) {
+                float acc = sh[c][0u][i][lane];
+                acc = acc + sh[c][1u][i][lane];
+                acc = acc + sh[c][2u][i][lane];
+                acc = acc + sh[c][3u][i][lane];
+                for (uint o = 16u; o > 0u; o >>= 1u) acc += subgroupShuffleXor(acc, o);   // warp_sum tree
+                if (lane == i && row0 + i < pc.n_out) by.v[c * pc.n_out + row0 + i] = acc;
+            }
+        }
+        groupMemoryBarrier(); barrier();             // next c must not race this c's reads
+    }
+}

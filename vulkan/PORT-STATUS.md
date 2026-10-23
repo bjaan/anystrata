@@ -49,7 +49,7 @@ header helpers, one row per header) | `n/a` (decision `n/a`).
 | q4_k / q5_k / q6_k / q2_0 / q2_k / q3_k (mmvq + f32 pair) | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | todo |
 | iq4_xs / iq4_nl (mmvq + f32 pair) | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | todo |
 | native_mmvq_pair / native_mmvq_slots / native_mmvq_ids | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | todo |
-| native_mmvq (iq2_xxs + q5_k; other types trap-by-name `native_mmvq type <n>`) | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu:3110 + iq_kernels.cu launch_mmvq<16> + native_q5_k_mmvq | native_mmvq_vk_parity.cpp (bitwise) | `__shfl` (warp_sum), `__vcmpne4/__vsub4/dp4a` (scalar-emulated), `iq2xxs_grid` (arena-uploaded table), fp contraction (the CUDA leg builds with --use_fast_math; the vk dot mirrors the fused order) | translate | **ported+parity-green** (vulkan/src/kernels/mmvq_iq2_xxs.comp, mmvq_q5_k.comp, native_mmvq_vk.cpp; iq-family row: format 16 iq2_xxs, format 13 q5_k. q6_k (14) not demanded by the model — traps by number) |
+| native_mmvq (iq2_xxs + q5_k + q6_k; other types trap-by-name `native_mmvq type <n>`) | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu:3110 + iq_kernels.cu launch_mmvq<16> + native_q5_k_mmvq + native_q6_k_mmvq | native_mmvq_vk_parity.cpp (bitwise) | `__shfl` (warp_sum), `__vcmpne4/__vsubss4/dp4a` (scalar-emulated), `iq2xxs_grid` (arena-uploaded table), fp contraction (the CUDA leg builds with --use_fast_math; the vk dot mirrors the fused order) | translate | **ported+parity-green** (vulkan/src/kernels/mmvq_iq2_xxs.comp, mmvq_q5_k.comp, mmvq_q6_k.comp, native_mmvq_vk.cpp; iq-family row: format 16 iq2_xxs, format 13 q5_k, format 14 q6_k. Other types trap by number) |
 | q8_1 interleave: native_quantize_q8_1_il / native_q8_1_interleave / native_mmvq_il / native_q8_1_il_cp | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | todo |
 | native_moe_combine / _multi / _hits / _multi_hits / _multi_hits_gated | native_moe.hpp | src/kernels/cuda/native_moe.cu | native_expert_parity.cpp, native_multi_parity.cpp | `__shared__`, `__ldg` | translate | todo |
 | moe_hit_grouped_s2 / _dev / _multi / _cpu_order, moe_hit_select / _multi, moe_hit_add, moe_grouped_s2, moe_group_resident (setters host-side) | s2_expert_grouped.hpp | src/kernels/cuda/s2_expert_grouped.cu | s2_expert_grouped_parity.cpp, native_grouped_parity.cpp, decode_cluster_parity.cpp | `__shfl`, `__shared__`, `__ldg` | translate | todo |
@@ -204,7 +204,7 @@ Re-run with `STRATA_VK_STUBS=log` enumerates the rest of the qwen35moe decode pa
 | 5 | `strata::poly::gemv_f32` | poly: gemv_kernel — **PORTED (Task 2.4)** |
 | 6 | `strata::poly::conv4_silu` | poly: conv4_silu/_rows/_state kernels — **PORTED (Task 2.4)** |
 | 7 | `strata::poly::gdn_step` | poly: gdn_norm/gates/state/state_reg/out kernels — **PORTED (Task 2.5)** |
-| 7b | `strata::kernels::native_mmvq` type 14 (Q6_K) | native_mmvq family — the model's NEW halt (the pre-digested #8 axpy guess did not hold: qwen35moe's shared-expert/dense mmvq path asks type 14 = Q6_K next) |
+| 7b | `strata::kernels::native_mmvq` type 14 (Q6_K) | native_mmvq family — **PORTED (Task 2.6)** |
 | 8 | `strata::poly::axpy` | poly: axpy_kernel |
 | 9 | `strata::poly::swiglu_clamp` | poly: swiglu_clamp/_rows |
 | 10 | `strata::poly::mul_sigmoid` | poly: mul_sigmoid_kernel |
@@ -277,6 +277,20 @@ rel_l1 sits at 1e-7; never looser, it is the tree's number). NOT bitwise: the re
 explicit __fma spellings vs RADV's lowering land between the arms (Task 2.4's measurement
 pattern; both arms tested, closer one governs). ctest 11/11. Model load 87 s; the gate cleared
 #7 and named `native_mmvq type 14` — demand 7b, port iq2_s before the poly elementwise trio.
+
+**Halt point after Task 2.6 (2026-10-23):** `strata::poly::axpy` — demand #7b cleared: Q6_K (type
+14) ported as mmvq_q6_k.comp (native_q6_k_mmvq_kernel :806-842 + q6_q8_dot/_impl :773-803; VDR=1:
+kbx = tid/32 + 4t, kqs = tid%32, SmallK threshold nb < 4, Q6KBlock 210 B read byte-wise — the
+iq2_xxs precedent, not q5_k's direct word indexing). STRATA_VK_TRACE_MMVQ14: the model asks one
+Q6_K mmvq per token, n_in 4096 n_out 2048 ncols 1 -> nb 16 >= 4, ROWS=1 arm (grid n_out).
+native_mmvq_vk_parity is now 1443/1443 outputs **BITWISE** (6 q6_k shapes incl. both ROWS arms
++ q5_k + iq2_xxs sets). CONTRACTION LAW (this box, q6 leg): the intra-dot `sumf += d8*(dot*sc)`
+fuses to fma exactly as q5_k's, AND the kbx accumulation `tmp += d*sumf` fuses to
+fma(d, sumf, tmp) — visible only when a thread takes >1 kbx iteration (the rows=1 arm): the
+un-fused host arm differs by 1-2 ULP on 38/64 of the first shape, the fused arm matches to the
+bit; rows=4 (nb<4, one iteration) matched either way. ctest 11/11. Model load 94 s, gate reached
+decode and stopped at poly demand #8 (axpy) — the pre-digested demand order resumes: axpy,
+swiglu_clamp, mul_sigmoid (actual halt decides).
 
 Phase-2 first picks by demand order: `copy2`, `rms_norm`, then the mmvq family
 (`native_quantize_q8_1`, `native_mmvq`) — matching the plan's expectation (quantize_act /

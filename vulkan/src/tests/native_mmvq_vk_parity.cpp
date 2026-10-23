@@ -185,6 +185,58 @@ float q5_k_ref(const uint8_t* wr, const uint8_t* xcol, int nb, int row, int rows
     return a[row_in_group];   // lane i's post-tree value answers row0+i
 }
 
+// ---- Q6_K (type 14): transcription of q6_q8_dot / q6_q8_dot_impl (native_mmvq.cu:773-803).
+// Q6KBlock bytes: ql[128]@0, qh[64]@128, scales[16]@192 (int8), d (half)@208; 210 B, not aligned.
+// Returns d and sumf separately: the kbx accumulation `tmp[i] += q6_q8_dot(...)` inlines the dot,
+// and CUDA's --use_fast_math / RADV's NIR fuse `acc + d*sumf` to fma(d, sumf, acc) (the q5_k
+// contraction lineage, PORT-NOTES law 6) — visible only when a thread takes >1 kbx iteration,
+// which is exactly where the unfused host arm disagreed by 1-2 ULP and rows=4 (<=1 iter) matched.
+void q6_k_dot_df(const uint8_t* w, const uint8_t* x, int iqs, float& d, float& sumf) {
+    const int bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;
+    const int scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
+    const int vh_shift = 2 * ((iqs % 16) / 8);
+    const int vl = rd_i32(w + 4 * iqs);                                   // load_int_b2(ql, iqs)
+    const int vh = rd_i32(w + 128 + 4 * (8 * (iqs / 16) + iqs % 8)) >> vh_shift;
+    const int8_t* sc = (const int8_t*)(w + 192 + scale_offset);           // scales[]
+    sumf = 0.0f;
+    for (int i = 0; i < 2; ++i) {
+        const uint8_t* bq8i = x + (bq8_offset + 2 * i) * 36;
+        const int u  = rd_i32(bq8i + 4 + 4 * (iqs % 8));                  // (int*)qs[iqs % 8]
+        const float d8 = f16_to_f32(rd_u16(bq8i));                        // __low2float(ds)
+        const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;
+        const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
+        const int vi  = int(vsub4(uint32_t(vil | vih), 0x20202020u));     // vsubss4 (in-range, exact)
+        sumf = std::fma(d8, float(dp4a(uint32_t(vi), uint32_t(u), 0) * int(sc[4 * i])), sumf);
+    }
+    d = f16_to_f32(rd_u16(w + 208));
+}
+
+// same partition for Q6_K (native_q6_k_mmvq_kernel :806-842): tid = 0..127, kbx = tid/32 + 4t
+// (VDR=1, BLOCKS_PER_ITER=4), kqs = tid%32; rows=1: all four subrows sum one row; rows=4: subrow
+// i does row0+i. warp 0 sums subrow-ascending then the xor tree; lane i writes row0+i.
+float q6_k_ref(const uint8_t* wr, const uint8_t* xcol, int nb, int row, int rows, int row_in_group) {
+    float part[4][32];
+    for (int s = 0; s < 4; ++s) for (int l = 0; l < 32; ++l) part[s][l] = 0.f;
+    for (int tid = 0; tid < 128; ++tid) {
+        const int s = tid / 32, lane = tid % 32, kqs = tid % 32;
+        const int r = (rows == 1) ? row : row + row_in_group;
+        float acc = 0.f;
+        for (int kbx = tid / 32; kbx < nb; kbx += 4) {
+            float d, sumf;
+            q6_k_dot_df(wr + (size_t(r) * nb + kbx) * 210,
+                        xcol + size_t(kbx * 8) * 36, kqs, d, sumf);
+            acc = std::fma(d, sumf, acc);   // contraction: tmp += d*sumf -> fma (see above)
+        }
+        part[s][lane] += acc;
+    }
+    float a[32];
+    for (int l = 0; l < 32; ++l)
+        a[l] = ((part[0][l] + part[1][l]) + part[2][l]) + part[3][l];
+    float n[32];
+    for (int o = 16; o > 0; o >>= 1) { for (int l = 0; l < 32; ++l) n[l] = a[l] + a[l ^ o]; std::memcpy(a, n, sizeof a); }
+    return a[row_in_group];   // lane i's post-tree value answers row0+i
+}
+
 }  // namespace
 
 using namespace strata;
@@ -339,6 +391,81 @@ int main(int argc, char** argv) {
             }
         }
         std::printf("native_mmvq q5_k vk vs reference: n_in %d n_out %d ncols %d rows %d: %d outputs, %d differ bitwise\n",
+                    s.n_in, s.n_out, s.ncols, rows, s.ncols * s.n_out, shape_fails);
+    }
+    // ---- type 14 (Q6_K): n_in 2048 -> rows=1 (nb 8, SmallK=false); 512/256 -> rows=4 (nb<4)
+    const struct { int n_in, n_out, ncols; } q6_shapes[] = {
+        {2048, 64, 1}, {2048, 64, 4}, {2048, 3, 2}, {512, 64, 3}, {256, 3, 1}, {256, 7, 2}};
+    for (const auto& s : q6_shapes) {
+        const int nb = s.n_in / 256;
+        const int rows = (nb < 4) ? 4 : 1;            // mirrors the launcher's SmallK pick
+        std::mt19937 rng(4100 + s.n_in * 13 + s.ncols);
+        std::uniform_real_distribution<float> dsc(0.0009765625f, 0.03125f);   // d in [2^-10, 2^-5)
+        std::vector<uint8_t> W(size_t(s.n_out) * nb * 210);
+        for (auto& blk : W) blk = uint8_t(rng() & 0xFF);
+        for (int r = 0; r < s.n_out; ++r)
+            for (int b = 0; b < nb; ++b) {           // sane fp16 d (byte 208; mmvq_multi_parity's law)
+                const uint16_t dh = f16_rn((rng() & 1) ? -dsc(rng) : dsc(rng));
+                std::memcpy(W.data() + (size_t(r) * nb + b) * 210 + 208, &dh, 2);
+            }
+        std::vector<float> x(size_t(s.n_in) * s.ncols);
+        for (auto& v : x) v = float(int(rng() % 2001) - 1000) / 250.0f;
+
+        const uint64_t w_sz = W.size(), w_pad = (w_sz + 3) & ~3ull;
+        const uint64_t x_sz = size_t(s.n_in) / 32 * s.ncols * 36;
+        const uint64_t y_sz = size_t(s.ncols) * s.n_out * 4;
+        const uint64_t ax = a.alloc(x.size() * 4), aq = a.alloc(x_sz);
+        const uint64_t aw = a.alloc(w_pad + 4), ay = a.alloc(y_sz);
+        vk::copy_h2d((void*)ax, x.data(), x.size() * 4, nullptr);
+        vk::copy_h2d((void*)aw, W.data(), w_sz, nullptr);
+        vk::fill_d((void*)ay, 0xFE, y_sz, nullptr);
+        kernels::native_quantize_q8_1((const float*)strata_vk_compat::wrap(ax), strata_vk_compat::wrap(aq),
+                                      s.n_in, s.ncols, strata_vk_compat::wrap(1000));
+        std::vector<uint8_t> Q(x_sz);
+        vk::copy_d2h(Q.data(), (void*)aq, x_sz, nullptr);
+
+        kernels::native_mmvq(14, strata_vk_compat::wrap(aw), strata_vk_compat::wrap(aq),
+                             (float*)strata_vk_compat::wrap(ay), s.n_in, s.n_out, s.ncols,
+                             strata_vk_compat::wrap(1000));
+        std::vector<float> y(size_t(s.ncols) * s.n_out);
+        vk::copy_d2h(y.data(), (void*)ay, y_sz, nullptr);
+
+        int shape_fails = 0;
+        for (int c = 0; c < s.ncols; ++c) {
+            const uint8_t* xcol = Q.data() + size_t(c) * nb * 8 * 36;
+            if (rows == 1) {
+                for (int r = 0; r < s.n_out; ++r) {
+                    const float ref = q6_k_ref(W.data(), xcol, nb, r, 1, 0);
+                    const float got = y[size_t(c) * s.n_out + r];
+                    ++compared;
+                    if (got != ref) {
+                        if (shape_fails < 8) {
+                            uint32_t gb, rb; std::memcpy(&gb, &got, 4); std::memcpy(&rb, &ref, 4);
+                            std::printf("  MISMATCH q6k n_in %d ncols %d r %d: got %.9g ref %.9g (bits %08x/%08x)\n",
+                                        s.n_in, c, r, got, ref, gb, rb);
+                        }
+                        ++shape_fails; ++fails;
+                    }
+                }
+            } else {
+                for (int g = 0; g < (s.n_out + 3) / 4; ++g)
+                    for (int i = 0; i < 4 && g * 4 + i < s.n_out; ++i) {
+                        const int r = g * 4 + i;
+                        const float ref = q6_k_ref(W.data(), xcol, nb, g * 4, 4, i);
+                        const float got = y[size_t(c) * s.n_out + r];
+                        ++compared;
+                        if (got != ref) {
+                            if (shape_fails < 8) {
+                                uint32_t gb, rb; std::memcpy(&gb, &got, 4); std::memcpy(&rb, &ref, 4);
+                                std::printf("  MISMATCH q6k n_in %d ncols %d r %d: got %.9g ref %.9g (bits %08x/%08x)\n",
+                                            s.n_in, c, r, got, ref, gb, rb);
+                            }
+                            ++shape_fails; ++fails;
+                        }
+                    }
+            }
+        }
+        std::printf("native_mmvq q6_k vk vs reference: n_in %d n_out %d ncols %d rows %d: %d outputs, %d differ bitwise\n",
                     s.n_in, s.n_out, s.ncols, rows, s.ncols * s.n_out, shape_fails);
     }
     std::printf("native_mmvq_vk_parity: %d outputs compared bitwise, %d differ -> %s\n",
