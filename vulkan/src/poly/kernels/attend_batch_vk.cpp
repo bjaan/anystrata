@@ -26,6 +26,7 @@
 #include "strata/vulkan_compat/cuda_fp16.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -64,6 +65,37 @@ const vk::Kernel& pl_scale() {
     return k;
 }
 inline long long gridll(long long n, long long block) { return (n + block - 1) / block; }
+
+// STRATA_VK_GEMM_WALL=1 companion: real GPU time for a whole attend_batch call (drain before/
+// after; same measurement arm as the GEMM wall, so attend-GEMM f16 wall + this = attend total).
+long long g_attend_calls = 0;
+double g_attend_ms = 0.0;
+struct AttendWall {
+    static bool on() { static const bool v = std::getenv("STRATA_VK_GEMM_WALL") != nullptr; return v; }
+    static long long& calls() { return g_attend_calls; }
+    static double& ms() { return g_attend_ms; }
+    std::chrono::steady_clock::time_point t0;
+    bool armed;
+    AttendWall() : armed(on()) {
+        if (!armed) return;
+        vk::device_sync();
+        t0 = std::chrono::steady_clock::now();
+    }
+    ~AttendWall() {
+        if (!armed) return;
+        vk::device_sync();
+        ms() += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        calls()++;
+    }
+};
+struct AttendWallDump {
+    ~AttendWallDump() {
+        if (AttendWall::on() && AttendWall::calls())
+            std::fprintf(stderr, "%-24s calls=%lld gpu-drain=%.1fms\n",
+                         "attend_batch total", AttendWall::calls(), AttendWall::ms());
+    }
+};
+AttendWallDump g_attend_dump;
 }  // namespace
 
 void attend_batch(void* blas, const float* q, const uint16_t* kcache, const uint16_t* vcache, int64_t pos, int rows,
@@ -90,6 +122,7 @@ void attend_batch(void* blas, const float* q, const uint16_t* kcache, const uint
                              "window=%d ring=%d whole=%d score_floats=%zu\n",
                      (long long) pos, rows, dim, n_head, kv_heads, (double) scale, window, ring, int(whole),
                      score_floats);
+    AttendWall g_attend_wall;
     const float one = 1.0f, zero = 0.0f;
     const long long last = whole ? pos + rows - 1 : -1;
     // CUDA 2596-2597: two thirds of the scratch for a block's scores, the rest for the f16

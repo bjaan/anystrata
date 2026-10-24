@@ -5,7 +5,7 @@
 // (server-queue), the task and result types with their OpenAI/Anthropic/Responses JSON (server-task), request parsing,
 // tokenization helpers and SSE formatting (server-common), the request schema (server-schema). What this file adds is
 // the part that llama.cpp does with llama_context, llama_batch and common_sampler and that the engine does inside
-// its own process: run one request at a time through `strata`/`strata-poly`, turn its `T <id>` lines into partial
+// its own process: run one request at a time through `strata`/`omnistrata-gguf`, turn its `T <id>` lines into partial
 // results, and its `DONE` line into the final one.
 #pragma once
 

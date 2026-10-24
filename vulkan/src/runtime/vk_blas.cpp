@@ -69,6 +69,10 @@ struct MMParams {   // must match mm_gemm.comp's push_constant block (56B of fie
 };
 static_assert(sizeof(MMParams) == 64, "push-constant struct must be exactly 64B");
 
+// GPU-wall counters (STRATA_VK_GEMM_WALL=1 measurement arm; see dump()).
+long long g_wall_calls = 0, g_wall_f16_calls = 0, g_wall_f32_calls = 0;
+double g_wall_ms = 0.0, g_wall_f16_ms = 0.0, g_wall_f32_ms = 0.0;
+
 // The strided-batched GPU arm. Returns true = launched (queue-ordered against the runtime's
 // other work); false = the caller runs the CPU reference. Element extents stay under 2^31 and
 // every binding offset 4-byte aligned (the kernel addresses f16 through uint words).
@@ -110,12 +114,32 @@ bool gemm_gpu(cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
     const uint64_t bufs[3] = {ao, bo, co};
     const uint64_t sizes[3] = {(uint64_t) topA * (uint64_t) ea, (uint64_t) topB * (uint64_t) ea,
                                (uint64_t) topC * 4ull};
+    // STRATA_VK_GEMM_WALL=1: drain before/after the launch so the enqueue-only BlasClock gets a
+    // companion measuring real GPU time per GEMM (measurement arm; serialization is queue-order
+    // the per-dispatch barrier already imposes, so results stay bitwise-identical).
+    static const bool gemm_wall = std::getenv("STRATA_VK_GEMM_WALL") != nullptr;
+    std::chrono::steady_clock::time_point wall_t0;
+    if (gemm_wall) { strata::vk::device_sync(); wall_t0 = std::chrono::steady_clock::now(); }
     try {
         strata::vk::kernel_launch_sized(mm_kernel(transA, f16 ? 1 : 0), pc.tilesX * pc.tilesY * pc.batch,
                                 bufs, sizes, 3, &pc);
     } catch (const std::exception& e) {   // e.g. a span crossing an arena piece: the reference still runs
+        if (gemm_wall) strata::vk::device_sync();
         note_fallback(e.what());
         return false;
+    }
+    if (gemm_wall) {
+        strata::vk::device_sync();
+        const double dt = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wall_t0).count();
+        g_wall_ms += dt;
+        g_wall_calls++;
+        // f16 GEMMs happen only in attend_batch (scores/values); f32 in gemm_f32 dense proj.
+        if (f16) { g_wall_f16_ms += dt; g_wall_f16_calls++; }
+        else     { g_wall_f32_ms += dt; g_wall_f32_calls++; }
+        if (std::getenv("STRATA_VK_GEMM_SHAPES"))
+            std::fprintf(stderr, "gemm_wall: %s m=%d n=%d k=%d b=%d tiles=%dx%d groups=%d %.2fms\n",
+                         f16 ? "f16" : "f32", m, n, k, batch, pc.tilesX, pc.tilesY,
+                         pc.tilesX * pc.tilesY * batch, dt);
     }
     return true;
 }
@@ -166,7 +190,11 @@ void dump() {
                      kv.second.bm, kv.second.bn, kv.second.bk, kv.second.bb);
         tot += kv.second.total_ms;
     }
-    std::fprintf(stderr, "%-24s total=%.1fms\n", "ALL cublas", tot);
+    std::fprintf(stderr, "%-24s total=%.1fms\n", "ALL cublas (enqueue)", tot);
+    if (g_wall_calls)
+        std::fprintf(stderr, "%-24s calls=%lld gpu-drain=%.1fms (f16 %lld/%.1fms, f32 %lld/%.1fms)\n",
+                     "GPU GEMM wall", g_wall_calls, g_wall_ms,
+                     g_wall_f16_calls, g_wall_f16_ms, g_wall_f32_calls, g_wall_f32_ms);
     std::fflush(stderr);
 }
 struct BlasStatDump {

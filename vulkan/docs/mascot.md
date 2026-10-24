@@ -1,9 +1,13 @@
-# Strata Cyan — mascot character sheet (Vulkan engine)
+# Omni Cyan — mascot character sheet (omnistrata)
 
 ## Identity (fixed canon — never varies)
-- **Name:** Strata Cyan ("the girl made of layers"); short form **Cyan**.
-- **What she brands:** the Vulkan backend — one engine, any Vulkan 1.2+ GPU (Radeon, Intel
-  Arc, APUs, MoltenVK bridges). Cyan = the Vulkan spec's light, not a vendor color.
+- **Name:** **Omni Cyan** ("the girl made of layers, for every GPU"). *Omni* from the project
+  name — one engine, every GPU; *Cyan* from the Vulkan spec's cyan light, "the color of any GPU
+  at night". She was first drawn as "Omni Cyan" under the old name; the rename carried over to
+  her — same character, one more honest word.
+- **What she brands:** omnistrata as a whole — by default its Vulkan backend: any Vulkan 1.2+
+  GPU (Radeon, Intel Arc, APUs, MoltenVK bridges), with CUDA/HIP/SYCL/Metal as opt-in backends
+  where they win. Cyan = the Vulkan light, not a vendor color.
 - **Core metaphor:** experts living in VRAM, streamed to the card. Everything below encodes it.
 - **Origin (a biographical fact, not a setting):** the BC-250 board (die: *Cyan Skillfish*),
   where the port was written and first answered **17 × 23 = 391**. Reference her birthplace

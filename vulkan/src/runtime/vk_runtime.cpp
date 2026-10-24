@@ -419,6 +419,24 @@ Kernel kernel_load(const char* name, const uint32_t* spv, size_t spv_bytes, int 
 // `buffers` are arena offsets; `sizes` the same length, each span required to sit inside one arena piece.
 void kernel_launch_sized(const Kernel& k, int groups_x, const uint64_t* buffers, const uint64_t* sizes,
                          int n_buffers, const void* push_constants) {
+    // Prefill-tuning probe (STRATA_VK_LAUNCH_TIME=1): host time spent inside the launch path
+    // and the total dispatch count. Env-gated chrono only; no behavior change.
+    static const bool launch_time = getenv("STRATA_VK_LAUNCH_TIME") != nullptr;
+    static long long launch_calls = 0;
+    static double launch_ms = 0.0;
+    static struct LaunchDump { ~LaunchDump() {
+        if (launch_calls) std::fprintf(stderr, "=== kernel_launch_sized: calls=%lld host=%.1fms ===\n",
+                                       launch_calls, launch_ms); } } g_launch_dump;
+    struct LaunchTimer {
+        std::chrono::steady_clock::time_point t0; bool on;
+        LaunchTimer() : on(launch_time) { if (on) t0 = std::chrono::steady_clock::now(); }
+        ~LaunchTimer() {
+            if (!on) return;
+            launch_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (++launch_calls % 50000 == 0)
+                std::fprintf(stderr, "vk launch host: calls=%lld ms=%.1f\n", launch_calls, launch_ms);
+        }
+    } lt;
     std::lock_guard<std::mutex> lk(g_km());
     auto it = g_kernels.find((uint64_t)k.pipeline);
     if (it == g_kernels.end()) throw std::runtime_error("vk_runtime: launch of an unloaded kernel");

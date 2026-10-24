@@ -4,25 +4,75 @@ The engines are PolyStrata's, by VecSzn and contributors, built on [Strata](http
 Niko1221. The front end is built from [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)'s server, common and
 mtmd code. Qwen3.8-Flash-Next and Qwen3.6-35B-A3B are by the Qwen team; the IQ3_XXS GSQ-RCO file is
 [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)'s, the Qwen3.6 files are
-[Unsloth](https://huggingface.co/unsloth)'s. Upstream's full credits: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits).
+[Unsloth](https://huggingface.co/unsloth)'s and [chtisgit](https://huggingface.co/chtisgit)'s GSQ conversions.
+Upstream's full credits: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits).
 MIT License ([LICENSE](LICENSE)); some parts and every model have their own licenses
 ([which ones](docs/HOW_IT_WORKS.md#license)).
 
-# UnbiasedStrata 2 - note from a human.
+# omnistrata — Strata for every GPU
 
+One `make`, no vendor SDK: an inference engine and OpenAI-compatible server for Mixture-of-Experts LLMs, built
+around one idea — **the experts live in VRAM**: each token reads only the few experts it routes to, so a 35B MoE
+runs at chat speed on the card you already own. The default build speaks **Vulkan**: any AMD under Mesa, any APU,
+any GPU ROCm abandoned — just the driver already installed. No installer, no downloads at build or start, no
+Python between a request and a token. The CUDA, HIP, SYCL and Metal backends stay for the cards where they win;
+CUDA remains the reference everything is measured against.
 
-Issues with Strata / PolyStrata:
+```
+git clone <this repo> && cd omnistrata
+git submodule update --init      # shallow, third_party/llama.cpp @ robertkarl/llama.cpp (a6de9af3)
+make                             # the Vulkan engine: build-vk/bin/{omnistrata-gguf-vk, omnistrata}
+make test                        # the front end against a fake engine; no GPU, no model
+make build                       # the CUDA engine, opt-in: build/bin/{omnistrata-pack, omnistrata-gguf, libstrata_kq.so, omnistrata}
+```
 
+## Why this exists
+
+MoE models are cheap to run if you exploit their structure: a token activates a few percent of the weights.
+Strata's engines have scheduled exactly that — expert caches, routed GEMVs, speculative decoding — for NVIDIA
+first. This repo carries the port of that engine, kernel by kernel and parity test by parity test, to Vulkan
+(`vulkan/`): the cards nobody's CUDA serves — AMD APUs Mesa keeps as RADV homes, integrated graphics, and
+oddities like the BC-250, a repurposed PS5 board with 16 GB of unified memory that ROCm refuses to see. On one
+such board, Qwen3.6-35B-A3B at 2 bits keeps all 10,240 routed experts resident in VRAM, decodes ~19 tok/s, and
+answers `pi` and other coding agents over the OpenAI API.
+
+The port is held to the fork's correctness culture: integer arithmetic is **bitwise** against the CUDA tree (a
+parity suite of ~50,000 outputs, zero differences, across every quantized weight format the models use — Q2_0,
+Q8_0, the K-quants, the IQ-quants), float paths at the tree's own tolerances with the measured driver laws
+recorded per GPU family, and the teacher-forced harness (`bench/correctness/`) as the acceptance gate. Any format
+or path not yet ported refuses loudly, by name — it never answers with a wrong kernel. The CUDA/HIP sources under
+`src/` and `include/strata/` are untouched by the port: `git diff` against the import commit is still the whole
+story, the rule [UPSTREAM.md](UPSTREAM.md) exists to keep.
+
+## Origins
+
+The lineage, spelled out because the name changed:
+
+1. **[Strata](https://github.com/Niko1221/Strata)** (Niko1221) — the original expert-streaming engine, NVIDIA first.
+2. **[PolyStrata](https://github.com/VecSzn/PolyStrata)** (VecSzn and contributors) — many model families
+   (`strata-poly` reading GGUFs in place: Qwen3.6, GLM, Gemma 4, DeepSeek, LFM, Ornith, Tiel…) and many GPUs:
+   AMD/HIP, Intel/SYCL, Apple/Metal. Its v0.1.45-poly.1 release is imported into this repo **byte for byte**
+   (verified tree hash, commit `0197ae86`).
+3. **UnbiasedStrata** (robertkarl) — the suckless/dwm treatment: the installer, the build- and run-time downloads,
+   and the Python middle layer are gone; in their place a C++ front end built from llama.cpp's own server code.
+   The human note that opened this README — *"Strata minus the bullshit. clone, rsync to compile and go"* — is
+   still the rule.
+4. **omnistrata** — the same project, renamed 2026-10-24 because the Vulkan port made GPU coverage the headline:
+   one engine family, every GPU that speaks a backend. Hence *omni*strata, and the binaries carry it
+   (`omnistrata` the front end, `omnistrata-gguf` the engine, `omnistrata-gguf-vk` the Vulkan build,
+   `omnistrata-pack` the original pack engine). "Poly" and "unbiased" live on in the history and in the credits,
+   not in the names. The GitHub repo keeps its old name until it is pushed elsewhere; the tree is what changed.
+
+```
+Issues with Strata / PolyStrata, from the human who forked it:
 * piping instructions from markdown into agent == bad idea
 * replacing components at build-time or runtime isn't great
 * desired: clone; submodule init; make; situation
 
-UnbiasedStrata aims to be the suckless (dwm) variant of Strata.
-
 It's been vetted in a few ways:
 * agents went through and verified kernels to the difference between CPU/GPU within llama.cpp
 * full a run of Qwen 3.8 Flash Next over Bob-bench wide test set with a high score.
-
+* and, in the Vulkan port, ~50,000 kernel outputs held bitwise against the CUDA tree (vulkan/PORT-STATUS.md).
 
 This wouldn't exist without llama.cpp.
 
@@ -30,25 +80,7 @@ without Niko's Strata.
 
 Without PolyStrata either.
 
-Use at your own risk. Works on my machine.
-
-
-# AI generate nonsense from here on out
-
-
-
-A fork of [PolyStrata](https://github.com/VecSzn/PolyStrata) v0.1.45-poly.1 that keeps its two inference engines
-unchanged and replaces everything around them: no installer, no downloads at build or start, no Python between a
-request and a token. One `make build` on a Linux box with an NVIDIA card produces the engines and a C++ front end,
-`unbiased-strata`, that serves an OpenAI-style chat API from llama.cpp's own server code. The target is one NVIDIA GPU,
-Pascal or newer, CUDA 12.x, Linux x86-64, on a machine that may have no network at all. What was changed and why is in
-[UPSTREAM.md](UPSTREAM.md); the plan this follows is [PLAN.md](PLAN.md).
-
-```
-git clone <this repo> && cd UnbiasedStrata
-git submodule update --init          # shallow, third_party/llama.cpp @ robertkarl/llama.cpp UnbiasedStrata (a6de9af3)
-make build                           # build/bin/{strata,strata-poly,strata-dsv41,libstrata_kq.so,unbiased-strata}
-make test                            # the front end against a fake engine; no GPU, no model
+Use at your own risk. Works on my machine — and now, on yours.
 ```
 
 ## Box setup — CliffsNotes
@@ -74,7 +106,7 @@ Pascal — GTX 1080 Ti, compute 6.1:
 ```bash
 nvcc --list-gpu-arch | grep -q compute_61                       # CUDA 13 has no sm_61; stay on 12.4
 nvidia-smi --query-gpu=driver_version --format=csv,noheader     # 550 is below CUDA 13's requirement (>= 580)
-git clone https://github.com/robertkarl/UnbiasedStrata && cd UnbiasedStrata
+git clone https://github.com/robertkarl/UnbiasedStrata && cd UnbiasedStrata   # the repo directory keeps the old name until it is renamed upstream
 JOBS=4 make test                                                # no GPU, no model
 JOBS=4 make build CUDA_ARCHS=61                                 # -DSTRATA_EXPERIMENTAL_SM60=ON, -ccbin /usr/bin/g++-13; 15 min, 398 MB, 53 warnings
 ```
@@ -82,7 +114,7 @@ JOBS=4 make build CUDA_ARCHS=61                                 # -DSTRATA_EXPER
 Ada — RTX 4090, compute 8.9:
 
 ```bash
-git clone https://github.com/robertkarl/UnbiasedStrata && cd UnbiasedStrata
+git clone https://github.com/robertkarl/UnbiasedStrata && cd UnbiasedStrata   # the repo directory keeps the old name until it is renamed upstream
 make test
 make build CUDA_ARCHS=89                                        # 6m40 on 16 cores, 557 MB, 0 warnings
 ```
@@ -90,38 +122,60 @@ make build CUDA_ARCHS=89                                        # 6m40 on 16 cor
 ## Run
 
 ```
-unbiased-strata --engine <strata|strata-poly|strata-dsv41|path> -m <model.gguf> [llama-server options] -- <engine options>
+omnistrata --engine <omnistrata-pack|omnistrata-gguf|omnistrata-gguf-dsv41|path> -m <model.gguf> [llama-server options] -- <engine options>
 ```
 
 `-m` names the GGUF the vocabulary and chat template are read from; no tensors are loaded from it by the front end.
 `--engine` takes a path, or a bare name looked up beside the program. Everything before `--` is a `llama-server`
-option (`--host`, `--port`, `--api-key`, `--alias`, `--temp`, `--top-k`, `--top-p`, `--min-p`,
+option (`--host`, `--port`, `--api-key`, `--alias`, `--temp`, `--top-k`, `--top-p`, `--min-p`, `--presence-penalty`,
 `--reasoning-format`, `--chat-template-kwargs`, `--sse-ping-interval`, ...); everything after `--` goes to the
-engine, which is started as a child process with `--serve` added and spoken to over its line protocol
+engine, started as a child with `--serve` added and spoken to over its line protocol
 ([docs/BACKENDS.md](docs/BACKENDS.md)). Where the model ends up (GPU cache, pinned RAM, SSD) and the three expert
-modes: [docs/MEMORY_LAYOUT.md](docs/MEMORY_LAYOUT.md). The server answers `/v1/chat/completions` (streaming and not), `/v1/models`,
-`/health`, `/props`, `/tokenize`, `/detokenize`, as llama.cpp's server does, one request at a time.
+modes: [docs/MEMORY_LAYOUT.md](docs/MEMORY_LAYOUT.md). The server answers `/v1/chat/completions` (streaming and
+not), `/v1/models`, `/health`, `/props`, `/tokenize`, `/detokenize`, one request at a time.
+
+Vulkan, the default — Qwen3.6-35B-A3B 2-bit GSQ (chtisgit's hybrid conversion of ISTA-DASLab's checkpoint; 12.2 GB;
+all 10,240 routed experts in VRAM) on a Mesa-AMD card, with the Qwen3.6 sampling defaults:
 
 ```
-build/bin/unbiased-strata --engine build/bin/strata-poly \
+build-vk/bin/omnistrata --engine build-vk/bin/omnistrata-gguf-vk \
+  -m /models/Qwen3.6-35B-A3B-GSQ-hybrid.gguf --host 127.0.0.1 --port 18090 \
+  --alias qwen3.6-35b-a3b-gsq-hybrid --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0 --presence-penalty 1.5 \
+  -- --model /models/Qwen3.6-35B-A3B-GSQ-hybrid.gguf --no-graphs --max-context 16384
+```
+
+CUDA, the reference path — Qwen3.6-35B-A3B from an Unsloth GGUF:
+
+```
+build/bin/omnistrata --engine build/bin/omnistrata-gguf \
   -m /models/Qwen3.6-35B-A3B-UD-Q3_K_M.gguf --host 127.0.0.1 --port 18091 --alias qwen3.6-35b-a3b-ud-q3_k_m \
   -- --model /models/Qwen3.6-35B-A3B-UD-Q3_K_M.gguf --max-context 32768 \
      --expert-profile /models/expert-profile-q3km.txt --tail-skip 6
 ```
 
-With pictures, add `--mmproj /models/mmproj-F16.gguf` (the projector from the same `-MTP` repository) and
-`--threads N` for the encoder before the `--`. The front end checks the projector's width against the model's at
-start, encodes each picture with llama.cpp's mtmd and hands the rows to the engine over upstream's `GENI`
-protocol. A picture is at most 300 rows by default (upstream's installer's CPU setting; `--image-max-tokens`
-changes it), which read a 1920x1080 dashboard correctly in 15 s of encoding on a Ryzen 7 1700.
-Flash-Next through `strata` takes the same `--mmproj` (its own BF16 projector) and also needs `--vision` after the
-`--`, or the engine refuses the rows ("this engine was started without --vision"); checked on the 4090, 2026-10-20.
+With pictures, add `--mmproj /models/mmproj-F16.gguf` (the projector from the same repository) and `--threads N`
+before the `--`; the front end encodes each picture once (picture cache, keyed by its SHA-256) and hands the rows
+to the engine over the `GENI` protocol. A picture is at most 300 rows by default (`--image-max-tokens` changes it).
+The pack engine (`omnistrata-pack`, Qwen3.8-Flash-Next) takes its own BF16 projector and also needs `--vision`
+after the `--`. Pack preparation (`tools/iq_pack.py`, `tools/mtp_fetch.py`, `tools/mtp_pack.py`, `tools/mtp_rt.py`)
+is unchanged; published packs stay at https://huggingface.co/robertkarl/UnbiasedStrataPacks (name kept for
+continuity). Model files are downloaded on a network box and copied in; the served files with sizes and SHA-256
+are in [docs/MODEL-FILES.md](docs/MODEL-FILES.md).
 
-**Qwen3.8-Flash-Next GSQ-RCO IQ3_XXS** (`strata`; the two GGUF shards, the pack directory made from shard 1, the MTP
-draft directory). On the 24 GB card:
+## Backends
+
+| Backend | Command | Needs | Status |
+| --- | --- | --- | --- |
+| **Vulkan** (default) | `make` | a Vulkan loader, glslc; any Vulkan 1.2+ driver | the port: [docs/VULKAN.md](docs/VULKAN.md) |
+| CUDA | `make build` | CUDA 12.x | upstream's, unchanged; the reference |
+| AMD HIP | `-DSTRATA_ENABLE_HIP=ON` | ROCm 7 (gfx1100/gfx1201 validated) | upstream's |
+| Intel SYCL | `-DSTRATA_ENABLE_SYCL=ON` | oneAPI/icpx | upstream's (community) |
+| Metal | `metal/` | macOS | upstream's (community) |
+
+### Example lines (the pack and DeepSeek-V4.1 engines, CUDA path)
 
 ```
-build/bin/unbiased-strata --engine build/bin/strata \
+build/bin/omnistrata --engine build/bin/omnistrata-pack \
   -m /models/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf \
   --host 127.0.0.1 --port 18090 --alias qwen3.8-flash-next-iq3_xxs --sse-ping-interval 10 \
   -- --pack /models/pack-iq3-xxs \
@@ -133,11 +187,11 @@ build/bin/unbiased-strata --engine build/bin/strata \
 ```
 
 
-**DeepSeek-V4.1-Flash-1017, ISTA-DASLab IQ2_XXS** (`strata-dsv41`, Strata v0.2.4's third engine; the four shards,
+**DeepSeek-V4.1-Flash-1017, ISTA-DASLab IQ2_XXS** (`omnistrata-gguf-dsv41`, Strata v0.2.4's third engine; the four shards,
 the shared Engram file, Unsloth's DSpark drafter and a pack directory made from them): [docs/DEEPSEEK41.md](docs/DEEPSEEK41.md).
 
 ```
-build/bin/unbiased-strata --engine build/bin/strata-dsv41 \
+build/bin/omnistrata --engine build/bin/omnistrata-gguf-dsv41 \
   -m /models/dsv41/IQ2_XXS/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf \
   --host 127.0.0.1 --port 11434 --alias deepseek-v4.1-flash-1017-ista-iq2_xxs --sse-ping-interval 10 \
   --chat-template-file data/dsv41/chat_template-ista-1017.jinja --temp 1.0 --top-p 1.0 --min-p 0.0 --top-k 64 \
@@ -146,7 +200,7 @@ build/bin/unbiased-strata --engine build/bin/strata-dsv41 \
 
 ### Preparing a Flash-Next pack
 
-`strata-poly` reads a GGUF as it is. `strata` needs a pack directory and an MTP draft directory made once, offline
+`omnistrata-gguf` reads a GGUF as it is. `omnistrata-pack` needs a pack directory and an MTP draft directory made once, offline
 except for the draft download, with upstream's tools (`tools/requirements.txt`: numpy, regex; `gguf-py` comes from the
 submodule). This is what upstream's installer ran. Re-run in this fork on 2026-10-20 on three hosts; the MTP directory
 came out byte-identical each time, so it is published, with the commands and hashes, at
@@ -164,63 +218,36 @@ Model files themselves are downloaded on a machine with network access and copie
 not fetch them. The files that have been served, with sizes and SHA-256, are in
 [docs/MODEL-FILES.md](docs/MODEL-FILES.md).
 
+
 ## Measured
 
-Each number came from a run directory with the command, the raw client output, the server log and the model files'
-checksums; the per-run records were removed from the tree on 2026-10-19 and are in git history at commit 7551f138 (`git checkout 7551f138 -- bench/unbiased bench/results`). What stays in `bench/` is
-reusable tooling only: upstream's `bench_vs_llama.py` and its corpus, the kernel probes, and `bench/correctness/`, the
-teacher-forced harness of the correctness checks. Tokens per second, median of 3 runs. Upstream is PolyStrata v0.1.45-poly.1 with its Python
-server, on the same card, the same files, the same client, back to back.
+The CUDA and upstream-vs-fork tables (RTX 3090 / A6000 / B200 numbers, PLAN.md steps 6-13, the teacher-forced
+correctness record with its USTRAT tickets, the pi acceptance runs) are unchanged and live in `docs/`,
+`bench/correctness/` and git history at 7551f138. New, from the port itself — **BC-250 (gfx1013 APU, Mesa/RADV:
+no CUDA, no ROCm)** with Qwen3.6-35B-A3B GSQ-hybrid 2-bit, 10,240/10,240 experts resident:
 
-**Upstream versus this fork, RTX 3090, 2026-10-18** (the step-9 record, in history at 7551f138; the client is
-upstream's `tools/strata_bench.py --runs 3 --long` plus a three-document sustained supplement):
+| Gate | Result |
+| --- | --- |
+| decode (16 / 128 token runs) | 18.3 / up to 24.3 tok/s |
+| prefill (735 / 4,954 token prompts) | 32 / 50 tok/s (5.5x after the GPU tiled GEMM; tuning continues) |
+| `pi` coding agent (1.6K-token system prompt) | served repeatedly: 52 s round trip, KV reuse, grammar parse |
+| parity vs the CUDA tree | ~50,000 outputs bitwise; runtime driver laws per GPU, measured |
 
-| Model | Workload | upstream | fork |
-| --- | --- | --- | --- |
-| Flash-Next IQ3_XXS, 64K ctx | chat decode | 87.1 | 103.1 |
-| | sustained decode, 512 tokens | 105.1 | 119.1 |
-| | prefill 4K / 16K / 32K | 1924 / 2342 / 2393 | 2065 / 2531 / 2616 |
-| | agent turn decode | 110.6 | 116.8 |
-| Qwen3.6 UD-Q3_K_M, 32K ctx | chat decode | 220.8 | 213.5 |
-| | sustained decode, 512 tokens | 207.6 | 200.0 |
-| | prefill 4K / 16K | 3652 / 3570 | 3822 / 3486 |
-| | agent turn decode | 194.0 | 186.9 |
+(llama.cpp's own Vulkan backend on the same card and model: ~76 tok/s decode — the ceiling this backend climbs
+toward while keeping Strata's expert-cache design, which is what lets a 12 GB model sit entirely inside
+15.7 GB of unified memory.)
 
-Flash-Next: the fork is ahead on every workload. Qwen3.6: decode is within the run-to-run range; 16K prefill is 2.3 %
-slower with non-overlapping ranges and is recorded as an open finding. The two engines were built separately in the
-two trees, so an engine-build difference is not excluded.
+## Known limits
 
-**pi on a fixed coding task** (pi 0.85.1, Flash-Next on the 3090, three runs a side, `…-step9/row3/`): every run
-completed the task. Generated tokens per wall-clock second, the whole run: upstream 72.1, fork 76.6 (medians); the raw
-wall times (36.3 vs 44.7 s) follow the length of each sampled trajectory.
+Read [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) and the backend pages before filing anything. The Vulkan
+port's open items are enumerated in `vulkan/PORT-STATUS.md`: captured graphs are pending Phase 4.2 (run
+`--no-graphs`), prefill tiles are under tuning, and every unported format or path traps by name — loudly, never
+silently. pi's compaction defaults assume >64K windows; serve more context or lower them (USTRAT-8).
 
-**Short-prompt decode through the fork, first end-to-end runs** (`…-step6/`, 2026-10-17; ranges over the smoke
-requests, not medians of a benchmark):
+## Mascot
 
-| Model | RTX 3090 | RTX A6000 |
-| --- | --- | --- |
-| Qwen3.6 UD-Q3_K_M | 211 to 227 | 214 to 235 |
-| Qwen3.6 UD-IQ4_XS | 205 to 245 | 207 to 215 |
-
-Greedy answers to the same prompt were identical on the two boxes and identical to upstream on the pod for both
-Flash-Next and Qwen3.6 (text and token count). Against llama.cpp at the pinned commit (PLAN.md step 12,
-harness `bench/correctness/`, record in history at 7551f138, 2026-10-18 on the A6000): teacher-forced on 16 sequences per model, both engines' per-step
-distributions are as close to llama.cpp's GPU run as llama.cpp's own CPU run is (mean KL 0.6 to 1.2x that spread on every
-set and arm), and the greedy token agrees at every position with a 0.5-nat margin except a handful of near ties per arm
-(Qwen3.6: 4 of 2,700; Flash-Next: 0 to 4 of about 2,880 depending on the arm). The findings, each with a ticket, are in
-that directory's README: upstream's own `poly_expert_parity` exceeds its bound on one expert; speculation is not bitwise
-inert above 4-token windows (it passes the KL gate); `strata`'s bits depend on the free VRAM at start when not every
-expert fits the card. Extended 2026-10-19 to DeepSeek V4 Flash UD-IQ2_XXS and GLM 5.3 Flash 3.0bit on a 2x RTX PRO 6000 pod (section 8 of that record): T2 holds on every set and arm, 0.69 to 1.13x llama.cpp's own CPU-vs-GPU spread; a handful of 0.5-nat-margin flips per model where both llama.cpp runs agree (USTRAT-10); on GLM the draft block's VRAM moves 52 experts to the CPU, so its answers are not bitwise the no-draft ones (USTRAT-9); and llama.cpp master's CPU run differs from the pinned commit's by as much as the engine does, so the DeepSeek numbers are against 3cf03257 specifically (USTRAT-11).
-
-**Model acceptance (PLAN.md step 13, 2026-10-19).** A coding agent (pi 0.85.1, in a container with tools, sampled as
-the model card asks) completed four work items through the fork's server with every served model: a Markdown
-table-of-contents CLI with tests, an HTTP key-value store with persistence, three planted bugs, and a browser
-Minesweeper that a headless browser can play; Minesweeper again at temperature 1.0. Flash-Next IQ3_XXS and Qwen3.6
-UD-Q3_K_M on an RTX 3090 and Qwen3.6 UD-IQ4_XS on the A6000 pass as is (the IQ4_XS temperature-1.0 page threw a
-`ReferenceError` of the agent's own making); DeepSeek V4 Flash UD-IQ2_XXS and GLM 5.3 Flash 3.0bit on a B200 pass
-after the two fixes under "Known limits" (argument order; GLM's architecture name in the vocabulary load). The
-API-only checks (`frontend/tests/acceptance-real-engine.sh`) hold decode and prompt reading within 15 % of step 9 on
-the 3090 (Flash-Next with the installer's `--pool-workers 15`; 24 costs 14 %) and record the first B200 figures
-(72 and 74 tok/s decode on one card). Record: the step-13 directory, in history at 7551f138. pi's compaction defaults (reserve 16K, keep the last 20K tokens) assume a window well above 64K: against a server at `--max-context 32768` a long pi session compacts to no effect and then sends `max_tokens: 1` ("Response was truncated before completion"); serve 128K or more to pi, or lower pi's `compaction` settings (USTRAT-8).
-
-
+**Omni Cyan** — the engine's character sheet: [vulkan/docs/mascot.md](vulkan/docs/mascot.md). An early-twenties
+engineer in a PCB-teal cardigan; a three-disc hair-tie (the expert cache: cached / warm / cold), a strata-banded
+skirt (the bitwise quant formats), a hairpin engraved **391** — the answer she first computed on the BC-250 — and
+Silly the crate-bird hauling an 18-byte Q2_0 block. She belongs to every card that runs the engine.
+Cute, but she documents it.

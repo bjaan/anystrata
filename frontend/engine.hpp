@@ -1,6 +1,6 @@
 // UnbiasedStrata: the engine as a child process.
 //
-// The engines (`strata`, `strata-poly`) speak lines over stdin/stdout: `GEN <max_new> key=value... <id,id,...>` in,
+// The engines (`strata`, `omnistrata-gguf`) speak lines over stdin/stdout: `GEN <max_new> key=value... <id,id,...>` in,
 // `T <id>` per token, `PP`, `RESUME`, `DONE ...`, `ERR ...` out, `STOP` to cancel, `QUIT` to end (docs/BACKENDS.md,
 // "How a backend works"). This class owns one such child. It never blocks longer than the caller allows: the server
 // loop polls it between tasks so a cancel from a disconnected client is seen within the poll interval.
@@ -96,7 +96,7 @@ public:
             }
             argv.push_back(nullptr);
             ::execv(executable.c_str(), argv.data());
-            std::fprintf(stderr, "unbiased-strata: could not start the engine %s: %s\n", executable.c_str(), std::strerror(errno));
+            std::fprintf(stderr, "omnistrata: could not start the engine %s: %s\n", executable.c_str(), std::strerror(errno));
             ::_exit(127);
         }
         pid_ = pid;

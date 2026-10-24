@@ -767,7 +767,7 @@ target_include_directories(vk_compat_smoke PRIVATE ${STRATA_ROOT}/include ${CMAK
 target_link_libraries(vk_compat_smoke PRIVATE strata_vk_compat)
 add_test(NAME vk_compat_smoke COMMAND vk_compat_smoke)
 
-# ---- Task 1.4: strata-poly-vk - the engine's strata-poly target (root CMakeLists.txt:2059) mirrored
+# ---- Task 1.4: omnistrata-gguf-vk - the engine's strata-poly target (root CMakeLists.txt:2059) mirrored
 # onto Vulkan with the host sources UNCHANGED.
 #
 # The .cu libraries of the CUDA target are NOT compiled here. src/poly/kernels.cu and kernels_dsv4.cu hold
@@ -785,7 +785,7 @@ add_test(NAME vk_compat_smoke COMMAND vk_compat_smoke)
 # the arena path (vulkan/include/strata/vulkan_compat/cuda.h). device.cu/pinned.cu -> the Task-1.3 twins.
 # ggml-base + ggml-cpu come from the same pinned llama.cpp checkout the CUDA build uses (the CPU experts).
 find_package(Threads REQUIRED)
-set(STRATA_VK_GGML_DIR ${STRATA_ROOT}/third_party/llama.cpp/ggml CACHE PATH "ggml checkout for strata-poly-vk")
+set(STRATA_VK_GGML_DIR ${STRATA_ROOT}/third_party/llama.cpp/ggml CACHE PATH "ggml checkout for omnistrata-gguf-vk")
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(GGML_STATIC ON CACHE BOOL "" FORCE)
 set(GGML_CUDA OFF CACHE BOOL "" FORCE)
@@ -803,7 +803,7 @@ target_include_directories(strata_vk_poly_kernels PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/vulkan_compat)
 target_link_libraries(strata_vk_poly_kernels PUBLIC strata_vk_runtime)
 
-add_executable(strata-poly-vk
+add_executable(omnistrata-gguf-vk
   ${STRATA_ROOT}/src/poly/main.cpp
   ${STRATA_ROOT}/src/poly/engine.cpp
   ${STRATA_ROOT}/src/poly/glm5next.cpp
@@ -821,8 +821,8 @@ add_executable(strata-poly-vk
   ${STRATA_ROOT}/src/spec/controller.cpp
   ${STRATA_ROOT}/src/spec/draft_policy.cpp
   ${STRATA_ROOT}/src/spec/draft_source.cpp)
-target_include_directories(strata-poly-vk PRIVATE ${STRATA_ROOT}/include ${STRATA_VK_GGML_DIR}/include)
-target_link_libraries(strata-poly-vk PRIVATE
+target_include_directories(omnistrata-gguf-vk PRIVATE ${STRATA_ROOT}/include ${STRATA_VK_GGML_DIR}/include)
+target_link_libraries(omnistrata-gguf-vk PRIVATE
   strata_vk_kernel_s2_gemv strata_vk_kernel_dequant_s2   # real launchers FIRST (link-order rule above)
   strata_vk_kernel_copy2 strata_vk_kernel_rms_norm strata_vk_kernel_native_quantize_q8_1
   strata_vk_kernel_native_mmvq

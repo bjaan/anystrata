@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A stand-in for strata / strata-poly that speaks the line protocol (docs/BACKENDS.md), for tests without a GPU.
+"""A stand-in for omnistrata-pack / omnistrata-gguf that speaks the line protocol (docs/BACKENDS.md), for tests without a GPU.
 
   GEN <max_new> [key=value ...] <id,id,...>   -> T <id> per token, then DONE
   STOP                                         -> the current request ends with finish=cancel

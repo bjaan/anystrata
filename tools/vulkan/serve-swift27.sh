@@ -1,14 +1,14 @@
 #!/bin/sh
 # tools/vulkan/serve-swift27.sh — serve ukisai/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ2_XS on the
 # BC-250 through llama.cpp's Vulkan backend (the tree's own pinned submodule, built with
-# -DGGML_VULKAN=1). This is NOT strata-poly-vk: the qwen35-dense architecture has no Strata
+# -DGGML_VULKAN=1). This is NOT omnistrata-gguf-vk: the qwen35-dense architecture has no Strata
 # engine family on any backend (docs/VULKAN.md, plan Phase 7); this script is the today-path,
 # kept beside the port so the API the fork serves (OpenAI chat) looks the same.
 #
 # Measured on this card (llama-bench, -ngl 99): prefill 87 tok/s, decode 15.5 tok/s — dense
 # 27B touches every weight per token; MoE models are the fast path on 24 CUs.
 #
-# Do not run while strata-poly-vk holds Qwen3.6-35B in the unified 15.7 GiB: both loads
+# Do not run while omnistrata-gguf-vk holds Qwen3.6-35B in the unified 15.7 GiB: both loads
 # together thrash the 14 GiB of system RAM. Stop one before starting the other.
 set -e
 HERE=$(dirname "$0")

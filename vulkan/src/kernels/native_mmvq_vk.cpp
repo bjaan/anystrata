@@ -33,8 +33,10 @@
 #include "iq3xxs_grid_vk.h"
 #include "iq2s_grid_vk.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <map>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -125,6 +127,63 @@ uint64_t grid_iq2s_buffer() {
 }
 }  // namespace
 
+// ---- prefill-tuning measurement (STRATA_VK_TRACE_MMVQ_TIME=1): real GPU time per
+// native_mmvq call. The batch path defers submits, so a plain chrono here would measure only
+// the enqueue; this arm drains the queue (device_sync) before/after the launch, giving the
+// true kernel+barrier cost. Env-gated: off in every normal run, zero behavior change.
+double g_mmvq_ms = 0.0;
+long long g_mmvq_calls = 0;
+struct ShapeAgg { int n_in=0, n_out=0, type=0, cols=0; long long calls=0; double ms=0; };
+std::map<uint64_t, ShapeAgg> g_mmvq_shapes;   // namespace-scope: destroyed AFTER g_mmvq_dump
+inline std::map<uint64_t, ShapeAgg>& shapes() { return g_mmvq_shapes; }
+struct MmvqClock {
+    static bool on() { static const bool v = std::getenv("STRATA_VK_TRACE_MMVQ_TIME") != nullptr; return v; }
+    static double& ms() { return g_mmvq_ms; }
+    static long long& calls() { return g_mmvq_calls; }
+    std::chrono::steady_clock::time_point t0;
+    bool armed;
+    int type = 0, n_in_ = 0, n_out_ = 0, ncols_ = 0;
+    static bool syncing() { static const bool v = std::getenv("STRATA_VK_MMVQ_NOSYNC") == nullptr; return v; }
+    MmvqClock(bool sync_first, int ggml_type, int n_in, int n_out, int ncols)
+        : armed(on()), type(ggml_type), n_in_(n_in), n_out_(n_out), ncols_(ncols) {
+        if (!armed) return;
+        if (sync_first && syncing()) vk::device_sync();   // drain prior work so t0->t1 is THIS launch
+        t0 = std::chrono::steady_clock::now();
+    }
+    ~MmvqClock() {
+        if (!armed) return;
+        if (syncing()) vk::device_sync();
+        const double dt = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        ms() += dt;
+        calls()++;
+        if (calls() % 500 == 0) {
+            std::fprintf(stderr, "vk mmvq clock: calls=%lld total=%.1fms\n", calls(), ms());
+            if (std::getenv("STRATA_VK_MMVQ_SHAPES"))
+                for (auto& kv : shapes()) {
+                    const ShapeAgg& a = kv.second;
+                    std::fprintf(stderr, "  mmvq shape: type=%d n_in=%d n_out=%d ncols_sum=%d calls=%lld total=%.1fms avg=%.3fms\n",
+                                 a.type, a.n_in, a.n_out, a.cols, a.calls, a.ms, a.ms / (double)(a.calls ? a.calls : 1));
+                }
+        }
+        if (std::getenv("STRATA_VK_MMVQ_SHAPES")) {
+            const uint64_t key = (uint64_t(type) << 48) | (uint64_t(n_in_) << 24) | uint64_t(n_out_);
+            ShapeAgg& a = shapes()[key];
+            a.n_in = n_in_; a.n_out = n_out_; a.type = type; a.cols += ncols_;
+            a.calls++; a.ms += dt;
+        }
+    }
+};
+struct MmvqClockDump { ~MmvqClockDump() {
+    if (!MmvqClock::on()) return;
+    std::fprintf(stderr, "=== mmvq total: calls=%lld gpu+drain=%.1fms ===\n",
+                 MmvqClock::calls(), MmvqClock::ms());
+    for (auto& kv : shapes()) {
+        const ShapeAgg& a = kv.second;
+        std::fprintf(stderr, "  mmvq shape: type=%d n_in=%d n_out=%d ncols_sum=%d calls=%lld total=%.1fms avg=%.3fms\n",
+                     a.type, a.n_in, a.n_out, a.cols, a.calls, a.ms, a.ms / (double)(a.calls ? a.calls : 1));
+    } } };
+MmvqClockDump g_mmvq_dump;
+
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream) {
     if (ggml_type != 16 && ggml_type != 18 && ggml_type != 23 && ggml_type != 22 && ggml_type != 13 && ggml_type != 14 &&
@@ -174,6 +233,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     const uint64_t nb = uint64_t(n_in) / (ggml_type == 8 ? 32 : ggml_type == 42 ? 64 : IQ_BLOCK_ELEMS);
     const uint64_t x_sz = uint64_t(ncols) * (uint64_t(n_in) / 32) * Q8_BLOCK_BYTES;   // n_in/32 q8_1 blocks a column
     const uint64_t y_sz = uint64_t(ncols) * uint64_t(n_out) * 4;
+    MmvqClock g_mmvq_clk(true, ggml_type, n_in, n_out, ncols);   // env-gated timing (off = no-op)
     if (ggml_type == 13) {
         static const vk::Kernel k = vk::kernel_load(
             "native_mmvq_q5_k", mmvq_q5_k_spv, mmvq_q5_k_spv_len,

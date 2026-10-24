@@ -3,9 +3,9 @@
 # own test models (no GPU, no weights). Checks the HTTP surface a coding agent touches: /health, /v1/models,
 # a non-streaming chat completion, a streaming one, a client that disconnects mid-stream, and an engine error.
 #
-#   frontend/tests/e2e.sh <unbiased-strata binary> [model.gguf]
+#   frontend/tests/e2e.sh <omnistrata binary> [model.gguf]
 set -u
-BIN=${1:?usage: e2e.sh <unbiased-strata> [model.gguf]}
+BIN=${1:?usage: e2e.sh <omnistrata> [model.gguf]}
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 MODEL=${2:-$ROOT/third_party/llama.cpp/models/ggml-vocab-qwen35.gguf}
@@ -34,7 +34,7 @@ done
 # /health and /v1/models
 h=$(curl -s "$URL/health"); check $([ "$(echo "$h" | j 'd["status"]')" = ok ] && echo 0 || echo 1) "/health: $h"
 # upstream PolyStrata clients (tools/strata_bench.py) require these two to treat the server as a loaded strata server
-check $([ "$(echo "$h" | j 'd["service"]')" = strata ] && [ "$(echo "$h" | j 'd["loaded"]')" = true ] && echo 0 || echo 1) "/health: service=strata loaded=true"
+check $([ "$(echo "$h" | j 'd["service"]')" = omnistrata ] && [ "$(echo "$h" | j 'd["loaded"]')" = true ] && echo 0 || echo 1) "/health: service=omnistrata loaded=true"
 m=$(curl -s "$URL/v1/models"); check $([ "$(echo "$m" | j 'd["data"][0]["id"]')" = fake ] && echo 0 || echo 1) "/v1/models id: $(echo "$m" | j '{k: d["data"][0].get(k) for k in ("id", "context_length")}')"
 
 # non-streaming chat
