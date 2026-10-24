@@ -47,7 +47,7 @@ Pascal or newer, CUDA 12.x, Linux x86-64, on a machine that may have no network 
 ```
 git clone <this repo> && cd UnbiasedStrata
 git submodule update --init          # shallow, third_party/llama.cpp @ robertkarl/llama.cpp UnbiasedStrata (a6de9af3)
-make build                           # build/bin/{strata,strata-poly,libstrata_kq.so,unbiased-strata}
+make build                           # build/bin/{strata,strata-poly,strata-dsv41,libstrata_kq.so,unbiased-strata}
 make test                            # the front end against a fake engine; no GPU, no model
 ```
 
@@ -90,7 +90,7 @@ make build CUDA_ARCHS=89                                        # 6m40 on 16 cor
 ## Run
 
 ```
-unbiased-strata --engine <strata|strata-poly|path> -m <model.gguf> [llama-server options] -- <engine options>
+unbiased-strata --engine <strata|strata-poly|strata-dsv41|path> -m <model.gguf> [llama-server options] -- <engine options>
 ```
 
 `-m` names the GGUF the vocabulary and chat template are read from; no tensors are loaded from it by the front end.
@@ -132,6 +132,16 @@ build/bin/unbiased-strata --engine build/bin/strata \
      --max-context 65536 --kv int8 --ple-io ram --pool-workers 15 --kv-resident 32768
 ```
 
+
+**DeepSeek-V4.1-Flash-1017, ISTA-DASLab IQ2_XXS** (`strata-dsv41`, Strata v0.2.4's third engine; the four shards,
+the shared Engram file, Unsloth's DSpark drafter and a pack directory made from them): [docs/DEEPSEEK41.md](docs/DEEPSEEK41.md).
+
+```
+build/bin/unbiased-strata --engine build/bin/strata-dsv41 \
+  -m /models/dsv41/IQ2_XXS/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf \
+  --host 127.0.0.1 --port 11434 --alias deepseek-v4.1-flash-1017-ista-iq2_xxs --sse-ping-interval 10 \
+  -- --pack /models/dsv41/IQ2_XXS/maya-ds4 --max-context 131072 --dspark auto --gpus 0
+```
 
 ### Preparing a Flash-Next pack
 
