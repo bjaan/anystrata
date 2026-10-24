@@ -17,11 +17,68 @@
 #include "strata/vulkan_runtime.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <chrono>
+#include <map>
 #include <stdexcept>
 #include <vector>
 
 namespace {
+
+// ---- Phase 3 step 0: env-gated measurement (STRATA_VK_BLAS_TIME=1). One record per entry
+// point: calls, total ms, worst single call, and the biggest (m,n,k,batch) seen.
+struct BlasStat {
+    long long calls = 0;
+    double total_ms = 0.0, max_ms = 0.0;
+    long long bm = 0, bn = 0, bk = 0, bb = 0;   // biggest-flops shape seen
+    double flops(const BlasStat& s) { return double(s.bm) * s.bn * s.bk * s.bb; }
+};
+std::map<const char*, BlasStat>& blas_stats() { static std::map<const char*, BlasStat> m; return m; }
+bool blas_time_on() { static bool v = std::getenv("STRATA_VK_BLAS_TIME") != nullptr; return v; }
+void dump();
+int& blas_clock_depth() { static thread_local int d = 0; return d; }
+struct BlasClock {
+    const char* kind; BlasStat* st = nullptr; double flops;
+    std::chrono::steady_clock::time_point t0;
+    BlasClock(const char* k, int m, int n, int kk, int b) : kind(k) {
+        if (blas_clock_depth()++) { st = nullptr; return; }   // don't double-count nested entries
+        st = &blas_stats()[k];
+        flops = 2.0 * m * n * kk * (b > 0 ? b : 1);
+        t0 = std::chrono::steady_clock::now();
+    }
+    ~BlasClock() {
+        if (!st) { blas_clock_depth()--; return; }
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - t0).count();
+        st->calls++; st->total_ms += ms;
+        if (ms > st->max_ms) st->max_ms = ms;
+        blas_clock_depth()--;
+        if (blas_time_on() && st->calls % 250 == 0) dump();   // survive a timeout kill
+    }
+};
+void blas_stat_shape(const char* kind, int m, int n, int k, int b) {
+    BlasStat& s = blas_stats()[kind];
+    if (2.0 * m * n * k * (b > 0 ? b : 1) > 2.0 * s.bm * s.bn * s.bk * s.bb) {
+        s.bm = m; s.bn = n; s.bk = k; s.bb = b;
+    }
+}
+void dump() {
+    std::fprintf(stderr, "=== STRATA_VK_BLAS_TIME summary ===\n");
+    double tot = 0;
+    for (auto& kv : blas_stats()) {
+        std::fprintf(stderr, "%-24s calls=%lld total=%.1fms max=%.1fms biggest m,n,k,b=%lld,%lld,%lld,%lld\n",
+                     kv.first, kv.second.calls, kv.second.total_ms, kv.second.max_ms,
+                     kv.second.bm, kv.second.bn, kv.second.bk, kv.second.bb);
+        tot += kv.second.total_ms;
+    }
+    std::fprintf(stderr, "%-24s total=%.1fms\n", "ALL cublas", tot);
+    std::fflush(stderr);
+}
+struct BlasStatDump {
+    ~BlasStatDump() { if (blas_time_on()) dump(); }
+};
+BlasStatDump g_blas_dump;
 
 struct Handle {
     cudaStream_t stream = nullptr;
@@ -190,6 +247,8 @@ cublasStatus_t cublasSgemm_v2(cublasHandle_t handle, cublasOperation_t ta, cubla
                               int m, int n, int k, const float* alpha, const float* A, int lda,
                               const float* B, int ldb, const float* beta, float* C, int ldc) {
     if (!handle) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (blas_time_on()) blas_stat_shape("Sgemm", m, n, k, 1);
+    BlasClock clk("Sgemm", m, n, k, 1);
     return gemm_one(*(Handle*) handle, ta, tb, m, n, k, *alpha, A, CUDA_R_32F, lda, B, CUDA_R_32F, ldb,
                     *beta, C, CUDA_R_32F, ldc);
 }
@@ -198,6 +257,8 @@ cublasStatus_t cublasSgemmStridedBatched(cublasHandle_t handle, cublasOperation_
                                          long long strideA, const float* B, int ldb, long long strideB,
                                          const float* beta, float* C, int ldc, long long strideC, int batchCount) {
     if (!handle) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (blas_time_on()) blas_stat_shape("SgemmStridedBatched", m, n, k, batchCount);
+    BlasClock clk("SgemmStridedBatched", m, n, k, batchCount);
     for (int b = 0; b < batchCount; ++b) {
         cublasStatus_t s = gemm_one(*(Handle*) handle, ta, tb, m, n, k, *alpha,
                                     A + strideA * b, CUDA_R_32F, lda, B + strideB * b, CUDA_R_32F, ldb,
@@ -211,6 +272,8 @@ cublasStatus_t cublasGemmEx(cublasHandle_t handle, cublasOperation_t ta, cublasO
                             const void* B, cudaDataType Btype, int ldb, const void* beta, void* C,
                             cudaDataType Ctype, int ldc, cublasComputeType_t computeType, cublasGemmAlgo_t) {
     if (!handle) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (blas_time_on()) blas_stat_shape("GemmEx", m, n, k, 1);
+    BlasClock clk("GemmEx", m, n, k, 1);
     if (computeType != CUBLAS_COMPUTE_32F && computeType != CUBLAS_COMPUTE_32F_FAST_TF32)
         return CUBLAS_STATUS_NOT_SUPPORTED;      // fp64/integer compute types: the tree never asks for them
     float a = load_scalar(alpha, CUDA_R_32F, 0), b = load_scalar(beta, CUDA_R_32F, 0);
@@ -223,6 +286,8 @@ cublasStatus_t cublasGemmStridedBatchedEx(cublasHandle_t handle, cublasOperation
                                           void* C, cudaDataType Ctype, int ldc, long long strideC,
                                           int batchCount, cublasComputeType_t ct, cublasGemmAlgo_t algo) {
     if (!handle) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (blas_time_on()) blas_stat_shape("GemmStridedBatchedEx", m, n, k, batchCount);
+    BlasClock clk("GemmStridedBatchedEx", m, n, k, batchCount);
     const size_t ea = elem_bytes(Atype), eb = elem_bytes(Btype), ec = elem_bytes(Ctype);
     if (!ea || !eb || !ec) return CUBLAS_STATUS_NOT_SUPPORTED;
     for (int b2 = 0; b2 < batchCount; ++b2) {
