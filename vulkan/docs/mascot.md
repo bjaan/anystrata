@@ -1,65 +1,84 @@
-# Strata-chan — mascot concept for the Vulkan engine
+# Strata Cyan — mascot character sheet (Vulkan engine)
 
-**Name:** Cyan — from the Vulkan spec's cyan logo light, "the color of any GPU at night".
-Full mascot name: **Strata Cyan** ("the girl made of layers").
+## Identity (fixed canon — never varies)
+- **Name:** Strata Cyan ("the girl made of layers"); short form **Cyan**.
+- **What she brands:** the Vulkan backend — one engine, any Vulkan 1.2+ GPU (Radeon, Intel
+  Arc, APUs, MoltenVK bridges). Cyan = the Vulkan spec's light, not a vendor color.
+- **Core metaphor:** experts living in VRAM, streamed to the card. Everything below encodes it.
+- **Origin (a biographical fact, not a setting):** the BC-250 board (die: *Cyan Skillfish*),
+  where the port was written and first answered **17 × 23 = 391**. Reference her birthplace
+  only in easter eggs — she belongs to every card that runs the engine.
+- **Tone:** cozy lab-girl — competent, a little playful, shows her thinking before she speaks
+  (the model is a reasoning model). Cute, PG, never sexualized.
 
-## Design brief
-She brands the **Vulkan backend as such**: one engine, any Vulkan 1.2+ GPU — Radeon,
-integrated APUs, Intel Arc through Mesa, even MoltenVK bridges. The design's core idea is
-**experts living in VRAM**, streamed to the card like ingredients onto a hot pan. Her
-birthplace is the BC-250 (the repurposed PS5 board where the port was written and first
-answered 17×23 = 391) — that is her origin story, not her identity.
+## Fixed visual constants
+| Element | Constant |
+|---|---|
+| Hair | long straight dark navy **#1B2340**, low side-ponytail, two cyan **#31A2F1** under-light strands |
+| Hair-tie | three stacked discs = expert cache: full cyan / half-warm **#1F6F9E** / cold dark **#173A52** |
+| Eyes | amber-gold **#D9A441**; a faint rotating delta-net glyph (triangle wave) in the iris when thinking |
+| Outfit | oversized PCB-teal **#17494D** knit cardigan, gold-trace hem (GPU block diagram: SMs, L2, VRAM ctl), white tee |
+| Skirt | pleated with three horizontal strata bands: 2-bit stipple, 5-bit stripes, 8-bit solid (Q2_0 / Q5_K / Q8_0) |
+| Hairpin | small brass token-ribbon pin engraved **391** |
+| Companion | **Silly** — round teal seabird, carries an 18-byte Q2_0 crate in its beak (skillfish species = the BC-250 easter egg only) |
+| Palette | #31A2F1 Vulkan blue · #17494D PCB teal · #D9A441 gold · #1B2340 navy · strata grays #243248/#2E3D55/#F2F6FB |
+| Lighting | dark backgrounds: cyan rim-light glows; her under-light strands read as emissive |
 
-## Look (anime, cute, PG)
-- **Hair:** long, straight, dark navy with two under-lights glowing soft cyan (Vulkan-blue
-  #31A2F1 rim light); tied in a low side-ponytail with a **layered hair-tie** — three stacked
-  discs = the expert cache (one disc full/cached, one warm, one cold: the streaming metaphor).
-- **Eyes:** amber-gold (the PS5/BC-250 board silkscreen gold); when she "thinks", a faint
-  delta-net glyph rotates in the iris — she shows her reasoning before she speaks (thinking model).
-- **Outfit:** oversized knit cardigan the color of a PCB (dark teal-green, gold trace
-  embroidery along the hem — the traces form a generic GPU block diagram: SMs, L2, VRAM
-  controller; on close inspection a tiny "any vendor" mark),
-  a white tee, and a **pleated skirt of visible strata**: horizontal bands of differing
-  quantization dither — 2-bit stipple, 5-bit stripes, 8-bit solid (Q2_0/Q5_K/Q8_0 — the very
-  formats the engine carries bitwise).
-- **Accessories:**
-  - A shoulder-perched small sea-bird mascot ("**Silly**"), teal, round, carrying a tiny
-    18-byte Q2_0 crate in its beak — the bird is a skillfish only as an easter egg (the
-    BC-250, her birthplace: its die is named Cyan Skillfish); to anyone else it is just
-    the crate carrier for the engine's smallest quant.
-  - Hairpin: a small brass pin shaped like a token ribbon, engraved **391** (the answer she
-    proved on the BC-250; the port's first token) — she wears the origin story in her hair,
-    not around her neck.
-  - Sleeves pushed up; one hand holds a **spatula over a frying pan** — the engine *streaming
-    experts* to VRAM — but the pan is a circular VRAM die and the "eggs" are expert tiles.
-    (Homage: expert cache = a warm skillet of exactly 10,240 slots.)
-  - Bootlaces tied in a **piece-chain**: nodes labeled 512MiB — an inside joke for the arena.
-- **Pose:** leaning in, one eye winking, holding up her phone: it reads
-  `GET /v1/chat/completions → "The answer is 391."`
-- **Palette:** Vulkan blue #31A2F1, PCB teal #17494D, gold #D9A441, navy hair #1B2340, strata
-  grays. On dark backgrounds the rim lights glow; the skirt bands re-dither by context size.
+## Poses (use the matching one per context)
+- **Base pose** — leaning in, one eye winking, holding up her phone reading
+  `POST /v1/chat/completions → "391."`. Default single character art.
+- **Cook pose** — sleeves up, spatula over a skillet whose pan is a circular VRAM die and the
+  eggs are expert tiles ("streaming experts to cache"). Use for anything about the expert cache.
+- **Serve pose** — headset + mic, hand raised gesturing at a small "listening :18090" badge.
+  Use for server/status UI.
+- **Speed pose** — all three hair-tie discs lit, motion streaks. Use for benchmark/perf news.
+  (Her unbatched walk — discs dim — is the before-state; don't mix.)
+- **Workshop pose** — sitting cross-legged with kernels on a pegboard (a .comp on one hand, a
+  parity report on the other), Silly holding the crate. Use for changelog / dev-log headers.
+- **Multi-GPU banner** — cache discs split into rings, one per card. Use for layer-split docs.
 
-## Variants
-- **1-token stamp:** face-only circle, the 391 hairpin visible, for commit badges/README.
-- **Multi-GPU banner:** the three hair-tie cache discs split into several smaller rings, one
-  per card (the layer-split path every Vulkan-capable GPU gets).
-- **Serve pose:** headset + mic ("listening on 18090"), for the server status page.
-- **Speedline variant (post-Phase 4):** hair-tie discs all lit, motion streaks — decode
-  19 tok/s. Before Phase 4 she walks (4.4).
-- **Pi variant:** holding a raspberry-pi-colored pie (pi client integration).
+## Expressions (turnaround sheet)
+neutral · thinking (iris glyph spins, eyes up) · happy (wink, base pose) · proud (arms crossed,
+choker-free: point at hairpin) · worried/debug (sweat drop, discs half-dark, holding a broken
+crate Silly fled from) · celebrating confetti of 0/1 bytes.
 
-## Why it works for THIS build
-Every element is load-bearing: strata skirt = quant formats the port proves bitwise; the
-cache-disc hair-tie = the engine's whole design (experts in VRAM, residency 100% on the BC-250);
-the 391 hairpin = the first verified answer (on the BC-250, wherever she was compiled); cyan = the
-Vulkan light, not one vendor; Silly with the 18-byte crate = GGML_TYPE_Q2_0's block size
-(docs/pack-format.md's own figure). Cute, but she *documents the engine* — and she belongs
-to every card that can run it.
+## Size/scale rules for reuse
+- **Stamp/icon:** face-only circle, hairpin readable at ≥16 px, or Silly alone as a 16 px favicon.
+- **Avatar:** bust crop to the ponytail tie (tie must stay in frame — it's her signature).
+- **Banner (wide):** base pose right-third, engine name + status left; keep her off-center left
+  only in mirror variants. Never stretch the skirt bands below legible dither: at small sizes
+  render bands as solid tritone stripes.
+- **Print/sticker:** flat version — no gradients, exact 5-color palette above.
 
-## Commission note
-No local diffusion backend on this machine (ComfyUI not running) — this file is the full
-character sheet; any artist prompt: "anime girl, navy hair with cyan underglow, side ponytail
-with three-disc layered tie, teal PCB cardigan with gold traces, strata-banded pleated skirt
-(2-bit/5-bit/8-bit bands), amber eyes, small brass hairpin engraved "391", round teal seabird on shoulder holding
-a tiny crate, holding a phone showing a chat completion, cozy lab-girl energy, dark background,
-Vulkan-blue rim light".
+## Master prompt (any image model or artist)
+> anime character sheet, one girl: long straight dark-navy hair with two glowing soft-cyan
+> under-light strands, low side ponytail tied with three stacked discs (bright cyan, half blue,
+> dark blue), amber-gold eyes with a tiny triangle-wave glyph in the iris, oversized dark
+> teal-green knit cardigan with thin gold circuit traces along the hem, white tee, pleated
+> skirt with three horizontal bands — fine stipple, thin stripes, plain white —, a small brass
+> hairpin engraved "391", a round teal seabird perched on her shoulder carrying a tiny wooden
+> crate marked "18B", cozy lab-girl energy, dark navy background with cyan rim light, clean
+> cel shading
+
+Per-pose one-liners:
+- base: "…, leaning toward the viewer, one eye winking, holding up a phone showing a chat reply '391.'"
+- cook: "…, cooking at a round black skillet drawn like a GPU die, sunny-side eggs are tiny square tiles"
+- serve: "…, wearing a support headset, gesturing at a small glowing badge ':18090'"
+- speed: "…, running, all three hair discs glowing, blue motion streaks"
+- workshop: "…, seated with a pegboard of recipe cards behind her, the bird stealing one"
+
+## Do / don't
+- DO keep the three-disc tie, the strata skirt bands, and one cyan under-light strand in every
+  render — those three read her identity at any size.
+- DO vary context (kitchen, lab, stage, server rack) — she is portable by design.
+- DON'T add chokers/necklaces as identity marks (rejected early), vendor logos, or
+  number-badges other than 391 (numbers change; 391 is canon).
+- DON'T make the eyes cyan — gold eyes + cyan hair-light is the signature contrast.
+
+## Why the parts mean what they mean (for anyone extending her)
+Skirt bands = the quant formats the engine proves bitwise; hair-tie discs = the expert cache
+(cached/warm/cold); 391 hairpin = first verified answer; Silly's 18-byte crate = Q2_0's block
+size (docs/pack-format.md); bootlaces as a node chain (optional detail) = the arena's piece
+chain. She documents the engine — when adding a variant, encode a real fact.
+
+MEDIA-adjacent: current vector concept sketch lives at `vulkan/docs/strata-chan.svg`.
