@@ -60,8 +60,11 @@ into VRAM first; the engine updates it as it runs.
 build/bin/unbiased-strata --engine build/bin/strata-dsv41 \
   -m /mnt/ds4/dsv41/IQ2_XXS/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf \
   --host 0.0.0.0 --port 11434 --alias deepseek-v4.1-flash-1017-ista-iq2_xxs --sse-ping-interval 10 \
+  --chat-template-file data/dsv41/chat_template-ista-1017.jinja --temp 1.0 --top-p 1.0 --min-p 0.0 --top-k 64 \
   -- --pack /mnt/ds4/dsv41/IQ2_XXS/maya-ds4 --max-context 131072 --dspark auto --gpus 0
 ```
+
+(`DS4_STORE_ZC=1 DS4_STORE_ZC_FRAC=100 DS4_READERS=16` in the environment on a slow CPU; see the measurements.)
 
 - `-m` is shard 1: the front end reads the vocabulary and the chat template from it and no tensors. The pinned
   llama.cpp does not know `deepseek41`, so the vocabulary load takes the front end's `general.architecture` override path
@@ -103,7 +106,51 @@ RAM 7.2 tokens/s; four R9700 (32 GB each) 31 tokens/s; "under about 40 GB of RAM
 | Model | IQ2_XXS set above, 2.00 bpw |
 | Context | 128K (`--max-context 131072`) |
 
-Results: to be filled in at first light (decode and prefill tokens/s, VRAM split, load time).
+Load: 35 s to healthy (the pack's files in the page cache or not; the RAM store reads its 28.8 GB in 9 s). VRAM: dense
+5.86 GB, 4,700 of 15,360 experts (40.86 GB), caches 0.12 GB, 581 MiB free. 10,660 experts on the CPU lane, in place in
+the files; the RAM store 41 GB (3,996 slots). DSpark stays unloaded under `--dspark auto` (the engine's rule: the experts
+are far more than the card holds, so its verify rounds would gain nothing).
+
+Engine alone (`--ids ... --n 48`, caches dropped before each run), decode:
+
+| setting | tok/s | CPU lane, experts a token | of the per-token time |
+| --- | ---: | ---: | --- |
+| default | 2.00 | 66 | CPU lane 482 ms; store hits 63%, waits for the disk 79 ms; 317 MB read a token |
+| `--ssd-cache 0` (page cache instead) | 1.99 | 66 | the same; 226 MB read a token |
+| `--ssd-cache 16` | 1.93 | 66 | store hits 50%, waits 109 ms |
+| `--mmap-experts off` (40 GB copied into RAM) | 1.95 | 66 | CPU lane 495 ms, no store |
+| `DS4_STORE_ZC=1` (GPU computes the store's experts over PCIe, 50% visible) | 2.59 | 39 | CPU lane 353 ms; GPU 23 experts a token from the store |
+| `DS4_STORE_ZC=1 DS4_STORE_ZC_FRAC=100` | 3.23 | 26 | CPU lane 258 ms; GPU 43 a token from the store |
+| the same with `DS4_READERS=16` | 3.34 | 25 | CPU lane 246 ms; waits 79 ms |
+| `DS4_STORE_ZC=1` with `--cpu-threads 12` | 2.14 | 44 | worse: the 12 vCPUs are 6 cores' SMT pairs |
+
+So on this machine the critical path is the CPU lane, not the disk: a Ryzen 7 1700's AVX2 cores dequantize IQ1_M / IQ2
+rows at roughly 10 ms an expert, and the disk's share of the token is 60 to 80 ms (the NVMe reads random 8 MiB at 3.5 GB/s;
+the engine draws 230 to 340 MB a token). The zero-copy store is upstream's opt-in (slower than their CPU lane on a 5070 /
+PCIe 5.0 box, and the lane that takes an expert depends on timing, so answers are not bit-reproducible); here it moves
+two thirds of the CPU lane's work onto the A6000 over PCIe 3.0 x16 and is what the homelab unit runs with
+(`Environment=DS4_STORE_ZC=1 DS4_STORE_ZC_FRAC=100 DS4_READERS=16`).
+
+Through the front end (first light, default store): a 42-token prompt read at 4.4 tok/s, 30 tokens written at 2.4 tok/s; a
+329-token prompt at 17.8 tok/s and the answer at 2.5 tok/s; a 389-token answer streamed at 3.1 tok/s. Prefill is slow for
+the same reason: a prompt touches most experts, and every CPU-lane expert it touches is dequantized on the CPU (and read
+from the disk, 92 GB of them against 12 GB of page cache). With the zero-copy store (the unit's setting), through the front end: a 42-token prompt at 4.2 tok/s and 32 tokens
+at 4.5 tok/s; a 400-token streamed answer at 6.9 tok/s (the store warm); a 319-token prompt at 18.4 tok/s and 85 tokens at
+5.3 tok/s; the CPU lane took 2 to 3% of the expert uses. Healthy 50 s after start.
+
+## The chat template
+
+The ISTA GGUF carries an older DeepSeek template: it spells the tool tags `<｜DSML｜tool_calls>`, `<｜DSML｜invoke`,
+`<｜DSML｜parameter` through a `dsml_token` variable, while the 1017 model writes `<｜DSML｜ calls>`, `<｜DSML｜ invoke`,
+`<｜DSML｜ parameter` (a space, and `calls`). With the GGUF's template llama.cpp does not select its V4.1 parser (it looks
+for the literal `｜DSML｜ calls>` in the template source) and a tool call came back as text in the content. DeepSeek's
+official template and Unsloth's port (upstream Strata's fixture) both use Jinja's `dict()`, which the pinned llama.cpp's
+minja does not have ("Callee is not a function: got Undefined (hint: 'dict')", the server exits). So
+`data/dsv41/chat_template-ista-1017.jinja` is the GGUF's own template with the five tag spellings written out as literals,
+nothing else changed; pass it with `--chat-template-file` before the `--`. With it: `finish_reason: tool_calls`, arguments
+`{"city":"Paris","unit":"c"}`, reasoning split into `reasoning_content`, thinking on by default.
+
+
 
 ## Tests
 

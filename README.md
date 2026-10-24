@@ -140,6 +140,7 @@ the shared Engram file, Unsloth's DSpark drafter and a pack directory made from 
 build/bin/unbiased-strata --engine build/bin/strata-dsv41 \
   -m /models/dsv41/IQ2_XXS/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf \
   --host 127.0.0.1 --port 11434 --alias deepseek-v4.1-flash-1017-ista-iq2_xxs --sse-ping-interval 10 \
+  --chat-template-file data/dsv41/chat_template-ista-1017.jinja --temp 1.0 --top-p 1.0 --min-p 0.0 --top-k 64 \
   -- --pack /models/dsv41/IQ2_XXS/maya-ds4 --max-context 131072 --dspark auto --gpus 0
 ```
 
