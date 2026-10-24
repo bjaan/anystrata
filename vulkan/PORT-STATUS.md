@@ -670,6 +670,35 @@ generated 16 tokens 10.41 tok/s", ids 271,248068,271,248069,271,1206,10724,393,1
 for the chains that demand them, untested by these gates). Next halt: none observed - pi's
 >500-token system prompt now runs.
 
+Phase 3 (attempt 2) - GPU tiled GEMM under the cublas shim (vulkan/src/runtime/mm_gemm.comp +
+vk_blas.cpp dispatch): the dense prefill wall (attend_batch's two cublasGemmStridedBatchedEx over
+the f16 KV caches + gemm_f32's cublasSgemm/StridedBatched) lands on the card with NO call-site
+change. One .comp, four compiled variants (TRANS_A x F16AB glslc defines): 256 threads as 16x16,
+64x64 C tile, K-step 16 through two shared f32 tiles (8 KiB LDS), 4x4 microtile per thread,
+strided batch folded into the linear group id (kernel_launch_sized dispatches (groups_x,1,1)
+only; tilesX/tilesY/batch ride the 64B push-constant block with lda/ldb/ldc/m/n/k/alpha/beta and
+int32 element-unit strides - every cublasGemmStridedBatchedEx stride the tree passes fits, the
+biggest seen is far under 2^31). f16 operands decode bit-exactly through unpackHalf2x16 of the
+isolated 16-bit word (no rounding path, laws intact); C is f32 in every GPU variant (the Hgemm
+f16-out arms stay on the CPU reference - nothing on the model path uses them). Dispatcher rules:
+NN/TN with f32-f32 or f16-f16 A/B and f32 C go GPU; OP_T-B and exotic strides/alignments fall back
+to the ordered-fp32 CPU reference with a COUNTED one-line stderr notice (0 notices across both
+model gates). GPU is default; STRATA_VK_BLAS_CPU=1 is the A/B arm; the parity test toggles
+in-process through strata_vk_blas_use_gpu(). The launch rides kernel_launch_sized, so it is
+queue-ordered under Phase 4.1's per-dispatch barriers exactly like every other poly kernel.
+Micro-gate vk_blas_gpu_parity (new ctest): 200x128x300 all three compiled variants + NT-fallback
++ batch 3 + alpha/beta in {0,1} + the attend-shaped f16 TN strided case - GPU vs CPU arm, worst
+rel err 0.000e+00 (bitwise identical on every case, incl. the ragged k=300 tail); bench 2048^3:
+GPU 862 GFLOPs vs CPU 0.25 GFLOPs (~3400x; a first-pass tile, no double-buffering yet - the
+headroom vs the ~1 TFLOP fp32 ceiling is K-panel double-buffer / wider microtiles, deferred).
+ctest 14/14. Model gates: canary UNCHANGED - ids '220,18,24,16,13,271,48,25,3437,369,220,16,22,2942,220,17'
+(18-token prompt 13.8 tok/s, decode 18.28 tok/s). Long gate (735 tokens): prefill 5.8 -> 32.1
+tok/s GPU arm (5.5x; the 50 target needs the KV-block GEMMs at larger m alongside the dense ones -
+attend_batch's products dominate now, at 128x16x128 tiles on a 64x64 kernel there is tile waste to
+tune next). decode 10.0-11.1 tok/s both arms. pi acceptance GREEN: 'pi works', roundtrip 52.8 s,
+server prompt_ms=50304 for the 1596-token system prompt (31.7 tok/s prefill, vs 425.9 s the CPU
+shim took on the same request). git diff main..HEAD -- src include == 0 (all edits under vulkan/).
+
 COMPLETION: 16-token gate GREEN on the hybrid (default arena, no env overrides): prompt 18 tok at 12.3-13.3 tok/s, decode 16
 tokens at 19.03 / 18.95 / 18.65 / 18.59 tok/s (4 runs incl. the post-gemm_f32 rebuild, ids IDENTICAL all four):
 220,18,24,16,13,271,48,25,3437,369,220,16,22,2942,220,17

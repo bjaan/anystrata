@@ -26,6 +26,100 @@
 
 namespace {
 
+// ---- Phase 3 (attempt 2): the GPU tiled SGEMM (mm_gemm.comp, four compiled variants:
+// TRANS_A x F16AB). The common call-site combos (attend_batch's two strided-batched f16/f32-C
+// products with OP_N B, gemm_f32's OP_T/OP_N f32 products) dispatch GPU-side with the exact
+// strided-batch semantics; anything exotic falls back to the ordered-fp32 CPU reference below
+// with a counted one-line notice (never silent). GPU is the default; STRATA_VK_BLAS_CPU=1
+// forces the CPU arm (A/B), and the parity test re-toggles through strata_vk_blas_use_gpu().
+#include "mm_gemm_t0f0.spv.h"
+#include "mm_gemm_t0f1.spv.h"
+#include "mm_gemm_t1f0.spv.h"
+#include "mm_gemm_t1f1.spv.h"
+
+int g_gpu_override = -1;   // -1: use env; 0/1: the parity test's explicit arm
+constexpr std::uintptr_t kGemmPtrBias = 64;   // same value as kPtrBias below (strata_vk.h's contract)
+bool gpu_wanted() {
+    if (g_gpu_override >= 0) return g_gpu_override == 1;
+    static const bool cpu = std::getenv("STRATA_VK_BLAS_CPU") != nullptr;
+    return !cpu;
+}
+long long& fallback_notes() { static long long n = 0; return n; }
+void note_fallback(const char* why) {
+    long long& n = fallback_notes();
+    if (++n <= 5) std::fprintf(stderr, "strata-vk cublas: GPU GEMM not used (%s); CPU fallback (note %lld)\n", why, n);
+}
+
+const strata::vk::Kernel& mm_kernel(int transA, int f16) {
+    static const strata::vk::Kernel k00 = strata::vk::kernel_load("mm_gemm_t0f0", mm_gemm_t0f0_spv, mm_gemm_t0f0_spv_len, 3, 64, 256, false);
+    static const strata::vk::Kernel k01 = strata::vk::kernel_load("mm_gemm_t0f1", mm_gemm_t0f1_spv, mm_gemm_t0f1_spv_len, 3, 64, 256, false);
+    static const strata::vk::Kernel k10 = strata::vk::kernel_load("mm_gemm_t1f0", mm_gemm_t1f0_spv, mm_gemm_t1f0_spv_len, 3, 64, 256, false);
+    static const strata::vk::Kernel k11 = strata::vk::kernel_load("mm_gemm_t1f1", mm_gemm_t1f1_spv, mm_gemm_t1f1_spv_len, 3, 64, 256, false);
+    if (!transA && !f16) return k00;
+    if (!transA && f16)  return k01;
+    if (transA && !f16)  return k10;
+    return k11;
+}
+
+struct MMParams {   // must match mm_gemm.comp's push_constant block (56B of fields), padded to 64B
+    int32_t m, n, k, lda, ldb, ldc, tilesX, tilesY, batch;
+    float alpha, beta;
+    int32_t strideA, strideB, strideC;
+    int32_t pad[2];
+};
+static_assert(sizeof(MMParams) == 64, "push-constant struct must be exactly 64B");
+
+// The strided-batched GPU arm. Returns true = launched (queue-ordered against the runtime's
+// other work); false = the caller runs the CPU reference. Element extents stay under 2^31 and
+// every binding offset 4-byte aligned (the kernel addresses f16 through uint words).
+bool gemm_gpu(cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
+              float alpha, const void* A, cudaDataType At, int lda, long long strideA,
+              const void* B, cudaDataType Bt, int ldb, long long strideB,
+              float beta, void* C, cudaDataType Ct, int ldc, long long strideC, int batch) {
+    if (!gpu_wanted()) return false;
+    if (m <= 0 || n <= 0 || k <= 0 || batch <= 0 || !A || !B || !C) return false;
+    const bool f16 = (At == CUDA_R_16F && Bt == CUDA_R_16F);
+    if (!f16 && !(At == CUDA_R_32F && Bt == CUDA_R_32F)) { note_fallback("operand type mix"); return false; }
+    if (Ct != CUDA_R_32F) { note_fallback("non-f32 C"); return false; }
+    if (tb != CUBLAS_OP_N) { note_fallback("OP_T B"); return false; }
+    const int transA = ta == CUBLAS_OP_T;
+    if (!transA && ta != CUBLAS_OP_N) return false;
+    if (lda < (transA ? k : m) || ldb < k || ldc < m) return false;   // cuBLAS contract; bad input -> CPU
+    const long long ea = f16 ? 2 : 4;
+    if (strideA < 0 || strideB < 0 || strideC < 0 ||
+        strideA > 0x7FFFFFFFll || strideB > 0x7FFFFFFFll || strideC > 0x7FFFFFFFll) {
+        note_fallback("negative/oversize stride"); return false;
+    }
+    const long long extA = transA ? (long long)(m - 1) * lda + k : (long long)(k - 1) * lda + m;
+    const long long extB = (long long)(n - 1) * ldb + k;
+    const long long extC = (long long)(n - 1) * ldc + m;
+    const long long topA = extA + (long long)(batch - 1) * strideA;
+    const long long topB = extB + (long long)(batch - 1) * strideB;
+    const long long topC = extC + (long long)(batch - 1) * strideC;
+    if (topA >= (1ll << 31) || topB >= (1ll << 31) || topC >= (1ll << 31)) { note_fallback("span beyond 2^31 elems"); return false; }
+    const uint64_t ao = (uint64_t)(std::uintptr_t) A - kGemmPtrBias,
+                   bo = (uint64_t)(std::uintptr_t) B - kGemmPtrBias,
+                   co = (uint64_t)(std::uintptr_t) C - kGemmPtrBias;   // same strip as fetch() (kPtrBias)
+    if ((ao | bo | co) & 3u) { note_fallback("misaligned operand"); return false; }
+    MMParams pc;
+    std::memset(&pc, 0, sizeof pc);
+    pc.m = m; pc.n = n; pc.k = k; pc.lda = lda; pc.ldb = ldb; pc.ldc = ldc;
+    pc.tilesX = (n + 63) / 64; pc.tilesY = (m + 63) / 64; pc.batch = batch;
+    pc.alpha = alpha; pc.beta = beta;
+    pc.strideA = (int32_t) strideA; pc.strideB = (int32_t) strideB; pc.strideC = (int32_t) strideC;
+    const uint64_t bufs[3] = {ao, bo, co};
+    const uint64_t sizes[3] = {(uint64_t) topA * (uint64_t) ea, (uint64_t) topB * (uint64_t) ea,
+                               (uint64_t) topC * 4ull};
+    try {
+        strata::vk::kernel_launch_sized(mm_kernel(transA, f16 ? 1 : 0), pc.tilesX * pc.tilesY * pc.batch,
+                                bufs, sizes, 3, &pc);
+    } catch (const std::exception& e) {   // e.g. a span crossing an arena piece: the reference still runs
+        note_fallback(e.what());
+        return false;
+    }
+    return true;
+}
+
 // ---- Phase 3 step 0: env-gated measurement (STRATA_VK_BLAS_TIME=1). One record per entry
 // point: calls, total ms, worst single call, and the biggest (m,n,k,batch) seen.
 struct BlasStat {
@@ -241,6 +335,9 @@ cublasStatus_t cublasSetWorkspace_v2(cublasHandle_t handle, void* workspace, siz
     return CUBLAS_STATUS_SUCCESS;
 }
 cublasStatus_t cublasSetMathMode(cublasHandle_t, unsigned) { return CUBLAS_STATUS_SUCCESS; }  // always ordered fp32
+// The parity test's arm selector (the same toggle the STRATA_VK_BLAS_CPU env makes for binaries):
+// on = the GPU tiled kernel path, off = the ordered-fp32 CPU reference. -1 restores env control.
+void strata_vk_blas_use_gpu(int on) { g_gpu_override = on < 0 ? -1 : (on ? 1 : 0); }
 cublasStatus_t cublasGetMathMode(cublasHandle_t, unsigned* m) { if (m) *m = CUBLAS_DEFAULT_MATH; return CUBLAS_STATUS_SUCCESS; }
 
 cublasStatus_t cublasSgemm_v2(cublasHandle_t handle, cublasOperation_t ta, cublasOperation_t tb,
@@ -249,6 +346,8 @@ cublasStatus_t cublasSgemm_v2(cublasHandle_t handle, cublasOperation_t ta, cubla
     if (!handle) return CUBLAS_STATUS_NOT_INITIALIZED;
     if (blas_time_on()) blas_stat_shape("Sgemm", m, n, k, 1);
     BlasClock clk("Sgemm", m, n, k, 1);
+    if (gemm_gpu(ta, tb, m, n, k, *alpha, A, CUDA_R_32F, lda, 0, B, CUDA_R_32F, ldb, 0,
+                 *beta, C, CUDA_R_32F, ldc, 0, 1)) return CUBLAS_STATUS_SUCCESS;
     return gemm_one(*(Handle*) handle, ta, tb, m, n, k, *alpha, A, CUDA_R_32F, lda, B, CUDA_R_32F, ldb,
                     *beta, C, CUDA_R_32F, ldc);
 }
@@ -259,6 +358,8 @@ cublasStatus_t cublasSgemmStridedBatched(cublasHandle_t handle, cublasOperation_
     if (!handle) return CUBLAS_STATUS_NOT_INITIALIZED;
     if (blas_time_on()) blas_stat_shape("SgemmStridedBatched", m, n, k, batchCount);
     BlasClock clk("SgemmStridedBatched", m, n, k, batchCount);
+    if (gemm_gpu(ta, tb, m, n, k, *alpha, A, CUDA_R_32F, lda, strideA, B, CUDA_R_32F, ldb, strideB,
+                 *beta, C, CUDA_R_32F, ldc, strideC, batchCount)) return CUBLAS_STATUS_SUCCESS;
     for (int b = 0; b < batchCount; ++b) {
         cublasStatus_t s = gemm_one(*(Handle*) handle, ta, tb, m, n, k, *alpha,
                                     A + strideA * b, CUDA_R_32F, lda, B + strideB * b, CUDA_R_32F, ldb,
@@ -277,6 +378,8 @@ cublasStatus_t cublasGemmEx(cublasHandle_t handle, cublasOperation_t ta, cublasO
     if (computeType != CUBLAS_COMPUTE_32F && computeType != CUBLAS_COMPUTE_32F_FAST_TF32)
         return CUBLAS_STATUS_NOT_SUPPORTED;      // fp64/integer compute types: the tree never asks for them
     float a = load_scalar(alpha, CUDA_R_32F, 0), b = load_scalar(beta, CUDA_R_32F, 0);
+    if (gemm_gpu(ta, tb, m, n, k, a, A, Atype, lda, 0, B, Btype, ldb, 0, b, C, Ctype, ldc, 0, 1))
+        return CUBLAS_STATUS_SUCCESS;
     return gemm_one(*(Handle*) handle, ta, tb, m, n, k, a, A, Atype, lda, B, Btype, ldb, b, C, Ctype, ldc);
 }
 cublasStatus_t cublasGemmStridedBatchedEx(cublasHandle_t handle, cublasOperation_t ta, cublasOperation_t tb,
@@ -290,6 +393,11 @@ cublasStatus_t cublasGemmStridedBatchedEx(cublasHandle_t handle, cublasOperation
     BlasClock clk("GemmStridedBatchedEx", m, n, k, batchCount);
     const size_t ea = elem_bytes(Atype), eb = elem_bytes(Btype), ec = elem_bytes(Ctype);
     if (!ea || !eb || !ec) return CUBLAS_STATUS_NOT_SUPPORTED;
+    {
+        const float a = load_scalar(alpha, CUDA_R_32F, 0), b = load_scalar(beta, CUDA_R_32F, 0);
+        if (gemm_gpu(ta, tb, m, n, k, a, A, Atype, lda, strideA, B, Btype, ldb, strideB,
+                     b, C, Ctype, ldc, strideC, batchCount)) return CUBLAS_STATUS_SUCCESS;
+    }
     for (int b2 = 0; b2 < batchCount; ++b2) {
         cublasStatus_t s = cublasGemmEx(handle, ta, tb, m, n, k, alpha,
                                         (const char*) A + strideA * b2 * (long long) ea, Atype, lda,

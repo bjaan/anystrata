@@ -68,10 +68,32 @@ target_link_libraries(strata_vk_runtime PUBLIC Vulkan::Vulkan)
 # cudaStream_t -> stream sync, cudaEvent_t -> host-clock timing, cublas -> the CPU fallback in vk_blas.cpp)
 # for ../src's host translation units.  BEFORE so these win over any CUDA toolkit headers on the path, the
 # way hip_compat does in the HIP build (CMakeLists.txt:166).
-add_library(strata_vk_blas STATIC src/runtime/vk_blas.cpp)
+# Phase 3 (attempt 2): the GPU tiled SGEMM under the cublas shim. One .comp, four compiled
+# variants (TRANS_A x F16AB); embedded .spv.h ride the same vk-glslc + embed_spv pattern as
+# the kernel libs, but the launcher lives IN vk_blas.cpp (no separate _vk.cpp), so the blas
+# target carries the four generated headers itself.
+set(_mm_spvs "")
+foreach(_ta 0 1)
+  foreach(_f16 0 1)
+    set(_spv ${CMAKE_CURRENT_BINARY_DIR}/spv/mm_gemm_t${_ta}f${_f16}.spv)
+    add_custom_command(OUTPUT ${_spv}
+      COMMAND ${CMAKE_COMMAND} -E env VK_GLSLC_MODE=${GLSLC_MODE} VK_GLSLC_TOOL=${GLSLC_TOOL}
+              ${VK_GLSLC} --target-env=vulkan1.3 -O -DTRANS_A=${_ta} -DF16AB=${_f16}
+              ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/mm_gemm.comp -o ${_spv}
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/mm_gemm.comp ${VK_GLSLC}
+      COMMENT "vk-glslc mm_gemm.comp TRANS_A=${_ta} F16AB=${_f16}")
+    set(_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/mm_gemm_t${_ta}f${_f16}.spv.h)
+    add_custom_command(OUTPUT ${_inc}
+      COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} mm_gemm_t${_ta}f${_f16}
+      DEPENDS ${_spv})
+    list(APPEND _mm_spvs ${_inc})
+  endforeach()
+endforeach()
+add_library(strata_vk_blas STATIC src/runtime/vk_blas.cpp ${_mm_spvs})
 target_include_directories(strata_vk_blas PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/vulkan_compat
   ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_BINARY_DIR}/spv
   ${STRATA_ROOT}/include)
 target_link_libraries(strata_vk_blas PUBLIC strata_vk_runtime)
 add_library(strata_vk_compat INTERFACE)
@@ -677,6 +699,14 @@ add_executable(poly_attend_vk_parity src/tests/poly_attend_vk_parity.cpp)
 target_include_directories(poly_attend_vk_parity PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
 target_link_libraries(poly_attend_vk_parity PRIVATE strata_vk_kernel_attend strata_vk_kernel_attend_batch strata_vk_blas strata_vk_poly_kernels strata_vk_runtime strata_vk_compat strata_vk_stubs)
 add_test(NAME poly_attend_vk_parity COMMAND poly_attend_vk_parity)
+
+# Phase 3 (attempt 2): the GPU tiled GEMM's micro-parity gate - GPU arm vs the ordered-fp32 CPU
+# reference through the same public cublas surface (arm-switch via strata_vk_blas_use_gpu), all
+# compiled trans/f16 variants + strided batch + alpha/beta {0,1}, rel 1e-5, plus the 2048^3 bench.
+add_executable(vk_blas_gpu_parity src/tests/vk_blas_gpu_parity.cpp)
+target_include_directories(vk_blas_gpu_parity PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/vulkan_compat)
+target_link_libraries(vk_blas_gpu_parity PRIVATE strata_vk_blas strata_vk_runtime strata_vk_compat)
+add_test(NAME vk_blas_gpu_parity COMMAND vk_blas_gpu_parity)
 
 # Task 2.11: the arena's piece-align law - every region <= max allocation is single-piece by
 # construction (arena_add bumps the cursor past a short tail); oversize regions still chain and

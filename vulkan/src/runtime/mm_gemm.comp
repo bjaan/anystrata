@@ -1,0 +1,144 @@
+// vulkan/src/runtime/mm_gemm.comp - Phase 3: tiled fp32 SGEMM under the cublas shim.
+//
+// One workgroup computes a 64x64 tile of C (column-major contract: C = alpha*op(A)*op(B) + beta*C).
+// 256 threads as 16x16, each owning a 4x4 microtile; two shared 16-K-step tiles (sA 64x16, sB 16x64,
+// 8 KiB total - far under the probed 64 KiB LDS). The strided batch rides grid.x: kernel_launch_sized
+// only dispatches (groups_x,1,1), so the linear id decodes (tileX, tileY, batch) with tilesX/tilesY
+// from the push constants. B is always OP_N (both cublasGemmStridedBatchedEx sites in attend_batch
+// and both gemm_f32 sites pass OP_N for B); A's transpose is compiled: -DTRANS_A=0/1.
+//
+// Operand width is compiled too: -DF16AB=1 reads A and B as f16 packed pairs (the attention score /
+// value GEMMs: CUDA_R_16F caches) and unpacks each half bit-exactly into the fp32 shared tile
+// (unpackHalf2x16 of the isolated 16 bits; no rounding, no flush-mode freedom). C is fp32 in every
+// variant this file builds (the f16-out Hgemm arms stay on the CPU reference in vk_blas.cpp).
+//
+// Indexing: every element index into a bound buffer is a uint below 2^31 (the host dispatcher
+// refuses bigger spans), element bases and strides come from the push constants in EACH OPERAND'S
+// OWN element units, and the bound SSBO offsets are 4-byte aligned (host-checked), so the f16 half
+// select (e>>1, e&1) never straddles the binding's start.
+#version 450
+
+#ifndef TRANS_A
+#define TRANS_A 0
+#endif
+#ifndef F16AB
+#define F16AB 0
+#endif
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// A and B are read through the redeclared-block view matching their compiled width; C is always f32.
+layout(set = 0, binding = 0, std430) buffer A32 { float AF[]; };
+layout(set = 0, binding = 0, std430) buffer AU  { uint  AUW[]; };
+layout(set = 0, binding = 1, std430) buffer B32 { float BF[]; };
+layout(set = 0, binding = 1, std430) buffer BU  { uint  BUW[]; };
+layout(set = 0, binding = 2, std430) buffer C32 { float CF[]; };
+
+layout(push_constant) uniform PC {
+    int m, n, k;              // C is m x n, K inner
+    int lda, ldb, ldc;        // leading dims (column-major)
+    int tilesX, tilesY;       // grid decode: tilesX covers N, tilesY covers M
+    int batch;
+    float alpha, beta;
+    int strideA, strideB, strideC;   // per-batch strides in each operand's element units
+} pc;                         // 14*4 = 56 bytes
+
+shared float sA[16 * 64];     // [k][m]
+shared float sB[16 * 64];     // [k][n]
+
+float loadA(uint e) {
+#if F16AB
+    uint w = AUW[e >> 1u];
+    uint bits = ((e & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16);
+    return unpackHalf2x16(int(bits)).x;
+#else
+    return AF[e];
+#endif
+}
+float loadB(uint e) {
+#if F16AB
+    uint w = BUW[e >> 1u];
+    uint bits = ((e & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16);
+    return unpackHalf2x16(int(bits)).x;
+#else
+    return BF[e];
+#endif
+}
+
+void main() {
+    uint lin = gl_WorkGroupID.x;   // ONE tile per workgroup: the decode is per-workgroup, not per-thread
+    uint tX = lin % uint(pc.tilesX);
+    uint rest = lin / uint(pc.tilesX);
+    uint tY = rest % uint(pc.tilesY);
+    uint bI = rest / uint(pc.tilesY);
+
+    uint tileM0 = tY * 64u;
+    uint tileN0 = tX * 64u;
+    uint baseA = bI * uint(pc.strideA);
+    uint baseB = bI * uint(pc.strideB);
+    uint baseC = bI * uint(pc.strideC);
+    uint m = uint(pc.m), n = uint(pc.n), k = uint(pc.k);
+    uint lda = uint(pc.lda), ldb = uint(pc.ldb), ldc = uint(pc.ldc);
+
+    uint tid = gl_LocalInvocationIndex;
+    float acc[4][4];
+    for (int a = 0; a < 4; ++a)
+        for (int c = 0; c < 4; ++c)
+            acc[a][c] = 0.0;
+
+    for (int k0 = 0; k0 < pc.k; k0 += 16) {
+        uint kk0 = uint(k0);
+        // A tile: thread id -> (mi = id&63, kk = id>>6); four elements each (64x16 = 1024 / 256).
+        for (int u = 0; u < 4; ++u) {
+            uint id = tid + uint(u * 256);
+            uint mi = id & 63u, kk = id >> 6u;
+            uint gi = tileM0 + mi;
+            float v = 0.0;
+            if (gi < m && kk0 + kk < k)
+#if TRANS_A
+                v = loadA(baseA + (kk0 + kk) + gi * lda);   // op(A)=A^T: stored k x m
+#else
+                v = loadA(baseA + gi + (kk0 + kk) * lda);   // op(A)=A: stored m x k
+#endif
+            sA[kk * 64u + mi] = v;
+        }
+        // B tile (always OP_N: stored k x n).
+        for (int u = 0; u < 4; ++u) {
+            uint id = tid + uint(u * 256);
+            uint ni = id & 63u, kk = id >> 6u;
+            uint gj = tileN0 + ni;
+            float v = 0.0;
+            if (gj < n && kk0 + kk < k)
+                v = loadB(baseB + (kk0 + kk) + gj * ldb);
+            sB[kk * 64u + ni] = v;
+        }
+        barrier();
+
+        uint ly = gl_LocalInvocationID.y, lx = gl_LocalInvocationID.x;
+        int ksteps = min(16, pc.k - k0);
+        for (int kk = 0; kk < ksteps; ++kk) {
+            float a4[4], b4[4];
+            for (int a = 0; a < 4; ++a) a4[a] = sA[kk * 64u + ly * 4u + uint(a)];
+            for (int c = 0; c < 4; ++c) b4[c] = sB[kk * 64u + lx * 4u + uint(c)];
+            for (int a = 0; a < 4; ++a)
+                for (int c = 0; c < 4; ++c)
+                    acc[a][c] += a4[a] * b4[c];
+        }
+        barrier();
+    }
+
+    uint i0 = tileM0 + gl_LocalInvocationID.y * 4u;
+    uint j0 = tileN0 + gl_LocalInvocationID.x * 4u;
+    for (int a = 0; a < 4; ++a) {
+        uint i = i0 + uint(a);
+        if (i >= m) break;
+        for (int c = 0; c < 4; ++c) {
+            uint j = j0 + uint(c);
+            if (j >= n) break;
+            uint ci = baseC + j * ldc + i;
+            float v = pc.alpha * acc[a][c];
+            if (pc.beta != 0.0) v += pc.beta * CF[ci];
+            CF[ci] = v;
+        }
+    }
+}
