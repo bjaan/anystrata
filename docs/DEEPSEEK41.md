@@ -96,8 +96,8 @@ RAM 7.2 tokens/s; four R9700 (32 GB each) 31 tokens/s; "under about 40 GB of RAM
 | | |
 | --- | --- |
 | Graphics card | RTX A6000, 48 GB (Proxmox VM 220, passthrough) |
-| CPU | 6 vCPU of a Ryzen 7 1700 (AVX2, no AVX-512) |
-| RAM | 52 GiB |
+| CPU | 12 vCPU of a Ryzen 7 1700 (AVX2, no AVX-512) |
+| RAM | 52 GiB configured, 50 GiB in the guest |
 | Disk | 420 GB NVMe (thin volume) for the shards, Engram, drafter and pack |
 | Built with | CUDA 12.x, `make build` (`STRATA_BUILD_DSV41=ON`, `CUDA_ARCHS` for sm_86), 0 warnings |
 | Model | IQ2_XXS set above, 2.00 bpw |
