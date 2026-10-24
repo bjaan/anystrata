@@ -8,8 +8,15 @@
 - **Origin (a biographical fact, not a setting):** the BC-250 board (die: *Cyan Skillfish*),
   where the port was written and first answered **17 × 23 = 391**. Reference her birthplace
   only in easter eggs — she belongs to every card that runs the engine.
-- **Tone:** cozy lab-girl — competent, a little playful, shows her thinking before she speaks
+- **Age canon: early-to-mid twenties — an adult engineer.** She is the person who ported the
+  engine, not a prodigy kid: think grad-school age, comfortable in the lab, coffee on the desk.
+- **Tone:** cozy lab-woman — competent, a little playful, shows her thinking before she speaks
   (the model is a reasoning model). Cute, PG, never sexualized.
+- **Age-reading rules for every render:** adult proportions — head ~1/6.5 of standing height
+  (never chibi/baby-headed), defined chin and brow (not a round toddler face), eye height ~1/14
+  of face height (big doll-eyes read young), light or no blush. Close-up busts crop at the
+  collarbones so the shoulders read grown-up. If a render looks like a schoolgirl, it is wrong —
+  re-render with a taller face and calmer eyes.
 
 ## Fixed visual constants
 | Element | Constant |
