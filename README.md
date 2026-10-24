@@ -162,6 +162,31 @@ is unchanged; published packs stay at https://huggingface.co/robertkarl/Unbiased
 continuity). Model files are downloaded on a network box and copied in; the served files with sizes and SHA-256
 are in [docs/MODEL-FILES.md](docs/MODEL-FILES.md).
 
+## Supported models
+
+Three engines, and what each one runs. The `general.architecture` string in a GGUF decides the engine family;
+the files actually served, with sizes and SHA-256, are listed in [docs/MODEL-FILES.md](docs/MODEL-FILES.md).
+
+| Engine | Architecture (`general.architecture`) | Models | CUDA | HIP | SYCL | Metal | **Vulkan** |
+| --- | --- | --- | :-: | :-: | :-: | :-: | :-: |
+| `omnistrata-pack` | `qwen4exp` | Qwen3.8-Flash-Next and its fine-tunes (Coder, Swift 1.5) — pack + MTP directories, GSQ-RCO quants | ✓ | – | ✓ | ✓ | not ported |
+| `omnistrata-gguf` | `qwen35moe` | Qwen3.6-35B-A3B, Ornith 1.5, Tiel Coder, MiniCPM-V 4.7 (Unsloth / chtisgit-GSQ / community GGUFs) | ✓ | ✓ | ✓ | ✓ | **✓ end-to-end** (the port's gate model) |
+| | `glm5-next` | GLM 5.3 Flash (GSQ-RCO, REAP, UD quants) | ✓ | ✓ | – | – | untried |
+| | `gemma4` | Gemma 4 26B-A4B | ✓ | ✓ | – | – | untried |
+| | `deepseek4` | DeepSeek V4 Flash | ✓ | ✓ | – | – | untried |
+| | `lfm2moe` | LFM2.5-24B-A2B | ✓ | – | – | – | untried |
+| `omnistrata-gguf-dsv41` | `deepseek41` | DeepSeek-V4.1-Flash-1017 (Strata v0.2.4's engine: the four shards, Engram table, DSpark drafter; IQ1_M / IQ2_XXS / IQ2_XS GSQ-RCO) | ✓ | – | – | – | not ported |
+
+The Vulkan column reports what has run end-to-end on a Vulkan device (the BC-250 gate: `qwen35moe` files, all
+expert and dense quant formats held bitwise against the CUDA tree — see `vulkan/PORT-STATUS.md`); the other
+families build against the same shim but wait for their own bring-up gate. Anything the Vulkan port has not
+carried yet refuses loudly, by name, and never answers with a wrong kernel.
+
+Dense (non-MoE) models are a different story: Strata's design — streaming routed experts to VRAM — only applies
+to MoE. A dense GGUF like `qwen35` Qwen3.8-27B is served best by llama.cpp's own Vulkan backend
+([tools/vulkan/serve-swift27.sh](tools/vulkan/serve-swift27.sh)), and no Strata engine takes that architecture
+on any backend.
+
 ## Backends
 
 | Backend | Command | Needs | Status |

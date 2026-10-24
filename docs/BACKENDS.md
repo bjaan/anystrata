@@ -1,5 +1,10 @@
 # Models and backends
 
+(Name map for this fork's copy of the upstream page: `strata` = `omnistrata-pack`, `strata-poly` =
+`omnistrata-gguf`, `strata-dsv41` = `omnistrata-gguf-dsv41`, `unbiased-strata` = `omnistrata`.
+For what the **Vulkan** backend carries of each family, see the README's "Supported models" table and
+[vulkan/PORT-STATUS.md](../vulkan/PORT-STATUS.md).)
+
 PolyStrata runs more than one model family. This page says which, how the engine is put together so that it can,
 how a model is recognized, how to add one, and how to change the model that answers.
 
