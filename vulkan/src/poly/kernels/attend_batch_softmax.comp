@@ -1,0 +1,115 @@
+// vulkan/src/poly/kernels/attend_batch_softmax.comp - translation of attn_softmax_block_kernel
+// (src/poly/kernels.cu:1602-1629): the softmax over ONE block of the chunk's key rows, for
+// scores in the order of the groups.  blockIdx.x is the group-order row (group, token, head of
+// the group); its m scores lie at blk*m and its weights (the f16 the values' product takes) at
+// the same element index in the word-packed WT.  top/sum/shrink carry each row's running max,
+// its weight sum against that max, and the factor the earlier blocks' results shrink by - one
+// AUX binding at the launcher's work-arena offsets (indices from the work base in the pc).
+// The strided element pass j = tid; j < m; j += 128 matches CUDA :1618-1620 one-for-one, the
+// sum s over __half2float(w[j]) included: the same values, the same per-thread order (law 9's
+// exp family absorbs exp-vs-expf).  Words are built from f16_rn_bits (byte-exact vs CUDA's
+// __float2half, the store_f16 law 1 helper) and combined with atomicOr into ZEROED memory
+// (the launcher fills the weight third once a chunk): a word shared by two rows at an odd-m
+// boundary has each half written by exactly one thread, disjoint bit fields, OR into zeros -
+// same value whatever the block order.  The sum re-reads the half exactly via f16_to_float.
+// CUDA <<<c*n_head, 128>>>: 4 warps; block_max/block_sum's part[] walks go k = 0..3 in order
+// (:47/:64); the xor trees at offsets 16..1 never cross an aligned 32-lane block on gfx1013's
+// wave64 (the attend_softmax/rms_norm precedent).  attn_rows (:1026) replayed with i32
+// p/row0/last (the launcher traps beyond int31, the head_norm_rope law).
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer SC { float v[]; } bsc;   // this chunk's scores (row blk starts at blk*m)
+layout(std430, binding = 1) buffer WT { uint v[]; } bwt;             // f16 weights, zeroed words, element-mirrored
+layout(std430, binding = 2) buffer AUX { float v[]; } baux;          // top/sum/shrink at pc.top/sum/shrink + blk
+
+layout(push_constant) uniform PC {
+    uint m, tokens, per, first, window, fresh,
+         row0, pos, last, top, sum, shrink, pad0, pad1, pad2, pad3;
+} pc;
+
+shared float part[8];
+
+uint f16_rn_bits(float f) {                       // verbatim from store_f16.comp
+    const uint b = floatBitsToUint(f);
+    const uint sign = (b >> 16u) & 0x8000u;
+    int exp = int((b >> 23u) & 0xFFu) - 127 + 15;
+    uint man = b & 0x7FFFFFu;
+    if (exp >= 31) return sign | 0x7C00u;
+    if (exp <= 0) {
+        man |= 0x800000u;
+        const uint sh = uint(1 - exp) + 13u;
+        uint h = (sh >= 32u) ? 0u : (man >> sh);
+        const uint rem = (sh >= 32u) ? 0u : (man & ((1u << sh) - 1u));
+        if (sh < 32u && (rem > (1u << (sh - 1u)) || (rem == (1u << (sh - 1u)) && (h & 1u) != 0u))) h++;
+        return sign | h;
+    }
+    uint hman = man >> 13u; uint rem = man & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (hman & 1u) != 0u)) { hman++; if (hman == 0x400u) { hman = 0u; exp++; if (exp >= 31) return sign | 0x7C00u; } }
+    return sign | (uint(exp) << 10u) | hman;
+}
+
+float f16_to_float(uint h) {                      // exact, the parity helper's shape
+    const uint sign = (h >> 15u) & 1u;
+    const uint e = (h >> 10u) & 0x1Fu, m = h & 0x3FFu;
+    if (e == 0u) {
+        if (m == 0u) return sign == 0u ? 0.0f : -0.0f;
+        uint mb = m << 13u; int ee = -14;
+        while ((mb & 0x800000u) == 0u) { mb <<= 1u; ee--; }
+        return uintBitsToFloat((sign << 31u) | (uint(ee + 127) << 23u) | (mb & 0x7FFFFFu));
+    }
+    if (e == 31u) return uintBitsToFloat((sign << 31u) | 0x7F800000u | (m << 13u));
+    return uintBitsToFloat((sign << 31u) | ((e + 112u) << 23u) | (m << 13u));
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint blk = gl_WorkGroupID.x;
+    const uint m = pc.m;
+    // CUDA :1608: tok = first + (blockIdx.x % (tokens*per)) / per (group-order row).
+    const uint tok = pc.first + (blk % (pc.tokens * pc.per)) / pc.per;
+    // CUDA :1609-1612: attn_rows(pos + tok, window, last) clipped against the block at row0.
+    const int p = int(pc.pos) + int(tok);
+    const int lo_ = (int(pc.window) > 0 && p >= int(pc.window)) ? p - int(pc.window) + 1 : 0;
+    const int end = lo_ + ((int(pc.last) < 0 ? p : int(pc.last)) - lo_ + 1);
+    const int j0 = lo_ > int(pc.row0) ? lo_ - int(pc.row0) : 0;
+    const int j1 = end - int(pc.row0) < int(m) ? end - int(pc.row0) : int(m);
+
+    const uint base = blk * m;
+    // CUDA :1614-1615: mx over the token's attended rows of the block, then block_max.
+    float mx = uintBitsToFloat(0xFF800000u);
+    for (int j = j0 + int(tid); j < j1; j += 128) mx = max(mx, bsc.v[base + uint(j)]);
+    for (uint o = 16u; o > 0u; o >>= 1u) mx = max(mx, subgroupShuffleXor(mx, o));
+    if ((tid & 31u) == 0u) part[tid >> 5u] = mx;
+    barrier();
+    mx = part[0];
+    for (uint k = 1u; k < 4u; k++) mx = max(mx, part[k]);
+    barrier();
+    const float before = pc.fresh != 0u ? uintBitsToFloat(0xFF800000u) : baux.v[pc.top + blk];
+    const float now = max(before, mx);
+
+    // CUDA :1617-1620: w[j] = __float2half(expf(row[j] - now)) inside the token's span, 0.0
+    // outside, every j of the block; s sums the halves as written.
+    float s = 0.0f;
+    for (uint j = tid; j < m; j += 128u) {
+        const float e = (int(j) >= j0 && int(j) < j1) ? exp(bsc.v[base + j] - now) : 0.0f;
+        const uint hb = f16_rn_bits(e);
+        atomicOr(bwt.v[(base + j) / 2u], ((base + j) & 1u) != 0u ? (hb << 16u) : hb);
+        s += f16_to_float(hb);
+    }
+    for (uint o = 16u; o > 0u; o >>= 1u) s += subgroupShuffleXor(s, o);
+    if ((tid & 31u) == 0u) part[tid >> 5u] = s;
+    barrier();
+    float t0 = part[0];
+    for (uint k = 1u; k < 4u; k++) t0 += part[k];
+    barrier();
+    if (tid != 0u) return;
+    // CUDA :1624-1628: a block whose rows raised no max (empty span) shrinks nothing.
+    const float f = mx == uintBitsToFloat(0xFF800000u) ? 1.0f : exp(before - now);
+    baux.v[pc.top + blk] = now;
+    baux.v[pc.sum + blk] = (pc.fresh != 0u ? 0.0f : baux.v[pc.sum + blk] * f) + t0;
+    baux.v[pc.shrink + blk] = f;
+}

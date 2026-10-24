@@ -344,6 +344,42 @@ add_library(strata_vk_kernel_attend STATIC src/poly/kernels/attend_vk.cpp ${_att
 target_include_directories(strata_vk_kernel_attend PUBLIC ${STRATA_ROOT}/include ${STRATA_ROOT}/src/poly ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
 target_link_libraries(strata_vk_kernel_attend PUBLIC strata_vk_runtime strata_vk_compat)
 
+# Task: poly attend_batch - the prefill/multi-token chain: the wrapper's chunk/key-block loop
+# over the compat CPU cublas's two strided-batched products (vk_blas.cpp, transcribed arg for
+# arg), plus three .comp arms (group/ungroup one file with -DUNGROUP, softmax-block, scale).
+# The kq8/vq8 and dim-64 flash arms are covered the way attend_vk.cpp traps: by name, here.
+set(_ab_spvs "")
+foreach(_n group group_ungroup softmax scale)
+  if(_n STREQUAL "group")
+    set(_comp attend_batch_group.comp)
+    set(_def "-DUNGROUP=0")
+  elseif(_n STREQUAL "group_ungroup")
+    set(_comp attend_batch_group.comp)
+    set(_def "-DUNGROUP=1")
+  elseif(_n STREQUAL "softmax")
+    set(_comp attend_batch_softmax.comp)
+    set(_def "")
+  else()
+    set(_comp attend_batch_scale.comp)
+    set(_def "")
+  endif()
+  set(_spv ${CMAKE_CURRENT_BINARY_DIR}/spv/attend_batch_${_n}.spv)
+  add_custom_command(OUTPUT ${_spv}
+    COMMAND ${CMAKE_COMMAND} -E env VK_GLSLC_MODE=${GLSLC_MODE} VK_GLSLC_TOOL=${GLSLC_TOOL}
+            ${VK_GLSLC} --target-env=vulkan1.3 -O ${_def}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels/${_comp} -o ${_spv}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels/${_comp} ${VK_GLSLC}
+    COMMENT "vk-glslc ${_comp} -> attend_batch_${_n}")
+  set(_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/attend_batch_${_n}.spv.h)
+  add_custom_command(OUTPUT ${_inc}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} attend_batch_${_n}
+    DEPENDS ${_spv})
+  list(APPEND _ab_spvs ${_inc})
+endforeach()
+add_library(strata_vk_kernel_attend_batch STATIC src/poly/kernels/attend_batch_vk.cpp ${_ab_spvs})
+target_include_directories(strata_vk_kernel_attend_batch PUBLIC ${STRATA_ROOT}/include ${STRATA_ROOT}/src/poly ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
+target_link_libraries(strata_vk_kernel_attend_batch PUBLIC strata_vk_runtime strata_vk_compat strata_vk_blas)
+
 strata_vk_kernel(native_quantize_q8_1 COMP quantize_q8_1.comp LAUNCHER src/kernels/native_quantize_q8_1_vk.cpp)
 # Task 2.2: native_mmvq for IQ2_XXS (type 16) — the model's routed experts. The .spv embeds under
 # the entry point's name (native_mmvq.spv.h) so the launcher includes it like the others.
@@ -639,7 +675,7 @@ add_test(NAME poly_gdn_vk_parity COMMAND poly_gdn_vk_parity)
 # Task 2.11: poly attend parity - the general fp16-KV chain (score reg<4,1> / softmax / value).
 add_executable(poly_attend_vk_parity src/tests/poly_attend_vk_parity.cpp)
 target_include_directories(poly_attend_vk_parity PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
-target_link_libraries(poly_attend_vk_parity PRIVATE strata_vk_kernel_attend strata_vk_poly_kernels strata_vk_runtime strata_vk_compat strata_vk_stubs)
+target_link_libraries(poly_attend_vk_parity PRIVATE strata_vk_kernel_attend strata_vk_kernel_attend_batch strata_vk_blas strata_vk_poly_kernels strata_vk_runtime strata_vk_compat strata_vk_stubs)
 add_test(NAME poly_attend_vk_parity COMMAND poly_attend_vk_parity)
 
 # Task 2.11: the arena's piece-align law - every region <= max allocation is single-piece by
@@ -761,7 +797,7 @@ target_link_libraries(strata-poly-vk PRIVATE
   strata_vk_kernel_copy2 strata_vk_kernel_rms_norm strata_vk_kernel_native_quantize_q8_1
   strata_vk_kernel_native_mmvq
   strata_vk_kernel_gemv strata_vk_kernel_gemv_bf16 strata_vk_kernel_conv4_silu strata_vk_kernel_gdn strata_vk_kernel_elementwise
-  strata_vk_kernel_head_norm_rope strata_vk_kernel_store_f16 strata_vk_kernel_attend strata_vk_kernel_likeliest
+  strata_vk_kernel_head_norm_rope strata_vk_kernel_store_f16 strata_vk_kernel_attend strata_vk_kernel_attend_batch strata_vk_kernel_likeliest
   strata_vk_kernel_bf16_to_f32 strata_vk_kernel_gemm_f32
   strata_vk_poly_kernels strata_vk_core
   ggml-cpu ggml-base

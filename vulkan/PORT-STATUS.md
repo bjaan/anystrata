@@ -650,6 +650,26 @@ HALT after ports 1-3 (long-context run, 485 tokens from strata_tokenizer.py, --m
 (the multi-stage cuBLAS + softmax + q8-cache chain, kernels.cu:2568ff - a Phase-3-class port,
 not attempted under this session's 4-port budget).
 
+ATTEND_BATCH PORTED - LONG CONTEXT UNBLOCKED: strata::poly::attend_batch (kernels.cu:2568)
+runs on the compat CPU cublas + three new .comp arms (attend_batch_vk.cpp launcher; group /
+ungroup one file with -DUNGROUP, softmax-block, scale). The wrapper's chunk loop, the two
+cublasGemmStridedBatchedEx calls and the running-max softmax carry over ARG FOR ARG / line for
+line; the weights round to f16 before the value product exactly as CUDA's tensor-core design
+does (words built with f16_rn_bits + atomicOr into zeroed scratch - the launcher zeroes the
+block's weight span per key-block, since a shorter tail block reuses the region). The kq8/vq8
+arm traps by name (the q8 workspace's dequant chain); the CUDA dim-64 flash arm needs
+tensor_cores(), false on AMD builds, so every shape takes this chain like CUDA's own AMD path.
+Parity: poly_attend_vk_parity gains four attend_batch cases (32 rows over 64 keys at dim 128
+and 256; 100 rows multi-block chunked; 40 rows n_head=8 with an odd tail m=13): order-reference
+rel_l1 2.4-2.7e-8, worst-abs <=1.8e-7, and the cross-check batch-vs-the-ported-single-attend on
+the same data rel_l1 1.1-1.5e-7, all under attend's 1e-5 law. Gates: ctest 13/13; the short
+hybrid gate UNCHANGED (16 ids '220,18,24,16,13,271,48,25,3437,369,220,16,22,2942,220,17',
+18.78 tok/s); the 735-token long gate that halted now completes: "prompt 735 tokens 5.7 tok/s,
+generated 16 tokens 10.41 tok/s", ids 271,248068,271,248069,271,1206,10724,393,16,22,1088,14695,
+220,17,18,60439 (no further trap reached on this path: store_q8/_at and softcap stay trapped
+for the chains that demand them, untested by these gates). Next halt: none observed - pi's
+>500-token system prompt now runs.
+
 COMPLETION: 16-token gate GREEN on the hybrid (default arena, no env overrides): prompt 18 tok at 12.3-13.3 tok/s, decode 16
 tokens at 19.03 / 18.95 / 18.65 / 18.59 tok/s (4 runs incl. the post-gemm_f32 rebuild, ids IDENTICAL all four):
 220,18,24,16,13,271,48,25,3437,369,220,16,22,2942,220,17

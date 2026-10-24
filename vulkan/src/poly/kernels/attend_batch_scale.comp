@@ -1,0 +1,27 @@
+// vulkan/src/poly/kernels/attend_batch_scale.comp - translation of attn_scale_kernel
+// (src/poly/kernels.cu:1631): a chunk's results og in the order of the groups, `dim` values a
+// token and head, times its factor (shrink: when a block of keys raised a new largest, applied
+// to the running results before the next product) or divided by it (sum: the final divide).
+// CUDA's early-out `if (!divide && f == 1.0f) return;` is kept (:1637), and the divide arm
+// multiplies by 1.0f/f exactly like :1639 - no reordering freedom is taken.
+// Flattened CUDA grid: dim3(grid(dim,256), heads), x-fastest; b = blk / gx is CUDA's
+// blockIdx.y (a token and head in GROUP order), i = (blk % gx)*256 + tid is CUDA's i.
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer OG { float v[]; } bog;    // og rows: b*dim..
+layout(std430, binding = 1) readonly buffer F { float v[]; } bf;   // top/sum/shrink array base
+
+layout(push_constant) uniform PC { uint dim, gx, divide, factor0,
+                                   pad0, pad1, pad2, pad3, pad4, pad5, pad6, pad7, pad8, pad9, pad10, pad11; } pc;
+
+void main() {
+    const uint blk = gl_WorkGroupID.x;
+    const uint i = (blk % pc.gx) * 256u + gl_LocalInvocationID.x;
+    if (i >= pc.dim) return;
+    const uint b = blk / pc.gx;
+    const float f = bf.v[pc.factor0 + b];
+    if (pc.divide == 0u && f == 1.0f) return;
+    bog.v[b * pc.dim + i] *= pc.divide != 0u ? 1.0f / f : f;
+}

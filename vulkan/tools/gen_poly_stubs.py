@@ -126,6 +126,7 @@ void blas_destroy(void* blas) { if (blas) cublasDestroy((cublasHandle_t) blas); 
               "head_norm_rope": "vulkan/src/poly/kernels/head_norm_rope_vk.cpp",
               "store_f16": "vulkan/src/poly/kernels/store_f16_vk.cpp",
               "attend": "vulkan/src/poly/kernels/attend_vk.cpp",
+              "attend_batch": "vulkan/src/poly/kernels/attend_batch_vk.cpp",
               "likeliest": "vulkan/src/poly/kernels/likeliest_vk.cpp",
               "bf16_to_f32": "vulkan/src/poly/kernels/bf16_to_f32_vk.cpp",
               "gemm_f32": "vulkan/src/poly/kernels/gemm_f32_vk.cpp"}

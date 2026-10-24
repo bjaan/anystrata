@@ -24,6 +24,7 @@
 #include "strata/poly/kernels.hpp"
 #include "strata/vulkan_runtime.hpp"
 #include "strata/vulkan_compat/strata_vk.h"
+#include "strata/vulkan_compat/cublas_v2.h"
 
 #include <cmath>
 #include <cstdint>
@@ -320,6 +321,178 @@ void run(const Case& cs) {
     check(ro < 1e-5 && rn < 1e-5 && worst < 1e-5, cs.what);
 }
 
+
+// ---- attend_batch (the prefill chain, Task: long prompts). The ORDER reference is a direct
+// transcription of the launcher's algorithm (kernels.cu:2596-2662 mirrored): the chunk pick,
+// the key-block split, the group-order (g, tok, h) layout, f16-rounded q (attn_group), the
+// ordered fp32 score dot scaled by alpha after the sum (vk_blas gemm_one: crows += alpha*acc),
+// the per-block running-max softmax with the weights rounded to f16 BEFORE the value product
+// (the tensor-core design the batch chain has and the single attend chain does not), the
+// per-block shrink multiply, the ordered fp32 value accumulate across blocks, and the final
+// 1/sum divide. The only freedoms are exp-vs-expf (law 9) and warp-tree sum order (fp noise
+// far under 1e-5). The CROSS-CHECK runs the ported single attend() on the same data: the two
+// chains differ by the batch chain's f16 weight rounding, which cancels in the weighted
+// average when the v rows carry a strong common term (0.7 +/- 0.0015), so the agreement
+// still rides the same rel_l1 1e-5.
+struct BatchCase { long long pos; int rows; int n_head, kv_heads, dim; size_t score_floats; const char* what; };
+
+void run_batch(const BatchCase& cs) {
+    const int per = cs.n_head / cs.kv_heads, width = cs.kv_heads * cs.dim;
+    const float scale = 1.0f / std::sqrt((float) cs.dim);
+    const long long nrows = cs.pos + cs.rows;
+    std::mt19937 rng(4242 + cs.rows * 11 + size_t(cs.pos) * 3 + cs.dim);
+    std::vector<float> q(size_t(cs.rows) * cs.n_head * cs.dim);
+    std::vector<uint16_t> kc(size_t(nrows) * width), vc(size_t(nrows) * width);
+    for (auto& v : q) v = frandom(rng) * 0.5f;
+    for (size_t i = 0; i < kc.size(); ++i) kc[i] = f16_rn(frandom(rng));
+    // v rows carry a strong DC term: the f16-vs-f32 weight gap between the two chains is then
+    // a common factor of every row's weighted average and cancels at the rel_l1 level.
+    for (size_t i = 0; i < vc.size(); ++i) vc[i] = f16_rn(0.7f + frandom(rng) * 0.003f);
+
+    vk::Arena& a = vk::Arena::instance();
+    cublasHandle_t blas = nullptr;
+    if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS) { std::printf("  FAIL %s: cublasCreate\n", cs.what); fails++; return; }
+
+    // ---- ORDER reference: replay the launcher's loops (window=0, ring=0, whole=false).
+    const size_t cells = cs.score_floats / 3 * 2;
+    std::vector<float> out_ref(size_t(cs.rows) * cs.n_head * cs.dim, 0.f);
+    auto attn_by_group = [&](size_t row, size_t tokens) {
+        const size_t t = row / cs.n_head, h = row % cs.n_head;
+        return (h / per * tokens + t) * per + h % per;
+    };
+    for (long long first = 0, c = 0; first < cs.rows; first += c) {
+        c = (long long) std::min({size_t(cs.rows - first), size_t(65535 / cs.n_head), cells / cs.n_head,
+                                  std::max<size_t>(16, (size_t(8) << 20) / (size_t(cs.n_head) * cs.dim * 4))});
+        const long long p0 = cs.pos + first, lo0 = 0;
+        const int n_keys = int(p0 + c - 1) + 1;
+        const size_t heads = size_t(c) * cs.n_head;
+        std::vector<float> og(heads * cs.dim, 0.f), top(heads, 0.f), sum(heads, 0.f), shrink(heads, 1.f);
+        const int fit = (int) (cells / heads);
+        const int block = fit > 16 ? fit & ~15 : fit;
+        for (int k0 = 0, m = 0; k0 < n_keys; k0 += m) {
+            m = std::min<long long>(block, n_keys - k0);
+            // scores: blk (group order) x m rows
+            std::vector<float> sc(heads * m);
+            for (size_t blk = 0; blk < heads; ++blk) {
+                const size_t g = blk / (size_t(c) * per), jl = blk % (size_t(c) * per);
+                const size_t qrow = size_t(first) + jl / per;   // engine token
+                const size_t h = g * per + jl % per;            // engine head
+                for (int j = 0; j < m; ++j) {
+                    float acc = 0.f;
+                    for (int d = 0; d < cs.dim; ++d)
+                        acc += f16_to_float(f16_rn(q[(qrow * cs.n_head + h) * cs.dim + d])) *
+                               f16_to_float(kc[(size_t(k0 + j) * cs.kv_heads + g) * cs.dim + d]);
+                    sc[blk * m + j] = scale * acc;
+                }
+            }
+            // the block's softmax: running max/sum, f16 weights
+            const bool fresh = k0 == 0;
+            for (size_t blk = 0; blk < heads; ++blk) {
+                const long long tok = first + (long long) ((blk % (size_t(c) * per)) / per);
+                const int end = int(cs.pos + tok) + 1;
+                const int j0 = 0, j1 = end - k0 < m ? end - k0 : m;
+                float mx = -INFINITY;
+                for (int j = j0; j < j1; ++j) mx = std::fmax(mx, sc[blk * m + j]);
+                const float before = fresh ? -INFINITY : top[blk];
+                const float now = std::fmax(before, mx);
+                std::vector<uint16_t> w(m, 0);
+                float s = 0.f;
+                for (int j = 0; j < m; ++j) {
+                    if (j >= j0 && j < j1) w[j] = f16_rn(std::exp(sc[blk * m + j] - now));
+                    s += f16_to_float(w[j]);
+                }
+                // CUDA order: the softmax writes shrink = f FIRST, then attn_scale multiplies
+                // og by it (k0 > 0), then the values' product accumulates onto it.
+                const float f = mx == -INFINITY ? 1.f : std::exp(before - now);
+                for (size_t d = 0; d < cs.dim; ++d) {
+                    float acc = 0.f;
+                    const size_t g2 = blk / (size_t(c) * per);
+                    for (int j = 0; j < m; ++j)
+                        acc += f16_to_float(w[j]) * f16_to_float(vc[(size_t(k0 + j) * cs.kv_heads + g2) * cs.dim + d]);
+                    og[blk * cs.dim + d] = (k0 > 0 ? og[blk * cs.dim + d] * f : 0.f) + acc;
+                }
+                top[blk] = now;
+                sum[blk] = (fresh ? 0.f : sum[blk] * f) + s;
+                shrink[blk] = f;
+            }
+        }
+        for (size_t blk = 0; blk < heads; ++blk) {
+            const size_t row = blk;   // engine order (first + local row), head (g*per + hl)
+            const size_t t = row / cs.n_head, h = row % cs.n_head;
+            const size_t bg = attn_by_group(row, size_t(c));
+            for (int d = 0; d < cs.dim; ++d)
+                out_ref[(size_t(first) + t) * cs.n_head * cs.dim + h * cs.dim + d] = og[bg * cs.dim + d] / sum[bg];
+        }
+        (void) lo0;
+    }
+
+    // ---- the device run
+    const int cmax = (int) std::min<size_t>(cs.rows, cells / cs.n_head);
+    const size_t wf = size_t(cmax) * cs.n_head * (cs.dim / 2 + cs.dim + 3) + 4;
+    const uint64_t aq = a.alloc(q.size() * 4), ak = a.alloc(kc.size() * 2 + 8), av = a.alloc(vc.size() * 2 + 8),
+                   as = a.alloc(cs.score_floats * 4 + 8), ao = a.alloc(size_t(cs.rows) * cs.n_head * cs.dim * 4),
+                   aw = a.alloc(wf * 4);
+    vk::copy_h2d((void*) aq, q.data(), q.size() * 4, nullptr);
+    vk::copy_h2d((void*) ak, kc.data(), kc.size() * 2, nullptr);
+    vk::fill_d((void*) (ak + kc.size() * 2), 0, 8, nullptr);
+    vk::copy_h2d((void*) av, vc.data(), vc.size() * 2, nullptr);
+    vk::fill_d((void*) (av + vc.size() * 2), 0, 8, nullptr);
+    vk::fill_d((void*) as, 0, cs.score_floats * 4, nullptr);
+    vk::fill_d((void*) aw, 0, wf * 4, nullptr);
+    vk::fill_d((void*) ao, 0, size_t(cs.rows) * cs.n_head * cs.dim * 4, nullptr);
+    std::vector<float> got(size_t(cs.rows) * cs.n_head * cs.dim, 0.f);
+    try {
+        poly::attend_batch(blas, (float*) strata_vk_compat::wrap(aq), (uint16_t*) strata_vk_compat::wrap(ak),
+                           (uint16_t*) strata_vk_compat::wrap(av), cs.pos, cs.rows,
+                           (float*) strata_vk_compat::wrap(as), cs.score_floats,
+                           (float*) strata_vk_compat::wrap(aw), (float*) strata_vk_compat::wrap(ao),
+                           cs.dim, cs.n_head, cs.kv_heads, scale, nullptr);
+        vk::copy_d2h(got.data(), (void*) ao, got.size() * 4, nullptr);
+    } catch (const std::exception& e) {
+        std::printf("  FAIL %s: attend_batch threw: %s\n", cs.what, e.what());
+        fails++; cublasDestroy(blas); return;
+    }
+    auto rel = [](const std::vector<float>& g, const std::vector<float>& r) {
+        double d = 0.0, m = 0.0;
+        for (size_t i = 0; i < g.size(); ++i) { d += std::fabs((double) g[i] - r[i]); m += std::fabs((double) g[i]); }
+        return d / (m > 1e-30 ? m : 1e-30);
+    };
+    const double rb = rel(got, out_ref);
+    double worst = 0.0, rmax = 0.0;
+    for (size_t i = 0; i < got.size(); ++i) {
+        worst = std::fmax(worst, std::fabs((double) got[i] - out_ref[i]));
+        rmax = std::fmax(rmax, std::fabs(out_ref[i]));
+    }
+    std::printf("  attend_batch %s: out rel_l1 order %.3e; worst abs %.3e (max ref %.3f) target <=1e-5\n",
+                cs.what, rb, worst, rmax);
+    check(rb < 1e-5 && worst < 1e-5, cs.what);
+
+    // ---- cross-check vs the ported single attend() (the slots-style test). attend keeps the
+    // softmax weights f32; with the v rows' strong common term the two chains' weighted
+    // averages agree at the same rel_l1 1e-5 (the batch chain's f16 weight rounding is then
+    // a shared factor that divides out; the residual rides the fluctuation, 2e-3 of the DC).
+    const uint64_t as2 = a.alloc(size_t(cs.rows) * cs.n_head * (cs.pos + cs.rows) * 4 + 8),
+                   ao2 = a.alloc(size_t(cs.rows) * cs.n_head * cs.dim * 4);
+    vk::fill_d((void*) as2, 0, size_t(cs.rows) * cs.n_head * (cs.pos + cs.rows) * 4, nullptr);
+    vk::fill_d((void*) ao2, 0, size_t(cs.rows) * cs.n_head * cs.dim * 4, nullptr);
+    std::vector<float> got2(got.size(), 0.f);
+    try {
+        poly::attend((float*) strata_vk_compat::wrap(aq), (uint16_t*) strata_vk_compat::wrap(ak),
+                     (uint16_t*) strata_vk_compat::wrap(av), cs.pos, cs.rows,
+                     (float*) strata_vk_compat::wrap(as2), cs.rows,
+                     (float*) strata_vk_compat::wrap(ao2), cs.dim, cs.n_head, cs.kv_heads, scale, nullptr,
+                     0, 0, false, nullptr, 0, size_t(cs.rows) * cs.n_head * (cs.pos + cs.rows));
+        vk::copy_d2h(got2.data(), (void*) ao2, got2.size() * 4, nullptr);
+    } catch (const std::exception& e) {
+        std::printf("  FAIL %s cross-check: attend threw: %s\n", cs.what, e.what());
+        fails++; cublasDestroy(blas); return;
+    }
+    const double rx = rel(got, got2);
+    std::printf("  attend_batch %s: cross-check batch-vs-attend rel_l1 %.3e target <=1e-5\n", cs.what, rx);
+    check(rx < 1e-5, cs.what);
+    cublasDestroy(blas);
+}
+
 }  // namespace
 
 int main() {
@@ -337,6 +510,13 @@ int main() {
         {33, 3, 8, 16, 2, 256, "MODEL dim256 chunked rows=3 chunk=8"},
     };
     for (const auto& cs : cases) run(cs);
+    const BatchCase bcases[] = {
+        {64, 32, 16, 2, 128, size_t(1)<<18, "batch dim128 rows=32 over 64 keys"},
+        {64, 32, 16, 2, 256, size_t(1)<<18, "batch dim256 rows=32 over 64 keys"},
+        {63, 100, 16, 2, 128, size_t(1)<<16, "batch dim128 rows=100: chunked blocks, odd tails"},
+        {5, 40, 8, 2, 128, size_t(1)<<14, "batch multi-block rows=40 n_head=8: odd tail m=13"},
+    };
+    for (const auto& cs : bcases) run_batch(cs);
     std::printf("poly_attend_vk_parity %s\n", fails == 0 ? "PASS" : "FAIL");
     return fails == 0 ? 0 : 1;
 }

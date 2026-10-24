@@ -1,0 +1,67 @@
+// vulkan/src/poly/kernels/attend_batch_group.comp - translation of attn_group_kernel and
+// attn_ungroup_kernel (src/poly/kernels.cu:1581/:1590), one .comp with UNGROUP to pick the
+// direction.  A chunk's queries/results lie in two orders: the engine's (token, head) and the
+// one a product per group of heads takes (group, token, head of the group) - attn_by_group
+// (:1575) is transcribed as-is.  The group arm writes f16 halves (the products take halves):
+// RADV's packHalf2x16 truncates (PORT-NOTES law 1) so words are built from f16_rn_bits, the
+// same helper store_f16/quantize_q8_1 prove byte-exact against CUDA's __float2half; each
+// thread owns ONE word (values 2i, 2i+1 of its row) so no two threads touch a word.  dim is
+// even (the launcher checks it) and rows are dim apart, so a word never straddles two rows.
+// Flattened CUDA grid: dim3(grid(dim,256), c*n_head), x-fastest; b = blk / gx recovers
+// blockIdx.y, i = (blk % gx)*256 + tid recovers blockIdx.x*blockDim.x+threadIdx.x.
+#version 450
+
+layout(local_size_x = 256) in;
+
+// GROUP arm (UNGROUP=0): SRC = q f32 (engine order), DST = qg f16 words (group order).
+// UNGROUP arm: SRC = og f32 (group order), DST = out f32 (engine order).
+#if UNGROUP == 0
+layout(std430, binding = 0) readonly buffer SRC { float v[]; } bsrc;
+layout(std430, binding = 1) buffer DST { uint v[]; } bdst;
+#else
+layout(std430, binding = 0) readonly buffer SRC { float v[]; } bsrc;
+layout(std430, binding = 1) buffer DST { float v[]; } bdst;
+#endif
+
+layout(push_constant) uniform PC { uint dim, n_head, kv_heads, tokens, gx,
+                                   pad0, pad1, pad2, pad3, pad4, pad5, pad6, pad7, pad8, pad9, pad10; } pc;
+
+uint f16_rn_bits(float f) {                       // verbatim from store_f16.comp
+    const uint b = floatBitsToUint(f);
+    const uint sign = (b >> 16u) & 0x8000u;
+    int exp = int((b >> 23u) & 0xFFu) - 127 + 15;
+    uint man = b & 0x7FFFFFu;
+    if (exp >= 31) return sign | 0x7C00u;
+    if (exp <= 0) {
+        man |= 0x800000u;
+        const uint sh = uint(1 - exp) + 13u;
+        uint h = (sh >= 32u) ? 0u : (man >> sh);
+        const uint rem = (sh >= 32u) ? 0u : (man & ((1u << sh) - 1u));
+        if (sh < 32u && (rem > (1u << (sh - 1u)) || (rem == (1u << (sh - 1u)) && (h & 1u) != 0u))) h++;
+        return sign | h;
+    }
+    uint hman = man >> 13u; uint rem = man & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (hman & 1u) != 0u)) { hman++; if (hman == 0x400u) { hman = 0u; exp++; if (exp >= 31) return sign | 0x7C00u; } }
+    return sign | (uint(exp) << 10u) | hman;
+}
+
+// CUDA :1575 attn_by_group: engine row -> group order row.
+uint attn_by_group(uint row) {
+    const uint per = pc.n_head / pc.kv_heads, t = row / pc.n_head, h = row % pc.n_head;
+    return (h / per * pc.tokens + t) * per + h % per;
+}
+
+void main() {
+    const uint blk = gl_WorkGroupID.x, b = blk / pc.gx;   // blockIdx.y: the row in engine order
+#if UNGROUP == 0
+    const uint w0 = (blk % pc.gx) * 256u + gl_LocalInvocationID.x;  // word index in the row
+    if (w0 * 2u >= pc.dim) return;
+    const uint src = b * pc.dim + w0 * 2u;
+    const uint dst = attn_by_group(b) * (pc.dim / 2u);    // f16 word index
+    bdst.v[dst + w0] = f16_rn_bits(bsrc.v[src]) | (f16_rn_bits(bsrc.v[src + 1u]) << 16u);
+#else
+    const uint i = (blk % pc.gx) * 256u + gl_LocalInvocationID.x;   // CUDA's i, one float a thread
+    if (i >= pc.dim) return;
+    bdst.v[b * pc.dim + i] = bsrc.v[attn_by_group(b) * pc.dim + i];
+#endif
+}
