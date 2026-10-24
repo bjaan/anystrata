@@ -3,7 +3,7 @@
 #
 #   git clone <repo> && cd <repo>
 #   git submodule update --init
-#   make build                      # build/bin/{strata,strata-poly,libstrata_kq.so,unbiased-strata}
+#   make build                      # build/bin/{strata,strata-poly,strata-dsv41,libstrata_kq.so,unbiased-strata}
 #   make test                       # the front end against a fake engine; no GPU needed
 #
 BUILD_DIR  ?= build
@@ -46,7 +46,7 @@ COMPILER_FLAGS := $(if $(HOSTCXX),-DCMAKE_C_COMPILER=$(HOSTCC) -DCMAKE_CXX_COMPI
 # capped: inside a container nproc reports the host's CPUs, not the container's quota
 JOBS       ?= $(shell n=$$(nproc 2>/dev/null || echo 4); [ $$n -gt 16 ] && n=16; echo $$n)
 # what `make build` produces; upstream's `all` also builds about 70 parity and bench programs
-TARGETS    := strata strata-poly strata_kq unbiased-strata
+TARGETS    := strata strata-poly strata-dsv41 strata_kq unbiased-strata
 
 .PHONY: build configure clean test
 
@@ -54,14 +54,14 @@ configure:
 	@test -f third_party/llama.cpp/ggml/CMakeLists.txt || \
 	  { echo "third_party/llama.cpp is empty: run 'git submodule update --init' first"; exit 1; }
 	cmake -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_NATIVE_EXPERTS=ON \
-	      -DSTRATA_MMQ_KQUANTS=ON -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF \
+	      -DSTRATA_MMQ_KQUANTS=ON -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_BUILD_DSV41=ON -DSTRATA_BUILD_TESTS=OFF \
 	      "-DCMAKE_CUDA_ARCHITECTURES=$(CUDA_ARCHS)" $(SM60_FLAG) $(PORTABLE_FLAG) $(COMPILER_FLAGS) -DCMAKE_CUDA_COMPILER=$(NVCC) \
 	      -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=$(abspath $(BUILD_DIR))/bin \
 	      -DCMAKE_LIBRARY_OUTPUT_DIRECTORY=$(abspath $(BUILD_DIR))/bin $(CMAKE_EXTRA)
 
 build: configure
 	cmake --build $(BUILD_DIR) -j $(JOBS) --target $(TARGETS)
-	@echo "built:"; ls -1 $(BUILD_DIR)/bin/strata $(BUILD_DIR)/bin/strata-poly $(BUILD_DIR)/bin/libstrata_kq.so $(BUILD_DIR)/bin/unbiased-strata
+	@echo "built:"; ls -1 $(BUILD_DIR)/bin/strata $(BUILD_DIR)/bin/strata-poly $(BUILD_DIR)/bin/strata-dsv41 $(BUILD_DIR)/bin/libstrata_kq.so $(BUILD_DIR)/bin/unbiased-strata
 
 # The front end alone, without CUDA: for a laptop or a CI box. Needs only a C++20 compiler and CMake.
 .PHONY: frontend
