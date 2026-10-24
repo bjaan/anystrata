@@ -17,8 +17,8 @@ drafter is Unsloth's.
 
 | File | Size | What it is |
 | --- | ---: | --- |
-| `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-0000{1..4}-of-00004.gguf` | 120.7 GB | the model at 1.75 bpw |
-| `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-0000{1..4}-of-00004.gguf` | 138.2 GB | the model at 2.00 bpw, the set this fork runs |
+| `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-0000{1..4}-of-00004.gguf` | 120.7 GB | the model at 1.75 bpw (1.69 measured by `--pack-info`: mostly IQ1_S tensors); the set the homelab unit runs since 2026-10-24 06:10 UTC |
+| `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-0000{1..4}-of-00004.gguf` | 138.2 GB | the model at 2.00 bpw, the set first brought up |
 | `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-0000{1..4}-of-00004.gguf` | 155.2 GB | the model at 2.25 bpw |
 | `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` | 110.6 GB | the 4-bit Engram table, one file for all three sets; a few rows are read from it for every token, so it lives on NVMe |
 | `unsloth/DeepSeek-V4.1-Flash-1017-GGUF` `DSpark/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf` | 8.0 GB | the DSpark drafter |
@@ -103,7 +103,7 @@ RAM 7.2 tokens/s; four R9700 (32 GB each) 31 tokens/s; "under about 40 GB of RAM
 | RAM | 52 GiB configured, 50 GiB in the guest |
 | Disk | 420 GB NVMe (thin volume) for the shards, Engram, drafter and pack |
 | Built with | CUDA 12.x, `make build` (`STRATA_BUILD_DSV41=ON`, `CUDA_ARCHS` for sm_86), 0 warnings |
-| Model | IQ2_XXS set above, 2.00 bpw |
+| Model | IQ2_XXS set above, 2.00 bpw (the IQ1_M rows below say so) |
 | Context | 128K (`--max-context 131072`) |
 
 Load: 35 s to healthy (the pack's files in the page cache or not; the RAM store reads its 28.8 GB in 9 s). VRAM: dense
@@ -132,11 +132,30 @@ two thirds of the CPU lane's work onto the A6000 over PCIe 3.0 x16 and is what t
 (`Environment=DS4_STORE_ZC=1 DS4_STORE_ZC_FRAC=100 DS4_READERS=16`).
 
 Through the front end (first light, default store): a 42-token prompt read at 4.4 tok/s, 30 tokens written at 2.4 tok/s; a
-329-token prompt at 17.8 tok/s and the answer at 2.5 tok/s; a 389-token answer streamed at 3.1 tok/s. Prefill is slow for
-the same reason: a prompt touches most experts, and every CPU-lane expert it touches is dequantized on the CPU (and read
-from the disk, 92 GB of them against 12 GB of page cache). With the zero-copy store (the unit's setting), through the front end: a 42-token prompt at 4.2 tok/s and 32 tokens
-at 4.5 tok/s; a 400-token streamed answer at 6.9 tok/s (the store warm); a 319-token prompt at 18.4 tok/s and 85 tokens at
-5.3 tok/s; the CPU lane took 2 to 3% of the expert uses. Healthy 50 s after start.
+329-token prompt at 17.8 tok/s and the answer at 2.5 tok/s; a 389-token answer streamed at 3.1 tok/s. With the zero-copy
+store (the unit's setting): a 42-token prompt at 4.2 tok/s and 32 tokens at 4.5 tok/s; a 400-token streamed answer at
+6.9 tok/s (the store warm); a 319-token prompt at 18.4 tok/s and 85 tokens at 5.3 tok/s; the CPU lane took 2 to 3% of the
+expert uses. Healthy 50 s after start. Those prompt rates are a fixed cost of about 15 s a request, not a rate: see the
+depth table.
+
+### Prompt depth, and the IQ1_M set
+
+Through the front end (`stream: false`, thinking off, the unit's settings), the front end's `timings`; prompts are this
+repository's README, docs and sources, 200 tokens generated each. The IQ2_XXS and IQ1_M packs on the same VM, one after
+the other (IQ1_M: 5,395 experts in VRAM, the RAM store 4,676 slots of 8.7 MB; IQ2_XXS: 4,678 and 3,967 of 10.3 MB):
+
+| prompt tokens | IQ2_XXS prefill | IQ1_M prefill | IQ2_XXS decode | IQ1_M decode |
+| ---: | ---: | ---: | ---: | ---: |
+| 22 (short question, 270-290 out) | 3 to 18 tok/s | 6.5 to 7.2 tok/s | 4.5 to 6.9 tok/s | 4.8 to 6.1 tok/s |
+| 9,064 | 196 tok/s (46 s) | 216 tok/s (42 s) | 3.8 tok/s | 6.4 tok/s |
+| 39,005 | 426 tok/s (92 s) | 473 tok/s (83 s) | 5.2 tok/s | 8.4 tok/s |
+| 82,037 | 496 tok/s (165 s) | | 5.9 tok/s | |
+
+Prefill is about 15 s fixed plus ~1.3 ms a token (a chunk touches each needed expert once), so the rate climbs with
+depth up to the 8192-token chunk. A repeated-sentence filler prompt reads at 32 (492 tokens) to 427 tok/s (13.7K) with
+nearly every expert in VRAM; do not benchmark with one. Decode does not fall with depth: the latent cache is small and
+the token's cost is the expert fetch. The IQ1_M set fits 15% more experts on the card and in the store and decodes 60%
+faster at depth; ISTA's numbers put it at perplexity +21% against +15.5% for IQ2_XXS (weaker on prose).
 
 ## The chat template
 
