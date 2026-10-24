@@ -273,6 +273,16 @@ strata_vk_kernel(store_f16 SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels 
 # Task 2.19: poly likeliest (the sampler argmax; one workgroup of 1024 like the CUDA <<<1,1024>>>).
 strata_vk_kernel(likeliest SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels COMP likeliest.comp LAUNCHER src/poly/kernels/likeliest_vk.cpp)
 
+# Hybrid bring-up: poly bf16_to_f32 (the exact bf16 -> f32 widening; demanded by the long-context
+# prefill when a BF16 dense matrix crosses kStageRows into the compat cuBLAS gemm_f32 path).
+strata_vk_kernel(bf16_to_f32 SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels COMP bf16_to_f32.comp LAUNCHER src/poly/kernels/bf16_to_f32_vk.cpp)
+
+# Hybrid bring-up: poly gemm_f32 - a HOST launcher (no .comp): the CUDA body is pure cuBLAS
+# (cublasSgemm / StridedBatched), real in the compat surface (vk_blas.cpp, ordered fp32).
+add_library(strata_vk_kernel_gemm_f32 STATIC src/poly/kernels/gemm_f32_vk.cpp)
+target_include_directories(strata_vk_kernel_gemm_f32 PUBLIC ${STRATA_ROOT}/include ${STRATA_ROOT}/src/poly ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(strata_vk_kernel_gemm_f32 PUBLIC strata_vk_runtime strata_vk_compat strata_vk_blas)
+
 # Task 2.11: poly attend - the general fp16-KV chain: one score kernel (reg<4,1,false>, the
 # model's dim-128 per=8 arm), one softmax kernel, and THREE value arms compiled from one .comp
 # (-DATT_VARIANT 0 = attn_value_t<1>, 1 = attn_value_t<2>, 2 = the plain kernel) so the launcher
@@ -467,7 +477,20 @@ add_custom_command(OUTPUT ${_q3k_inc}
   COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_q3k_spv} ${_q3k_inc} mmvq_q3_k
   DEPENDS ${_q3k_spv} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py)
 add_custom_target(mmvq_q3_k.spv_h DEPENDS ${_q3k_inc})
-add_dependencies(strata_vk_kernel_native_mmvq mmvq_q5_k.spv_h mmvq_q6_k.spv_h mmvq_iq3_xxs.spv_h mmvq_iq4_xs.spv_h mmvq_q8_0.spv_h mmvq_iq2_s.spv_h mmvq_q4_k.spv_h mmvq_q2_k.spv_h mmvq_q3_k.spv_h mmvq_slots_iq2_xxs.spv_h mmvq_slots_q5_k.spv_h mmvq_slots_q6_k.spv_h)
+# Hybrid bring-up: the Q2_0 (type 42) variant, same pattern (mmvq_q2_0.comp -> its own embedded
+# .spv.h; 18-byte blocks, no grid table - the 2-bit codes unpack through the byte_perm chain).
+set(_q20_spv ${CMAKE_CURRENT_BINARY_DIR}/spv/mmvq_q2_0.spv)
+add_custom_command(OUTPUT ${_q20_spv}
+  COMMAND ${CMAKE_COMMAND} -E env VK_GLSLC_MODE=${GLSLC_MODE} VK_GLSLC_TOOL=${GLSLC_TOOL}
+          ${VK_GLSLC} --target-env=vulkan1.3 -O ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/mmvq_q2_0.comp -o ${_q20_spv}
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/mmvq_q2_0.comp ${VK_GLSLC}
+  COMMENT "vk-glslc(${GLSLC_MODE}) mmvq_q2_0.comp")
+set(_q20_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/mmvq_q2_0.spv.h)
+add_custom_command(OUTPUT ${_q20_inc}
+  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_q20_spv} ${_q20_inc} mmvq_q2_0
+  DEPENDS ${_q20_spv} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py)
+add_custom_target(mmvq_q2_0.spv_h DEPENDS ${_q20_inc})
+add_dependencies(strata_vk_kernel_native_mmvq mmvq_q5_k.spv_h mmvq_q6_k.spv_h mmvq_iq3_xxs.spv_h mmvq_iq4_xs.spv_h mmvq_q8_0.spv_h mmvq_iq2_s.spv_h mmvq_q4_k.spv_h mmvq_q2_k.spv_h mmvq_q3_k.spv_h mmvq_q2_0.spv_h mmvq_slots_iq2_xxs.spv_h mmvq_slots_q5_k.spv_h mmvq_slots_q6_k.spv_h)
 strata_vk_kernel(copy2 SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels LAUNCHER src/poly/kernels/copy2_vk.cpp)
 
 # Task 2.5: poly gdn_step — five CUDA kernels, one launcher lib. gdn_norm/gdn_out compile per dim
@@ -739,6 +762,7 @@ target_link_libraries(strata-poly-vk PRIVATE
   strata_vk_kernel_native_mmvq
   strata_vk_kernel_gemv strata_vk_kernel_gemv_bf16 strata_vk_kernel_conv4_silu strata_vk_kernel_gdn strata_vk_kernel_elementwise
   strata_vk_kernel_head_norm_rope strata_vk_kernel_store_f16 strata_vk_kernel_attend strata_vk_kernel_likeliest
+  strata_vk_kernel_bf16_to_f32 strata_vk_kernel_gemm_f32
   strata_vk_poly_kernels strata_vk_core
   ggml-cpu ggml-base
   strata_vk_compat strata_vk_stubs                      # stubs last: they only let the link complete

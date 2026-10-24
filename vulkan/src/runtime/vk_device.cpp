@@ -143,10 +143,14 @@ void init() {
         // NOT a driver limit: Vulkan exposes no maxAllocationSize field and the "512 MiB on RADV"
         // figure was a session-start guess, DISPROVEN on the BC-250 (probe: buffer allocations of
         // 512 MiB, 1, 2, 4, 8 GiB all succeed; 12 GiB fails on the memory budget - llama.cpp serves
-        // the 11 GB model in big buffers here). 6 GiB sits safely inside the budget the arena's
-        // slack rule already accounts for; overridable with STRATA_VK_MAX_ALLOC (the probe pins
-        // 512 MiB to keep exercising the piece-chain paths deterministically).
-        g_info.max_allocation_size = (6ull << 30);
+        // the 11 GB model in big buffers here). The default is now the budget itself: arena_add
+        // grows only within free_bytes (its own check) and halve-retries any piece the driver
+        // refuses, so chaining is failure-driven, not a fixed cap. (The GSQ-hybrid bring-up: the
+        // old 6 GiB default chained the 8.4 GiB expert cache and an expert row straddled the
+        // boundary -> named straddle rejection on every mmvq binding of that row.) overridable
+        // with STRATA_VK_MAX_ALLOC (the probe pins 512 MiB to keep exercising the piece-chain
+        // paths deterministically).
+        g_info.max_allocation_size = (16ull << 30);
     if (const char* e = getenv("STRATA_VK_MAX_ALLOC")) g_info.max_allocation_size = (uint64_t)atoll(e);
     g_info.integer_dot_product = idp;
     g_info.subgroup_size_control = ssc;

@@ -602,3 +602,57 @@ MEASURED (Qwen3.6-35B-A3B UD-IQ2_XXS, BC-250, 2 runs each, medians; ids IDENTICA
 Gates: ctest 13/13; 16-tok ids == 220,18,24,16,13,198,48,25,3437,369,220,16,22,2942,220,17 both
 modes (3x); 128-tok ids identical BATCH=0 vs BATCH=1 (diff clean); git diff main..HEAD -- src
 include == 0.
+
+## Hybrid GSQ bring-up (2026-10-23/24)
+
+Vehicle: models/Qwen3.6-35B-A3B-GSQ-hybrid-GGUF/Qwen3.6-35B-A3B-GSQ-hybrid.gguf (chtisgit GSQ,
+arch qwen35moe, 12.2 GB, sha256 8e50912f...b03596 verified). 120 Q2_0 routed-expert tensors,
+251 Q8_0, 61 BF16, 301 F32. Same vocab as UD-IQ2_XXS: the /tmp/qids.txt 18-token gate applies.
+
+LOAD FACTS: loads in 29-36 s; 10240 of 10240 routed experts fully in VRAM (8.4 GiB expert
+cache; no CPU experts, 0 swaps), BC-250 15.7 GiB. First halt: native_mmvq type 42 (Q2_0 - the
+CUDA switch's case 42 -> native_q2_0_mmvq).
+
+Demand table for THIS model (separate list, in demand order):
+1. mmvq ggml type 42 (Q2_0), the routed-expert gate/up/down projections.
+   PORTED (mmvq_q2_0.comp + native_mmvq_vk.cpp dispatch arm + CMake embed rule): QK=64, QI=2,
+   VDR=1, T=2, BLOCKS_PER_ITER=64; SmallK pick n_in/64 < 64 (model n_in 2048 -> nb 32 -> ROWS=4
+   arm); 18 B blocks through the wb/w16 assemblers (2-byte-aligned int16 qs load, CUDA :352);
+   __byte_perm emulated lane-by-lane (probe: prmt unsigned mode, sn&4 picks src, bit 3 IGNORED,
+   so the int16 sign extension never reaches a used selector bit - qe/qo hand-expanded to
+   LUT[(q16>>(4n+{0,2}))&3] in both device and host refs, cross-checked against the raw prmt
+   chain on 8000 random words). Parity: 5127 outputs across 5 shapes x both arms, 0 differ
+   BITWISE - and BOTH contraction arms (fma vs unfused add-mul) match, the int products keep dm*
+   sumi exact so NIR contraction cannot show a difference here.
+2. Q8_0 attention/LM-head weights: native_mmvq type 8 already ported (Task 2.13) - no demand hit.
+2b. ARENA-PCE straddle (runtime law, see below) - fixed in the runtime, not a kernel port.
+3. poly::bf16_to_f32 (port 2): demanded only by the 485-token max-context-16384 run (prefill
+   batch >= kStageRows routes BF16 dense matrices through lin()'s gemm path). Exact widening
+   (out = bitcast(u32(w)<<16)), one kernel, no rounding class: bitwise by construction.
+4. poly::gemm_f32 (port 3, HOST launcher - no .comp): the CUDA body is pure cuBLAS; the compat
+   surface's ordered-fp32 CPU GEMM (vk_blas.cpp) is real, so the wrapper transcribes whole.
+   Honest deviation recorded in the file header: the small-out CUDA perf arm (groups==1 &&
+   n_out <= 256, gemm_small_kernel) routes through the same cublasSgemm - that arm's
+   accumulation order is not a parity contract anywhere in this port (decode stays on the
+   bitwise gemv/mmvq paths; prefill mmq fits() still answers false).
+
+ARENA LAW UPDATE (vk_runtime.cpp arena_add + vk_device.cpp default): the hybrid's 8.4 GiB
+single expert-cache alloc CHAINED at the 6 GiB piece default and one expert row straddled the
+6 GiB boundary -> named "kernel argument 0 of native_mmvq_q2_0 crosses an arena piece" reject
+(offset 9266885600, 589824 B; pieces [..,9267246848] [9267246848,..]). Fix: max_allocation_size
+default becomes 16 GiB (the budget itself - arena_add's free_bytes check is the real limit) and
+arena_add halve-retries any piece the driver refuses, so chaining is failure-driven, never
+mid-region. Piece-chain class stays tested: vk_piece_align now pins STRATA_VK_MAX_ALLOC=512 MiB
+itself (the probe's route) instead of inheriting the default.
+
+HALT after ports 1-3 (long-context run, 485 tokens from strata_tokenizer.py, --max-context
+16384 --max-new 16): "strata-vk: strata::poly::attend_batch has no Vulkan implementation yet"
+(the multi-stage cuBLAS + softmax + q8-cache chain, kernels.cu:2568ff - a Phase-3-class port,
+not attempted under this session's 4-port budget).
+
+COMPLETION: 16-token gate GREEN on the hybrid (default arena, no env overrides): prompt 18 tok at 12.3-13.3 tok/s, decode 16
+tokens at 19.03 / 18.95 / 18.65 / 18.59 tok/s (4 runs incl. the post-gemm_f32 rebuild, ids IDENTICAL all four):
+220,18,24,16,13,271,48,25,3437,369,220,16,22,2942,220,17
+"experts from VRAM 100.0%, 0 experts swapped, 0 left out, 5 of 5 guessed tokens right".
+Gates: ctest 13/13 (parity suite incl. the new q2_0 section); git diff main..HEAD -- src include
+== 0 (all edits under vulkan/).

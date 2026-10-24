@@ -1,0 +1,20 @@
+// bf16_to_f32 in Vulkan GLSL: the CUDA body (src/poly/kernels.cu:154-156, ldw :72) is the
+// exact bf16 -> f32 widening: out[i] = bitcast(uint32(w[i]) << 16). No rounding happens
+// (bf16 is a truncation of f32's high mantissa bits), so this is bitwise by construction.
+// One element per thread, 256-thread blocks (the CUDA launch is grid(n,256) x 256).
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer W { uint  v[]; } bw;   // bf16 words: element 2i low, 2i+1 high
+layout(std430, binding = 1)           buffer O { float v[]; } bo;  // f32 outputs
+
+layout(push_constant) uniform PC { uint n; } pc;
+
+void main() {
+    const uint i0 = gl_GlobalInvocationID.x * 2u;      // two elements per thread through one u32 word
+    if (i0 >= pc.n) return;
+    const uint w = bw.v[i0 >> 1u];
+    bo.v[i0] = uintBitsToFloat((w & 0xFFFFu) << 16u);
+    if (i0 + 1u < pc.n) bo.v[i0 + 1u] = uintBitsToFloat(w & 0xFFFF0000u);
+}

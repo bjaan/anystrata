@@ -1,0 +1,140 @@
+// vulkan/src/kernels/mmvq_q2_0.comp - native_mmvq for ggml type 42 (Q2_0).
+//
+// Transcription of src/kernels/cuda/native_mmvq.cu's native_q2_0_mmvq (:2752-2796) ->
+// native_q2_0_mmvq_kernel<SmallK> (:377-408): QK=64, QI=2, VDR=1, T=2,
+// BLOCKS_PER_ITER=WARPS*WARP/2=64. The wrapper's pick (:2787): n_in/64 < 64 -> SmallK=true:
+// grid ceil(n_out/4), ROWS=4; else SmallK=false: grid n_out, ROWS=1. `rows` is the 4th push
+// constant; both partitions and both reductions are transcribed exactly (q8_0/q6_k precedent).
+// The q2_0_warp_rows variant (:2695-2735) is the Turing sm75 opt-in route (q2_0_warp_rows_on()
+// is false on this device), and launch_multi's exact layout is pinned BITWISE-equal per column
+// (native_mmvq.cu:970-977), so the c loop below answers every ncols the way the CUDA multi
+// kernel does (q5_k/q8_0 precedent).
+//
+// The dot is q2_q8_dot (:350-371) verbatim: chunk = (x + kby) + kqs (two q8_1 blocks per weight
+// block, this thread's half kqs); per j: q = the int16 word w->qs bytes 8*kqs + 2j (the CUDA
+// comment pins the deliberate 2-byte-aligned int16 load - w16 here), then
+//   qe = __byte_perm(0x020100ff, 0x020100ff, q >> 0)
+//   qo = __byte_perm(0x020100ff, 0x020100ff, q >> 2)
+//   qx = __byte_perm(qe, qo, 0x5140), qy = __byte_perm(qe, qo, 0x7362)
+// emulated byte-lane-by-byte-lane (bperm below), then the two 4-pair signed dp4a into int32
+// sumi (exact). prmt unsigned mode (probe q20_bperm_probe.py, 2026-10-24): out byte n picks
+// (sel_n>>2)&1 ? b : a at index sel_n&3, sel bit 3 IGNORED - so q's int16 sign extension never
+// reaches a selector bit that matters (it sits in nibble 3's bit 3 of q>>2, ignored), and
+// qe = (LUT[c0],LUT[c2],LUT[c4],LUT[c6]), qo = (LUT[c1],LUT[c3],LUT[c5],LUT[c7]) of the word's
+// 8 2-bit codes with LUT (ff,00,01,02); qx=(qe0,qo0,qe1,qo1), qy=(qe2,qo2,qe3,qo3).
+//
+// return d2 * d8 * sumi (:370) is LEFT-associative in CUDA: (d2*d8) rounds first, then the
+// *float(sumi). tmp += term is the mul-into-accumulator pair PORT-NOTES gotcha #6 talks about:
+// this dot's shape needs the contraction probe (fused fma((d2*d8),sumi_f,tmp) vs the unfused
+// two arms) - both host arms are in the parity test; the device picks one (the q8_0 lineage
+// expects unfused: glslc's OpFMul+OpFAdd survived NIR for the same x+dm*s shape).
+//
+// Q20Block is 18 B = half d @0 + uint8 qs[16] @2, alignof 2 (static_assert :131): W reads go
+// through the wb/w16 assemblers (like q8_0's 34 B blocks); x (block_q8_1, 36 B, 4-aligned) is
+// direct bx.v[] indexing (word 0 = ds, low half d8; words 1..8 = qs).
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer W    { uint  v[]; } bw;   // Q2_0 blocks, 18 B each
+layout(std430, binding = 1) readonly buffer X    { uint  v[]; } bx;   // q8_1 columns, 9 words/block
+layout(std430, binding = 2)           buffer Y    { float v[]; } by;  // ncols * n_out floats
+
+layout(push_constant) uniform PC { uint n_in; uint n_out; uint ncols; uint rows; } pc;
+
+// one byte of W at byte offset B (blocks are 18 B = not 4-aligned; same helper as q8_0)
+uint wb(uint B) { return (bw.v[B >> 2u] >> (8u * (B & 3u))) & 0xFFu; }
+// the uint16 at even byte offset B of W (the qs int16_t word, 2-byte aligned by construction)
+uint w16(uint B) { return wb(B) | (wb(B + 1u) << 8u); }
+
+int sbyte(uint a, uint i) {
+    const uint b = (a >> (8u * i)) & 255u;
+    return b >= 128u ? int(b) - 256 : int(b);
+}
+int dp4a(int a, int b, int c) {
+    for (uint i = 0u; i < 4u; ++i) c += sbyte(uint(a), i) * sbyte(uint(b), i);
+    return c;
+}
+// __byte_perm(A, B, s), PTX prmt unsigned mode: out byte n = ((sn>>2)&1) ? B[sn&3] : A[sn&3],
+// sn = nibble n of s, bit 3 ignored (verified by probe; cf. iq4_xs's hand-expanded tree).
+uint bperm(uint A, uint B, uint s) {
+    uint res = 0u;
+    for (uint n = 0u; n < 4u; ++n) {
+        const uint sn = (s >> (4u * n)) & 15u;
+        const uint src = ((sn >> 2u) & 1u) != 0u ? B : A;
+        res |= ((src >> (8u * (sn & 3u))) & 255u) << (8u * n);
+    }
+    return res;
+}
+
+// q2_q8_dot: w block at byte base rb, x at word base xb (= (kby + kqs) * 9 for this thread).
+float q2_0_dot(uint rb, uint xb, uint kqs) {
+    int sumi = 0;
+    for (uint j = 0u; j < 4u; ++j) {
+        const uint q  = w16(rb + 2u + 8u * kqs + 2u * j);        // (int16*)w->qs[iqs*4 + j]
+        const uint u  = bx.v[xb + 1u + j * 2u];                  // q8[j*2]
+        const uint v  = bx.v[xb + 1u + j * 2u + 1u];             // q8[j*2+1]
+        const uint qe = bperm(0x020100ffu, 0x020100ffu, q >> 0u);
+        const uint qo = bperm(0x020100ffu, 0x020100ffu, q >> 2u);
+        const uint qx = bperm(qe, qo, 0x5140u);
+        const uint qy = bperm(qe, qo, 0x7362u);
+        sumi = dp4a(int(u), int(qx), sumi);
+        sumi = dp4a(int(v), int(qy), sumi);
+    }
+    const float d2 = unpackHalf2x16(w16(rb)).x;                  // (float)w->d
+    const float d8 = unpackHalf2x16(bx.v[xb]).x;                 // __low2float(chunk->ds)
+    return (d2 * d8) * float(sumi);                              // :370, left-associative
+}
+
+// double-buffered across columns (max 8) so each c's reduction reads only its own writes
+shared float sh[8][4][4][32];
+
+void main() {
+    const uint tid    = gl_LocalInvocationID.x;      // CUDA tid = 32*threadIdx.y + threadIdx.x
+    const uint lane   = tid & 31u;
+    const uint subrow = tid >> 5u;                   // threadIdx.y
+    const uint nb     = pc.n_in / 64u;               // blocks_per_row (QK=64 elems/block)
+    const uint row0   = (pc.rows == 4u) ? gl_WorkGroupID.x * 4u : gl_WorkGroupID.x;
+    const uint kqs    = tid % 2u;                    // F::kqs (Q20Traits :1067)
+    const uint maxc   = min(pc.ncols, 8u);
+    for (uint c = 0u; c < maxc; ++c) {
+        float t0 = 0.0, t1 = 0.0, t2 = 0.0, t3 = 0.0;
+        const uint xc = c * nb * 18u;                // column c's x base (words; 9/block, 2/block)
+        for (uint kbx = tid / 2u; kbx < nb; kbx += 64u) {    // BLOCKS_PER_ITER = WARPS*WARP/2
+            const uint kby = kbx * 2u;               // KBY = 2 q8_1 blocks per weight block
+            const uint xb = xc + (kby + kqs) * 9u;   // chunk = (x + kby) + kqs
+            const uint rb = row0 * nb * 18u + kbx * 18u;    // row0's block kbx byte base
+            if (pc.rows == 1u) {
+                t0 += q2_0_dot(rb, xb, kqs);
+            } else {
+                if (row0 + 0u < pc.n_out) t0 += q2_0_dot(rb + 0u * nb * 18u, xb, kqs);
+                if (row0 + 1u < pc.n_out) t1 += q2_0_dot(rb + 1u * nb * 18u, xb, kqs);
+                if (row0 + 2u < pc.n_out) t2 += q2_0_dot(rb + 2u * nb * 18u, xb, kqs);
+                if (row0 + 3u < pc.n_out) t3 += q2_0_dot(rb + 3u * nb * 18u, xb, kqs);
+            }
+        }
+        sh[c][subrow][0u][lane] = t0;
+        if (pc.rows == 4u) {           // ROWS=1: CUDA partial[..][i>0] is never written; keep the
+            sh[c][subrow][1u][lane] = t1;   // slots untouched (zero) so the sum stays exact.
+            sh[c][subrow][2u][lane] = t2;
+            sh[c][subrow][3u][lane] = t3;
+        }
+        groupMemoryBarrier(); barrier();
+        // CUDA: warp 0 only (threadIdx.y > 0 returned) sums tmp + partial[l] l = 0..WARPS-2
+        // ascending = sh[0]+sh[1]+sh[2]+sh[3] (all 4 SUBROWS, whatever ROWS is: for rows==1 the
+        // other three subrows hold the same row's t0 partials).
+        if (subrow == 0u) {
+            for (uint i = 0u; i < pc.rows; ++i) {
+                float acc = sh[c][0u][i][lane];
+                acc = acc + sh[c][1u][i][lane];
+                acc = acc + sh[c][2u][i][lane];
+                acc = acc + sh[c][3u][i][lane];
+                for (uint o = 16u; o > 0u; o >>= 1u) acc += subgroupShuffleXor(acc, o);   // warp_sum tree
+                if (lane == i && row0 + i < pc.n_out) by.v[c * pc.n_out + row0 + i] = acc;   // lane i's
+            }
+        }
+        groupMemoryBarrier(); barrier();             // next c must not race this c's reads
+    }
+}

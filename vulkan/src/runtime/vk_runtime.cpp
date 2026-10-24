@@ -100,19 +100,33 @@ uint64_t arena_add(uint64_t bytes) {   // returns the base the region was PLACED
     if (g_cursor + bytes + slack > d.free_bytes)
         throw std::runtime_error("vk_runtime: out of VRAM growing the arena by " + std::to_string(bytes >> 20) + " MiB");
     while (bytes) {
+        // Budget-aware pieces: chain only when a piece of the requested size does not fit the
+        // memory budget (the GSQ-hybrid bring-up: the engine's 8.4 GiB expert cache chained at the
+        // old 6 GiB default and an expert row straddled the boundary -> every mmvq binding of that
+        // row hit the named straddle rejection). Try sz first, halve on allocation failure;
+        // max_allocation_size (env-overridable; the probe pins 512 MiB) stays the cap.
         uint64_t sz = bytes > max_alloc ? max_alloc : bytes;
-        Piece p; p.base = g_cursor; p.size = sz;
-        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bci.size = sz;
-        bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                    VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        RT(vkCreateBuffer(dev, &bci, nullptr, &p.buf));
-        VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev, p.buf, &mr);
-        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        mai.allocationSize = mr.size;
-        mai.memoryTypeIndex = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        RT(vkAllocateMemory(dev, &mai, nullptr, &p.mem));
-        RT(vkBindBufferMemory(dev, p.buf, p.mem, 0));
+        VkBuffer buf = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE;
+        for (;;) {
+            VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            bci.size = sz;
+            bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                        VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            if (vkCreateBuffer(dev, &bci, nullptr, &buf) != VK_SUCCESS) {
+                if (sz < (32ull << 20)) throw std::runtime_error("vkCreateBuffer: arena piece exhausted halving");
+                sz /= 2; continue;
+            }
+            VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev, buf, &mr);
+            VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            mai.allocationSize = mr.size;
+            mai.memoryTypeIndex = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (vkAllocateMemory(dev, &mai, nullptr, &mem) == VK_SUCCESS) break;
+            vkDestroyBuffer(dev, buf, nullptr); buf = VK_NULL_HANDLE;
+            if (sz < (32ull << 20)) throw std::runtime_error("vkAllocateMemory -> out of memory: arena piece exhausted halving");
+            sz /= 2;
+        }
+        RT(vkBindBufferMemory(dev, buf, mem, 0));
+        Piece p; p.base = g_cursor; p.size = sz; p.buf = buf; p.mem = mem;
         g_pieces.push_back(p);
         g_cursor += sz;
         bytes -= sz;

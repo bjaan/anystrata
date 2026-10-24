@@ -534,6 +534,72 @@ float q8_0_ref(const uint8_t* wr, const uint8_t* xcol, int nb, int row, int rows
     return a[row_in_group];   // lane i's post-tree value answers row0+i
 }
 
+// ---- Q2_0 (type 42, Hybrid bring-up): transcription of q2_q8_dot (native_mmvq.cu:350-371).
+// Q20Block bytes: half d @0, uint8 qs[16] @2 (18 B, align 2). The CUDA dot loads the qs as
+// int16_t* + iqs*4 (the deliberate 2-byte-aligned read, :352-353): q16 = rd_u16(w+2+8*kqs+2j).
+// __byte_perm (PTX prmt unsigned: sn = nibble; src = (sn>>2)&1 ? b : a at idx sn&3; bit 3
+// IGNORED, verified by probe scratch/q20_bperm_probe.py) with A==B==0x020100ff makes the src
+// bit moot for qe/qo: qe byte n = LUT[(q16>>(4n))&3], qo byte n = LUT[(q16>>(4n+2))&3],
+// LUT=(ff,00,01,02); the int16 sign extension can never reach a used selector bit (bits 15+
+// only enter q>>2's nibble-3 bit 3, which prmt ignores). qx=(qe0,qo0,qe1,qo1),
+// qy=(qe2,qo2,qe3,qo3) via the constant selectors 0x5140/0x7362. sumi: two dp4a per j (exact
+// int32). dm = d2*d8 rounds once (the CUDA `d2 * d8 * sumi` is left-associative).
+uint32_t prmt(uint32_t a, uint32_t b, uint32_t s) {
+    uint32_t out = 0;
+    for (int n = 0; n < 4; ++n) {
+        const uint32_t sn = (s >> (4 * n)) & 0xFu;
+        const uint32_t src = ((sn >> 2) & 1u) ? b : a;
+        out |= ((src >> (8 * (sn & 3u))) & 0xFFu) << (8 * n);
+    }
+    return out;
+}
+void q2_0_dot_df(const uint8_t* w, const uint8_t* x, int kqs, float& dm, int& sumi) {  // x = one q8_1 chunk
+    sumi = 0;
+    static const uint32_t LUT[4] = {0xFFu, 0x00u, 0x01u, 0x02u};
+    for (int j = 0; j < 4; ++j) {
+        const uint32_t q16 = rd_u16(w + 2 + 8 * kqs + 2 * j);
+        uint32_t qe = 0, qo = 0;
+        for (int n = 0; n < 4; ++n) {
+            qe |= LUT[(q16 >> (4 * n)) & 3u] << (8 * n);
+            qo |= LUT[(q16 >> (4 * n + 2)) & 3u] << (8 * n);
+        }
+        const uint32_t qx = prmt(qe, qo, 0x5140u);
+        const uint32_t qy = prmt(qe, qo, 0x7362u);
+        sumi = dp4a(uint32_t(rd_i32(x + 4 + 4 * (j * 2))),     qx, sumi);
+        sumi = dp4a(uint32_t(rd_i32(x + 4 + 4 * (j * 2 + 1))), qy, sumi);
+    }
+    dm = f16_to_f32(rd_u16(w)) * f16_to_f32(rd_u16(x));
+}
+
+// emulate native_q2_0_mmvq_kernel<SmallK> for one (row group, column): tid = 0..127,
+// kbx = tid/2 + 64t (T=2, BLOCKS_PER_ITER=WARPS*WARP/2=64), kqs = tid%2; x chunk block =
+// kbx*2 + kqs (KBY=2). rows==1: all four subrows sum one row; rows==4: subrow i does row0+i.
+// warp 0 sums subrow-ascending then the xor tree; lane i writes row0+i. The kbx accumulation
+// arm follows the contraction probe below (FUSED selects fma(dm, sumi_f, acc) vs the unfused
+// (dm*sumi_f) then add; the .comp returns the dot then adds, glslc emits mul+add).
+float q2_0_ref(const uint8_t* wr, const uint8_t* xcol, int nb, int row, int rows, int row_in_group, bool fused) {
+    float part[4][32];
+    for (int s = 0; s < 4; ++s) for (int l = 0; l < 32; ++l) part[s][l] = 0.f;
+    for (int tid = 0; tid < 128; ++tid) {
+        const int s = tid / 32, lane = tid % 32, kqs = tid % 2;
+        const int r = row + (rows == 4 ? row_in_group : 0);
+        float acc = 0.f;
+        for (int kbx = tid / 2; kbx < nb; kbx += 64) {
+            float dm; int sumi;
+            q2_0_dot_df(wr + (size_t(r) * nb + kbx) * 18, xcol + size_t(kbx * 2 + kqs) * 36, kqs, dm, sumi);
+            if (fused) acc = std::fma(dm, float(sumi), acc);
+            else acc = acc + dm * float(sumi);
+        }
+        part[s][lane] = acc;
+    }
+    float a[32];
+    for (int l = 0; l < 32; ++l)
+        a[l] = ((part[0][l] + part[1][l]) + part[2][l]) + part[3][l];
+    float n[32];
+    for (int o = 16; o > 0; o >>= 1) { for (int l = 0; l < 32; ++l) n[l] = a[l] + a[l ^ o]; std::memcpy(a, n, sizeof a); }
+    return a[row_in_group];   // lane i's post-tree value answers row0+i
+}
+
 }  // namespace
 
 using namespace strata;
@@ -1269,6 +1335,69 @@ int main(int argc, char** argv) {
         std::printf("native_mmvq q8_0 vk vs reference: n_in %d n_out %d ncols %d rows %d: %d outputs, %d differ bitwise\n",
                     s.n_in, s.n_out, s.ncols, rows, s.ncols * s.n_out, shape_fails);
     }
+    // ---- type 42 (Q2_0, Hybrid bring-up): n_in 4096 -> nb 64 >= 64 -> rows=1 (SmallK=false);
+    // 2048/1024 -> nb 32/16 < 64 -> rows=4. The model's expert rows are n_in 2048 -> the rows=4
+    // arm is the live path. Contraction probe: BOTH host arms (fused fma vs unfused add-mul) are
+    // counted; the arm matching the device is the one with 0 differs (PORT-NOTES gotcha #6).
+    const struct { int n_in, n_out, ncols; } q20_shapes[] = {
+        {4096, 64, 1}, {2048, 768, 1}, {2048, 2048, 2}, {1024, 64, 3}, {64, 7, 1}};
+    int q20_fused_diffs = 0, q20_unfused_diffs = 0, q20_total = 0;
+    for (const auto& s : q20_shapes) {
+        const int nb = s.n_in / 64;
+        const int rows = (nb < 64) ? 4 : 1;           // mirrors the launcher's SmallK pick
+        std::mt19937 rng(4200 + s.n_in * 3 + s.ncols);
+        std::vector<uint8_t> W(size_t(s.n_out) * nb * 18);
+        for (auto& blk : W) blk = uint8_t(rng() & 0xFF);                      // random 2-bit codes
+        for (int r = 0; r < s.n_out; ++r)
+            for (int b = 0; b < nb; ++b) {            // sane fp16 d (bytes 0-1)
+                std::uniform_real_distribution<float> d2sc(0.0009765625f, 0.03125f);   // d in [2^-10, 2^-5)
+                const uint16_t dh = f16_rn((rng() & 1) ? -d2sc(rng) : d2sc(rng));
+                std::memcpy(W.data() + (size_t(r) * nb + b) * 18, &dh, 2);
+            }
+        std::vector<float> x(size_t(s.n_in) * s.ncols);
+        for (auto& v : x) v = float(int(rng() % 2001) - 1000) / 250.0f;
+
+        const uint64_t w_sz = W.size(), w_pad = (w_sz + 3) & ~3ull;
+        const uint64_t x_sz = size_t(s.n_in) / 32 * s.ncols * 36;
+        const uint64_t y_sz = size_t(s.ncols) * s.n_out * 4;
+        const uint64_t ax = a.alloc(x.size() * 4), aq = a.alloc(x_sz);
+        const uint64_t aw = a.alloc(w_pad + 4), ay = a.alloc(y_sz);
+        vk::copy_h2d((void*)ax, x.data(), x.size() * 4, nullptr);
+        vk::copy_h2d((void*)aw, W.data(), w_sz, nullptr);
+        vk::fill_d((void*)ay, 0xFE, y_sz, nullptr);
+        kernels::native_quantize_q8_1((const float*)strata_vk_compat::wrap(ax), strata_vk_compat::wrap(aq),
+                                      s.n_in, s.ncols, strata_vk_compat::wrap(1000));
+        std::vector<uint8_t> Q(x_sz);
+        vk::copy_d2h(Q.data(), (void*)aq, x_sz, nullptr);
+
+        kernels::native_mmvq(42, strata_vk_compat::wrap(aw), strata_vk_compat::wrap(aq),
+                             (float*)strata_vk_compat::wrap(ay), s.n_in, s.n_out, s.ncols,
+                             strata_vk_compat::wrap(1000));
+        std::vector<float> y(size_t(s.ncols) * s.n_out);
+        vk::copy_d2h(y.data(), (void*)ay, y_sz, nullptr);
+
+        int shape_fails = 0, shape_fused = 0;
+        for (int c = 0; c < s.ncols; ++c) {
+            const uint8_t* xcol = Q.data() + size_t(c) * nb * 2 * 36;
+            const int groups = (rows == 1) ? s.n_out : (s.n_out + 3) / 4;
+            for (int g = 0; g < groups; ++g)
+                for (int i = 0; i < rows && g * rows + i < s.n_out; ++i) {
+                    const int r = g * rows + i;
+                    const float refu = q2_0_ref(W.data(), xcol, nb, g * rows, rows, i, false);
+                    const float reff = q2_0_ref(W.data(), xcol, nb, g * rows, rows, i, true);
+                    const float got = y[size_t(c) * s.n_out + r];
+                    ++compared; ++q20_total;
+                    if (got != refu) ++shape_fails;
+                    if (got != reff) ++shape_fused;
+                }
+        }
+        q20_fused_diffs += shape_fused; q20_unfused_diffs += shape_fails;
+        std::printf("native_mmvq q2_0 vk vs reference: n_in %d n_out %d ncols %d rows %d: %d outputs, unfused %d / fused %d differ bitwise\n",
+                    s.n_in, s.n_out, s.ncols, rows, s.ncols * s.n_out, shape_fails, shape_fused);
+        fails += (shape_fails == 0 || shape_fused == 0) ? 0 : shape_fails;
+    }
+    std::printf("native_mmvq q2_0 contraction arm: %d outputs, unfused %d, fused %d differ (pick 0-differ)\n",
+                q20_total, q20_unfused_diffs, q20_fused_diffs);
     // Mixed slots across types: iq2_xxs expert dims (2048 x 768), q5_k (2048 x 2048 style), q6_k.
     const int slots_cases = 0; (void)slots_cases;
     {

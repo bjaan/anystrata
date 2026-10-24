@@ -22,6 +22,7 @@
 #include "store_f16.spv.h"    // any compiled kernel works: the launch throws before executing
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -49,6 +50,10 @@ bool bind_whole(const vk::Kernel& k, uint64_t b0, uint64_t n0, uint64_t b1, uint
 }  // namespace
 
 int main() {
+    // Pin the piece cap deterministically (the probe's route): the default is now budget-driven
+    // (16 GiB with halve-on-OOM retry, post GSQ-hybrid), and this test's geometry (near-tail
+    // bump, oversize chain) wants small fixed pieces; free_bytes never covers a 16 GiB A anyway.
+    setenv("STRATA_VK_MAX_ALLOC", "536870912", 1);
     const vk::DeviceInfo* di = nullptr;
     try { di = &vk::device_info(); }
     catch (const std::exception& e) { std::fprintf(stderr, "vk_piece_align: %s\nSKIP\n", e.what()); return 77; }

@@ -126,7 +126,9 @@ void blas_destroy(void* blas) { if (blas) cublasDestroy((cublasHandle_t) blas); 
               "head_norm_rope": "vulkan/src/poly/kernels/head_norm_rope_vk.cpp",
               "store_f16": "vulkan/src/poly/kernels/store_f16_vk.cpp",
               "attend": "vulkan/src/poly/kernels/attend_vk.cpp",
-              "likeliest": "vulkan/src/poly/kernels/likeliest_vk.cpp"}
+              "likeliest": "vulkan/src/poly/kernels/likeliest_vk.cpp",
+              "bf16_to_f32": "vulkan/src/poly/kernels/bf16_to_f32_vk.cpp",
+              "gemm_f32": "vulkan/src/poly/kernels/gemm_f32_vk.cpp"}
     poly = [d for d in poly if d["qual"].rsplit("::", 1)[1] not in PORTED]
     # every header contract function must appear; the ones WITH bodies (inline helpers) do not need traps
     with open(HDR) as f:
