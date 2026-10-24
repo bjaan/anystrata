@@ -17,6 +17,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
+#include <map>
 #include <atomic>
 #include <mutex>
 #include <stdexcept>
@@ -204,12 +206,19 @@ uint32_t max_sets_per_cb() {
     return v;   // descriptor sets (== dispatches) per pending CB
 }
 constexpr uint32_t kMaxBufsPerSet = 64;      // pool sizing headroom; kernels use far fewer
-constexpr uint32_t kMaxInFlight = 8;         // queued-but-unreaped CBs before pend_flush waits the oldest
+uint32_t max_inflight() {   // queued-but-unreaped CBs before pend_flush waits the oldest
+    static uint32_t v = getenv("STRATA_VK_MAX_INFLIGHT") ? (uint32_t)atoi(getenv("STRATA_VK_MAX_INFLIGHT")) : 8u;
+    return v;
+}
 struct PendingCB { VkCommandBuffer cb = VK_NULL_HANDLE; VkDescriptorPool dp = VK_NULL_HANDLE;
                    uint32_t sets = 0; };
+
 struct InFlight { VkFence fence; VkCommandBuffer cb; VkDescriptorPool dp; };
 PendingCB g_pend;
 std::vector<InFlight> g_inflight;
+struct ClusterSpan { uint64_t off, bytes; bool wr; };
+std::vector<ClusterSpan> g_cluster;   // barrier-free cluster spans of the pending CB
+long long g_cluster_saves = 0;        // barriers elided (probe)
 uint32_t batch_on() {
     static uint32_t v = getenv("STRATA_VK_BATCH") ? (uint32_t)atoi(getenv("STRATA_VK_BATCH")) : 1u;
     return v;
@@ -228,14 +237,21 @@ void pend_begin_locked() {   // g_pm held
     dpi.maxSets = max_sets_per_cb(); dpi.poolSizeCount = 1; dpi.pPoolSizes = &psz;
     RT(vkCreateDescriptorPool(dev, &dpi, nullptr, &g_pend.dp));
     g_pend.sets = 0;
+    g_cluster.clear();   // new CB: no cluster to overlap (or to fence off)
 }
+// Prefill-tuning probe counters (STRATA_VK_LAUNCH_TIME=1; printed by the launch dump).
+std::map<std::string, long long> g_launch_names;
+long long g_flush_calls = 0; double g_flush_ms = 0.0;
+long long g_pendwait_calls = 0; double g_pendwait_ms = 0.0;   // depth-cap fence waits in pend_flush
 void pend_flush_locked() {   // g_pm held; end+submit with a fence, NO wait
     if (!g_pend.cb) return;
     VkDevice dev = (VkDevice)vk_handle();
     // depth cap: never leave more than kMaxInFlight CBs queued without reaping, so a 128-token
     // prefill can't pile up command buffers (and their pools) faster than the GPU drains.
-    if (g_inflight.size() >= kMaxInFlight) {
+    if (g_inflight.size() >= max_inflight()) {
+        const auto pw0 = std::chrono::steady_clock::now();
         RT(vkWaitForFences(dev, 1, &g_inflight.front().fence, VK_TRUE, ~0ull));
+        if (getenv("STRATA_VK_LAUNCH_TIME")) { g_pendwait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pw0).count(); g_pendwait_calls++; }
         vkDestroyFence(dev, g_inflight.front().fence, nullptr);
         vkFreeCommandBuffers(dev, g_pool, 1, &g_inflight.front().cb);
         vkDestroyDescriptorPool(dev, g_inflight.front().dp, nullptr);
@@ -251,10 +267,15 @@ void pend_flush_locked() {   // g_pm held; end+submit with a fence, NO wait
     g_pend = PendingCB{};
 }
 void flush_wait() {          // flush pending, then wait ALL in-flight fences (all queue ops under g_pm)
+    // stall time spent draining the queue:
+    static const bool ft = getenv("STRATA_VK_LAUNCH_TIME") != nullptr;
+    const auto t0 = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> plk(g_pm);
     pend_flush_locked();
     VkQueue q = (VkQueue)vk_default_queue();
     RT(vkQueueWaitIdle(q));   // drains EVERYTHING (incl. other threads' recorded work)
+    if (ft) g_flush_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (ft) g_flush_calls++;
     if (g_inflight.empty()) return;
     VkDevice dev = (VkDevice)vk_handle();
     for (auto& x : g_inflight) {
@@ -419,14 +440,62 @@ Kernel kernel_load(const char* name, const uint32_t* spv, size_t spv_bytes, int 
 // `buffers` are arena offsets; `sizes` the same length, each span required to sit inside one arena piece.
 void kernel_launch_sized(const Kernel& k, int groups_x, const uint64_t* buffers, const uint64_t* sizes,
                          int n_buffers, const void* push_constants) {
+    // The conservative default: every bound buffer counts as written, so the launch always
+    // barriers against the pending cluster (the pre-elision law).
+    kernel_launch_sized_rw(k, groups_x, buffers, sizes, n_buffers >= 32 ? ~0u : ((1u << n_buffers) - 1u),
+                           n_buffers, push_constants);
+}
+
+// Cluster tracking for barrier elision (see the header): the members recorded in the PENDING CB
+// since the last emitted barrier. rw_mask bit i = kernel WRITES buffer i (it may still read it;
+// every bound buffer counts as a read for interference). A new launch barriers first only when
+// it provably touches (RAW/WAR/WAW) some cluster member's span; else it records with no barrier
+// and RADV may overlap the dispatches. Queue submission ends each CB, so cluster state resets
+// with every fresh pending CB.
+namespace {
+bool spans_overlap(const ClusterSpan& a, const ClusterSpan& b) {
+    return a.off < b.off + b.bytes && b.off < a.off + a.bytes;
+}
+bool interferes(const uint64_t* buffers, const uint64_t* sizes, uint32_t rw_mask, int n_buffers) {
+    // Interference is PER PAIR: an overlapping span pair is a hazard iff at least one side
+    // WRITES it (RAW: cluster write vs new read; WAR: new write vs cluster read; WAW).
+    // Read-read overlap (the same weight tensor through consecutive launches) is benign and
+    // must NOT barrier, or the elision buys nothing on the mmvq fan-out path.
+    for (const ClusterSpan& c : g_cluster)
+        for (int i = 0; i < n_buffers; ++i) {
+            const ClusterSpan s{buffers[i], sizes[i], (rw_mask >> i) & 1u};
+            if (!c.wr && !s.wr) continue;
+            if (spans_overlap(c, s)) return true;
+        }
+    return false;
+}
+void cluster_add(const uint64_t* buffers, const uint64_t* sizes, uint32_t rw_mask, int n_buffers) {
+    for (int i = 0; i < n_buffers; ++i)
+        g_cluster.push_back(ClusterSpan{buffers[i], sizes[i], (rw_mask >> i) & 1u});
+}
+void emit_full_barrier(VkCommandBuffer cb) {
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                       VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 1, &mb, 0, nullptr, 0, nullptr);
+}
+}  // namespace
+
+void kernel_launch_sized_rw(const Kernel& k, int groups_x, const uint64_t* buffers, const uint64_t* sizes,
+                            uint32_t rw_mask, int n_buffers, const void* push_constants) {
     // Prefill-tuning probe (STRATA_VK_LAUNCH_TIME=1): host time spent inside the launch path
     // and the total dispatch count. Env-gated chrono only; no behavior change.
     static const bool launch_time = getenv("STRATA_VK_LAUNCH_TIME") != nullptr;
     static long long launch_calls = 0;
     static double launch_ms = 0.0;
     static struct LaunchDump { ~LaunchDump() {
-        if (launch_calls) std::fprintf(stderr, "=== kernel_launch_sized: calls=%lld host=%.1fms ===\n",
-                                       launch_calls, launch_ms); } } g_launch_dump;
+        if (launch_calls) std::fprintf(stderr, "=== kernel_launch_sized: calls=%lld host=%.1fms | barriers elided=%lld | flush_wait: calls=%lld stall=%.1fms | depth-cap waits: %lld / %.1fms ===\n",
+                                       launch_calls, launch_ms, g_cluster_saves, g_flush_calls, g_flush_ms, g_pendwait_calls, g_pendwait_ms);
+        for (auto& kv : g_launch_names)
+            std::fprintf(stderr, "  launch %s: %lld\n", kv.first.c_str(), kv.second); } } g_launch_dump;
     struct LaunchTimer {
         std::chrono::steady_clock::time_point t0; bool on;
         LaunchTimer() : on(launch_time) { if (on) t0 = std::chrono::steady_clock::now(); }
@@ -441,9 +510,15 @@ void kernel_launch_sized(const Kernel& k, int groups_x, const uint64_t* buffers,
     auto it = g_kernels.find((uint64_t)k.pipeline);
     if (it == g_kernels.end()) throw std::runtime_error("vk_runtime: launch of an unloaded kernel");
     const KernelImpl& impl = it->second;
+    if (launch_time) g_launch_names[impl.name]++;
     if (n_buffers != impl.n_buffers) throw std::runtime_error("vk_runtime: kernel buffer count mismatch");
     VkDevice dev = (VkDevice)vk_handle();
-    std::vector<VkDescriptorBufferInfo> dbi(n_buffers);
+    // hot path (789k launches in a 735-tok prefill): no heap alloc below the common buffer count
+    VkDescriptorBufferInfo dbi_small[32];
+    std::vector<VkDescriptorBufferInfo> dbi_big;
+    VkDescriptorBufferInfo* dbi = nullptr;
+    if (n_buffers <= 32) dbi = dbi_small;
+    else { dbi_big.resize(n_buffers); dbi = dbi_big.data(); }
     std::lock_guard<std::mutex> alk(g_m);   // g_pieces is grown under g_m (Arena::alloc); with
                                             // deferred submits, launches now genuinely overlap
                                             // background arena growth - read pieces under the lock.
@@ -516,18 +591,37 @@ void kernel_launch_sized(const Kernel& k, int groups_x, const uint64_t* buffers,
     vkCmdBindDescriptorSets(g_pend.cb, VK_PIPELINE_BIND_POINT_COMPUTE, impl.layout, 0, 1, &ds, 0, nullptr);
     if (impl.pc_bytes && push_constants)
         vkCmdPushConstants(g_pend.cb, impl.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, impl.pc_bytes, push_constants);
-    vkCmdDispatch(g_pend.cb, (uint32_t)groups_x, 1, 1);
     // In CB, consecutive dispatches carry NO declared dependency: RADV may overlap their
-    // storage-buffer reads/writes (eager mode's per-launch wait was an implicit barrier). Insert
-    // an explicit full memory barrier after each dispatch so the batch stays bitwise-ordered.
-    // This is far cheaper than the per-launch submit+vkQueueWaitIdle it replaces.
-    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
-                       VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(g_pend.cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         0, 1, &mb, 0, nullptr, 0, nullptr);
+    // storage-buffer reads/writes (eager mode's per-launch wait was an implicit barrier). The
+    // safe default inserts a full memory barrier after EVERY dispatch. Prefill spends ~12us
+    // of that barrier per dispatch (500k+ dispatches), so: when the launch comes through
+    // kernel_launch_sized_rw with a truthful write mask AND its spans provably do not touch
+    // any member of the pending barrier-free cluster (RAW/WAR/WAW span test), record it with
+    // NO barrier and let the cluster overlap. Any touching launch first flushes a barrier
+    // covering the whole cluster (the cluster's writes are then globally visible to it and to
+    // everything after), then records alone. STRATA_VK_NO_ELIDE=1 restores the per-dispatch law
+    // (A/B). Cluster state is per-pending-CB: pend_begin_locked resets it (a submit fences the
+    // recorded work off from what follows).
+    static const bool no_elide = getenv("STRATA_VK_NO_ELIDE") != nullptr;
+    // cap the cluster so the per-launch interference test stays O(1) amortized: at the cap,
+    // close it with a barrier even when this launch would have overlapped.
+    static const uint32_t cluster_cap = getenv("STRATA_VK_CLUSTER_CAP")
+                                           ? (uint32_t)atoi(getenv("STRATA_VK_CLUSTER_CAP")) : 128u;
+    if (!no_elide && g_cluster.size() < cluster_cap && !interferes(buffers, sizes, rw_mask, n_buffers)) {
+        // Provably no RAW/WAR/WAW with any cluster member: overlap. (A read-read span overlap
+        // is fine; so are disjoint worksets, the whole point of the mmvq-per-expert fan-out.)
+        vkCmdDispatch(g_pend.cb, (uint32_t)groups_x, 1, 1);
+        cluster_add(buffers, sizes, rw_mask, n_buffers);
+        if (launch_time) g_cluster_saves++;
+    } else {
+        // Interferes (or conservative/no-elide): CLOSE the cluster first — the barrier between
+        // the cluster's dispatches and this one is what makes the ordering safe — then this
+        // dispatch starts a new cluster.
+        if (!g_cluster.empty()) emit_full_barrier(g_pend.cb);
+        g_cluster.clear();
+        vkCmdDispatch(g_pend.cb, (uint32_t)groups_x, 1, 1);
+        cluster_add(buffers, sizes, rw_mask, n_buffers);
+    }
     g_pend.sets++;
 }
 

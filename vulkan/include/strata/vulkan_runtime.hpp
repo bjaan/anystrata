@@ -102,5 +102,12 @@ Kernel kernel_load(const char* name, const uint32_t* spv, size_t spv_bytes,
 // `buffers` are arena offsets with their byte sizes; each span must sit inside one arena piece.
 void kernel_launch_sized(const Kernel& k, int groups_x, const uint64_t* buffers, const uint64_t* sizes,
                          int n_buffers, const void* push_constants);
+// Barrier-elision arm: rw bit i = 1 if the kernel WRITES buffer i, 0 if it only reads it.
+// The runtime skips the post-dispatch full-RW barrier when this launch provably shares no
+// RAW/WAR/WAW span with the barrier-free cluster recorded in the pending CB, letting RADV
+// overlap independent dispatches (the per-dispatch barrier is ~12us of a 500k-dispatch
+// prefill). Callers must pass the EXACT write set; a wrong mask is a race, not a slowdown.
+void kernel_launch_sized_rw(const Kernel& k, int groups_x, const uint64_t* buffers, const uint64_t* sizes,
+                            uint32_t rw_mask, int n_buffers, const void* push_constants);
 
 }  // namespace strata::vk

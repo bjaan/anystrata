@@ -121,8 +121,10 @@ bool gemm_gpu(cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
     std::chrono::steady_clock::time_point wall_t0;
     if (gemm_wall) { strata::vk::device_sync(); wall_t0 = std::chrono::steady_clock::now(); }
     try {
-        strata::vk::kernel_launch_sized(mm_kernel(transA, f16 ? 1 : 0), pc.tilesX * pc.tilesY * pc.batch,
-                                bufs, sizes, 3, &pc);
+        // buffers are {A, B, C}: C (bit 2) is written; A/B are read (beta!=0 also reads C,
+        // which the runtime counts as a span-touch either way).
+        strata::vk::kernel_launch_sized_rw(mm_kernel(transA, f16 ? 1 : 0), pc.tilesX * pc.tilesY * pc.batch,
+                                bufs, sizes, 4u, 3, &pc);
     } catch (const std::exception& e) {   // e.g. a span crossing an arena piece: the reference still runs
         if (gemm_wall) strata::vk::device_sync();
         note_fallback(e.what());

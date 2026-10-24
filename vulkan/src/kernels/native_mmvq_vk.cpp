@@ -51,6 +51,7 @@ namespace {
 #include "mmvq_slots_iq2_xxs.spv.h"  // mmvq_slots_iq2_xxs.comp
 #include "mmvq_slots_q5_k.spv.h"     // mmvq_slots_q5_k.comp
 #include "mmvq_slots_q6_k.spv.h"     // mmvq_slots_q6_k.comp
+#include "mmvq_slots_q2_0.spv.h"    // mmvq_slots_q2_0.comp (prefill tuning: type 42)
 #include "mmvq_iq3_xxs.spv.h"       // mmvq_iq3_xxs.comp (Task 2.9, type 18 IQ3_XXS)
 #include "mmvq_iq4_xs.spv.h"        // mmvq_iq4_xs.comp (Task 2.12, type 23 IQ4_XS)
 #include "mmvq_q8_0.spv.h"          // mmvq_q8_0.comp (Task 2.13, type 8 Q8_0)
@@ -246,7 +247,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
         // SmallK: n_in/QK < BLOCKS_PER_ITER (8) -> ROWS=4; else ROWS=1 (native_mmvq.cu:2662-2666)
         const uint32_t rows = (nb < 8u) ? 4u : 1u;
         const uint32_t pc[4] = {(uint32_t)n_in, (uint32_t)n_out, (uint32_t)ncols, rows};
-        vk::kernel_launch_sized(k, rows == 4u ? int((n_out + 3) / 4) : n_out, bufs, sizes, 3, pc);
+        vk::kernel_launch_sized_rw(k, rows == 4u ? int((n_out + 3) / 4) : n_out, bufs, sizes, 4u /* w,r y=w */, 3, pc);
     } else if (ggml_type == 14) {
         static const vk::Kernel k = vk::kernel_load(
             "native_mmvq_q6_k", mmvq_q6_k_spv, mmvq_q6_k_spv_len,
@@ -260,7 +261,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
         // (native_mmvq.cu:2974-2978)
         const uint32_t rows = (nb < 4u) ? 4u : 1u;
         const uint32_t pc[4] = {(uint32_t)n_in, (uint32_t)n_out, (uint32_t)ncols, rows};
-        vk::kernel_launch_sized(k, rows == 4u ? int((n_out + 3) / 4) : n_out, bufs, sizes, 3, pc);
+        vk::kernel_launch_sized_rw(k, rows == 4u ? int((n_out + 3) / 4) : n_out, bufs, sizes, 4u /* w,r y=w */, 3, pc);
     } else if (ggml_type == 12) {  // Q4_K: 144 B blocks = 36 words (mmvq_q4_k.comp, Task 2.15)
         static const vk::Kernel k = vk::kernel_load(
             "native_mmvq_q4_k", mmvq_q4_k_spv, mmvq_q4_k_spv_len,
@@ -274,7 +275,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
         // the identical pick to q5_k (same VDR=2, QI=16, BLOCKS_PER_ITER=8 partition).
         const uint32_t rows = (nb < 8u) ? 4u : 1u;
         const uint32_t pc[4] = {(uint32_t)n_in, (uint32_t)n_out, (uint32_t)ncols, rows};
-        vk::kernel_launch_sized(k, rows == 4u ? int((n_out + 3) / 4) : n_out, bufs, sizes, 3, pc);
+        vk::kernel_launch_sized_rw(k, rows == 4u ? int((n_out + 3) / 4) : n_out, bufs, sizes, 4u /* w,r y=w */, 3, pc);
     } else if (ggml_type == 10) {  // Q2_K: 84 B blocks = 21 words (mmvq_q2_k.comp, Task 2.17)
         static const vk::Kernel k = vk::kernel_load(
             "native_mmvq_q2_k", mmvq_q2_k_spv, mmvq_q2_k_spv_len,
@@ -288,7 +289,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
         // Per-column launches mirror the CUDA wrapper's j loop (no multi-column kernel for Q2_K).
         const uint32_t rows = (nb < 8u) ? 4u : 1u;
         const uint32_t pc[4] = {(uint32_t)n_in, (uint32_t)n_out, (uint32_t)ncols, rows};
-        vk::kernel_launch_sized(k, rows == 4u ? int((n_out + 3) / 4) : n_out, bufs, sizes, 3, pc);
+        vk::kernel_launch_sized_rw(k, rows == 4u ? int((n_out + 3) / 4) : n_out, bufs, sizes, 4u /* w,r y=w */, 3, pc);
     } else if (ggml_type == 11) {  // Q3_K: 110 B blocks (mmvq_q3_k.comp, Task 2.18)
         static const vk::Kernel k = vk::kernel_load(
             "native_mmvq_q3_k", mmvq_q3_k_spv, mmvq_q3_k_spv_len,
@@ -302,7 +303,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
         // Per-column launches mirror launch_multi's bitwise-equal-per-column pin (:2820).
         const uint32_t rows = (nb < 8u) ? 4u : 1u;
         const uint32_t pc[4] = {(uint32_t)n_in, (uint32_t)n_out, (uint32_t)ncols, rows};
-        vk::kernel_launch_sized(k, rows == 4u ? int((n_out + 3) / 4) : n_out, bufs, sizes, 3, pc);
+        vk::kernel_launch_sized_rw(k, rows == 4u ? int((n_out + 3) / 4) : n_out, bufs, sizes, 4u /* w,r y=w */, 3, pc);
     } else if (ggml_type == 16) {
         static const vk::Kernel k = vk::kernel_load(
             "native_mmvq_iq2_xxs", native_mmvq_spv, native_mmvq_spv_len,
@@ -313,7 +314,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
                                    strata_vk_compat::off(y), grid_buffer()};
         const uint64_t sizes[4] = {w_sz, x_sz, y_sz, sizeof(kIq2xxsGrid)};
         const uint32_t pc[3] = {(uint32_t)n_in, (uint32_t)n_out, (uint32_t)ncols};
-        vk::kernel_launch_sized(k, (int)((n_out + 3) / 4), bufs, sizes, 4, pc);
+        vk::kernel_launch_sized_rw(k, (int)((n_out + 3) / 4), bufs, sizes, 4u, 4, pc);
     } else if (ggml_type == 23) {  // IQ4_XS: Fmt<23> = {qk 256, ipb 8, step 4}, no grid table
         static const vk::Kernel k = vk::kernel_load(
             "native_mmvq_iq4_xs", mmvq_iq4_xs_spv, mmvq_iq4_xs_spv_len,
@@ -324,7 +325,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
                                    strata_vk_compat::off(y)};
         const uint64_t sizes[3] = {w_sz, x_sz, y_sz};
         const uint32_t pc[3] = {(uint32_t)n_in, (uint32_t)n_out, (uint32_t)ncols};
-        vk::kernel_launch_sized(k, (int)((n_out + 3) / 4), bufs, sizes, 3, pc);
+        vk::kernel_launch_sized_rw(k, (int)((n_out + 3) / 4), bufs, sizes, 4u, 3, pc);
     } else if (ggml_type == 8) {  // Q8_0: 34 B blocks (wb/w32 assembler), per-column multi pin
         static const vk::Kernel k = vk::kernel_load(
             "native_mmvq_q8_0", mmvq_q8_0_spv, mmvq_q8_0_spv_len,
@@ -338,7 +339,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
         // (native_mmvq.cu:2139-2143)
         const uint32_t rows = (nb < 32u) ? 4u : 1u;
         const uint32_t pc[4] = {(uint32_t)n_in, (uint32_t)n_out, (uint32_t)ncols, rows};
-        vk::kernel_launch_sized(k, rows == 4u ? int((n_out + 3) / 4) : n_out, bufs, sizes, 3, pc);
+        vk::kernel_launch_sized_rw(k, rows == 4u ? int((n_out + 3) / 4) : n_out, bufs, sizes, 4u /* w,r y=w */, 3, pc);
     } else if (ggml_type == 42) {  // Q2_0: 18 B blocks (wb/w16 assemblers), per-column multi pin
         static const vk::Kernel k = vk::kernel_load(
             "native_mmvq_q2_0", mmvq_q2_0_spv, mmvq_q2_0_spv_len,
@@ -351,7 +352,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
         // SmallK: nb = n_in/64 < WARPS*WARP/2 (64) -> ROWS=4; else ROWS=1 (native_mmvq.cu:2787-2794)
         const uint32_t rows = (nb < 64u) ? 4u : 1u;
         const uint32_t pc[4] = {(uint32_t)n_in, (uint32_t)n_out, (uint32_t)ncols, rows};
-        vk::kernel_launch_sized(k, rows == 4u ? int((n_out + 3) / 4) : n_out, bufs, sizes, 3, pc);
+        vk::kernel_launch_sized_rw(k, rows == 4u ? int((n_out + 3) / 4) : n_out, bufs, sizes, 4u /* w,r y=w */, 3, pc);
     } else if (ggml_type == 22) {  // IQ2_S: Fmt<22> = {qk 256, ipb 8, step 2} - same launch as 16
         static const vk::Kernel k = vk::kernel_load(
             "native_mmvq_iq2_s", mmvq_iq2_s_spv, mmvq_iq2_s_spv_len,
@@ -362,7 +363,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
                                    strata_vk_compat::off(y), grid_iq2s_buffer()};
         const uint64_t sizes[4] = {w_sz, x_sz, y_sz, sizeof(kIq2sGrid)};
         const uint32_t pc[3] = {(uint32_t)n_in, (uint32_t)n_out, (uint32_t)ncols};
-        vk::kernel_launch_sized(k, (int)((n_out + 3) / 4), bufs, sizes, 4, pc);
+        vk::kernel_launch_sized_rw(k, (int)((n_out + 3) / 4), bufs, sizes, 4u, 4, pc);
     } else {  // ggml_type == 18 (IQ3_XXS): Fmt<18> = {qk 256, ipb 8, step 2} - same grid/launch as 16
         static const vk::Kernel k = vk::kernel_load(
             "native_mmvq_iq3_xxs", mmvq_iq3_xxs_spv, mmvq_iq3_xxs_spv_len,
@@ -373,7 +374,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
                                    strata_vk_compat::off(y), grid32_buffer()};
         const uint64_t sizes[4] = {w_sz, x_sz, y_sz, sizeof(kIq3xxsGrid)};
         const uint32_t pc[3] = {(uint32_t)n_in, (uint32_t)n_out, (uint32_t)ncols};
-        vk::kernel_launch_sized(k, (int)((n_out + 3) / 4), bufs, sizes, 4, pc);
+        vk::kernel_launch_sized_rw(k, (int)((n_out + 3) / 4), bufs, sizes, 4u, 4, pc);
     }
     if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
         throw std::runtime_error(std::string("native MMVQ launch: ") + cudaGetErrorString(e));
@@ -388,10 +389,14 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
 // against the host refs and against the single-launch outputs). native_mmvq_ids (the sibling
 // contract, :3194) is NOT ported: it stays trap-by-number in stubs_gen.
 bool native_mmvq_slots(int ggml_type, const MmvqSlots& slots, int count, int n_in, int n_out, void* stream) {
-    if (ggml_type != 16 && ggml_type != 13 && ggml_type != 14) return false;   // CUDA's slots_kind == 0 leg
+    if (ggml_type != 16 && ggml_type != 13 && ggml_type != 14 && ggml_type != 42)
+        return false;   // CUDA's slots_kind == 0 leg (42 is a Vulkan-side fusion of the exact
+                        // per-column launches: the slots arm is pinned BITWISE-equal per slot,
+                        // so the engine's fallback and this path answer identically)
     if (n_out <= 0 || count < 1 || count > MAX_NCOLS)
         throw std::invalid_argument("native MMVQ requires n_out > 0 and 1 to 8 matrices");
-    validate_shape(n_in, 1, IQ_BLOCK_ELEMS);        // n_in % 256 (per-matrix ncols == 1)
+    if (ggml_type == 42) validate_shape(n_in, 1, 64);        // Q20Block: 64 elems
+    else validate_shape(n_in, 1, IQ_BLOCK_ELEMS);            // n_in % 256 (per-matrix ncols == 1)
     for (int i = 0; i < count; ++i) {
         validate_pointer(slots.w[i]);
         validate_pointer(slots.x[i]);
@@ -400,15 +405,16 @@ bool native_mmvq_slots(int ggml_type, const MmvqSlots& slots, int count, int n_i
     validate_stream(stream);
     if (std::getenv("STRATA_VK_TRACE_MMVQ_SLOTS"))
         std::fprintf(stderr, "mmvq_slots t %d count %d n_in %d n_out %d\n", ggml_type, count, n_in, n_out);
-    const uint64_t nb = uint64_t(n_in) / IQ_BLOCK_ELEMS;
-    const uint64_t x_sz = nb * 8 * Q8_BLOCK_BYTES;  // one Q8_1 column per slot
+    const uint64_t nb = uint64_t(n_in) / (ggml_type == 42 ? 64 : IQ_BLOCK_ELEMS);
+    const uint64_t x_sz = nb * (ggml_type == 42 ? 2 : 8) * Q8_BLOCK_BYTES;  // one Q8_1 column per slot
     const uint64_t y_sz = uint64_t(n_out) * 4;
     // 24 bindings (w,x,y per slot; +grid for iq2_xxs): unused slots alias slot 0's buffers with a
     // 4-byte span - the flattened grid runs exactly count slots' arms, so they are never touched.
     uint64_t bufs[25], sizes[25];
     const int n_buf = ggml_type == 16 ? 25 : 24;
     const uint64_t rb = uint64_t(n_out) * nb *
-                        (ggml_type == 16 ? IQ_BLOCK_BYTES : ggml_type == 13 ? Q5K_BLOCK_BYTES : Q6K_BLOCK_BYTES);
+                        (ggml_type == 16 ? IQ_BLOCK_BYTES : ggml_type == 13 ? Q5K_BLOCK_BYTES :
+                         ggml_type == 42 ? Q20_BLOCK_BYTES : Q6K_BLOCK_BYTES);
     for (int i = 0; i < 8; ++i) {
         const int j = i < count ? i : 0;
         bufs[i]      = strata_vk_compat::off(slots.w[j]);
@@ -427,6 +433,19 @@ bool native_mmvq_slots(int ggml_type, const MmvqSlots& slots, int count, int n_i
         const uint32_t pc[4] = {(uint32_t)count, (uint32_t)n_in, (uint32_t)n_out, gx};
         vk::kernel_launch_sized(k, int(gx) * count, bufs, sizes, 25, pc);
     } else {
+        // q2_0 slots (prefill tuning): the single kernel's own pick (nb < 64 -> ROWS=4), the
+        // per-slot work body is that kernel verbatim -> bitwise the per-column fallback.
+        if (ggml_type == 42) {
+            const uint32_t rows = (nb < 64u) ? 4u : 1u;
+            const uint32_t gx = uint32_t((n_out + rows - 1) / rows);
+            const uint32_t pc[5] = {(uint32_t)count, (uint32_t)n_in, (uint32_t)n_out, gx, rows};
+            static const vk::Kernel k = vk::kernel_load(
+                "mmvq_slots_q2_0", mmvq_slots_q2_0_spv, mmvq_slots_q2_0_spv_len,
+                /*storage buffers*/ 24, /*push bytes*/ 20, /*workgroup*/ THREADS, true);
+            vk::kernel_launch_sized_rw(k, int(gx) * count, bufs, sizes,
+                                       0xFF0000u /* the 8 Y bindings are written */, 24, pc);
+            return true;
+        }
         // launch_slots (native_mmvq.cu:1758-1768): SmallK n_in/DIV < BPI -> ROWS=2, else ROWS=1
         const bool q5 = ggml_type == 13;
         const uint32_t rows = (nb < (q5 ? 8u : 4u)) ? 2u : 1u;

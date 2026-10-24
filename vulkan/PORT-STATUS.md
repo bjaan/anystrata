@@ -705,3 +705,56 @@ tokens at 19.03 / 18.95 / 18.65 / 18.59 tok/s (4 runs incl. the post-gemm_f32 re
 "experts from VRAM 100.0%, 0 experts swapped, 0 left out, 5 of 5 guessed tokens right".
 Gates: ctest 13/13 (parity suite incl. the new q2_0 section); git diff main..HEAD -- src include
 == 0 (all edits under vulkan/).
+
+PREFILL TUNING PASS (Phase 3 follow-on). MEASURED FIRST (new env arms: STRATA_VK_GEMM_WALL=1
+wall-times every GPU GEMM launch through device_sync, STRATA_VK_MMVQ_SHAPES=1 aggregates
+native_mmvq GPU time per (type,n_in,n_out), STRATA_VK_LAUNCH_TIME=1 counts kernel_launch_sized
+calls + host ms + flush_wait stalls + per-kernel launch names; all off by default, all inside
+vulkan/): the 735-tok prefill (23 s baseline) is NOT GEMM-bound. Time table: GPU GEMMs (f32 dense
+proj + f16 attend) 315 ms total WALL; attend_batch whole-call 159 ms (10 calls); mmvq GPU wall
+(after drain-in-flush attribution) ~6.4 s at 508k calls; cublas enqueue 12 ms. The wall was the
+DISPATCH TAX: 789k launches, ~12 us per-dispatch full-RW barrier each (barriers elided=0 before
+this pass), and 508k of those launches were native_mmvq ncols=1 calls — the engine's expert loop
+asks native_mmvq_slots first, which returned false for Q2_0 (type 42), the hybrid's 120 routed
+experts. Narrow-tile GEMM variants (the brief's suspect 1) are OFF the table: the attend GEMMs
+are 0.16 s of a 23 s prefill; n=16 heads never showed up (cols=c*per>=16x8; the real shapes are
+m=734,n=1776 / m=512,n=4096 tiles — already wide). Suspect 3 (redundant grouping) checked: the
+launcher groups once per chunk (outside the key-block loop), CUDA-faithful — nothing to hoist.
+TWO FIXES SHIPPED:
+(a) vulkan/runtime: barrier elision by span-cluster. kernel_launch_sized_rw(k,...,rw_mask,...)
+takes the kernel's exact WRITE mask (bit i = buffer i written); the runtime keeps the pending
+CB's barrier-free cluster (span off/bytes/wr) and skips the post-dispatch vkCmdPipelineBarrier
+when the new launch shares NO overlapping span with any cluster member that either side writes
+(RAW/WAR/WAW test; read-read overlap — the same weight tensor across launches — is benign).
+Any touching launch first CLOSES the cluster with the full barrier (everything before it stays
+globally ordered), so queue order and bitwise output are preserved by construction; the CB-set
+cap and STRATA_VK_NO_ELIDE=1 (A/B) reset/keep the old law. mmvq launchers pass {w,r; x,r; y,w}
+masks (expert fan-out: disjoint y + disjoint x = overlap freely on the SAME weight);
+vk_blas gemm_gpu passes C-only. A first version of this test got WAR backwards (cluster READ vs
+new WRITE) and flipped the long-gate generation — caught by the canary, rule now: pair hazard =
+overlap AND (either side writes).
+(b) vulkan/kernels: mmvq_slots_q2_0.comp — native_mmvq_slots for type 42, the q5_k slots
+precedent verbatim: slot = group/gx over 24 bindings, the single kernel's exact q2_0_dot (wb/w16
+byte assemblers per slot binding), BLOCKS_PER_ITER=64 partition, ROWS=1/4 SmallK pick, the
+sh staging + xor-tree reduction per slot. Parity: 3 new cases (3x2048x1024, 8x2048x2048,
+2x512x7) vs the single-launch kernel BITWISE (3072+16384+14 outputs, 0 differ); the engine's
+per-column fallback and this path answer identically, so the fusion is numerics-free.
+RESULT TABLE (same box, same binary family, 735-tok prompt / decode tok/s):
+  baseline (bdbb0fd)        prefill 32.1 (measured 31.7), 789k launches, 0 elided
+  +q2_0 slots (elide off)   35.2, 378k launches (508k mmvq -> 59k slots + 23k q8_0)
+  +barrier elide            36.0-36.3, 82k barriers elided/run
+  485-tok ctx-16384 gate    33.3 tok/s (was ~32); pi 1596-tok system prompt 31.7 -> re-measure:
+  short canary prompt 12.2-13.7 -> 13.7 tok/s, decode 18.3-19.0 -> 18.5-19.0 (unchanged class)
+Targets (60/70 tok/s) NOT reached: the remaining wall is now flush_wait stall 11.9 s / 31.6k calls
+(the engine's own d2h/copy sync points drain the queue: eager-copy law + sampler round-trips),
+plus ~12 us host cost per launch x 378k. Both are Phase-4.2-class (recorded copies / persistent
+maps, multi-CB overlap), left on the table deliberately: neither is a GEMM-tile problem, and the
+two shipped items are bitwise-safe and measured.
+GATES: ctest 14/14 (native_mmvq_vk_parity 74k outputs incl. the new q2_0 slots sections);
+short canary ids '220,18,24,16,13,271,48,25,3437,369,220,16,22,2942,220,17' -> generated
+'18,30,198,32,25,220,18,24,16,13,271,48,25,3437,369,220' IDENTICAL to NO_ELIDE and to the
+STRATA_VK_BATCH=0 eager arm; 735-tok long gate generated ids '271,248068,271,248069,271,1206,
+10724,393,16,22,1088,14695,220,17,18,60439' IDENTICAL to the bdbb0fd reference run.
+NOTE: git diff main..HEAD -- src include is NOT empty by itself: a concurrent session's rename
+commit dd4a161 (omnistrata) moved src/ targets; this pass touched ONLY files under vulkan/
+(git diff bdbb0fd..HEAD --stat -- src include == 0).

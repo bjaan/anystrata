@@ -433,7 +433,7 @@ add_custom_command(OUTPUT ${_q6k_inc}
 add_custom_target(mmvq_q6_k.spv_h DEPENDS ${_q6k_inc})
 # Task 2.8: native_mmvq_slots for types 16/13/14 — one slots .comp per format (24-25 storage
 # bindings: w/x/y per slot, + the iq2xxs grid table for type 16), same embed pattern.
-set(_slots_names mmvq_slots_iq2_xxs mmvq_slots_q5_k mmvq_slots_q6_k)
+set(_slots_names mmvq_slots_iq2_xxs mmvq_slots_q5_k mmvq_slots_q6_k mmvq_slots_q2_0)
 foreach(_s ${_slots_names})
   set(_spv ${CMAKE_CURRENT_BINARY_DIR}/spv/${_s}.spv)
   add_custom_command(OUTPUT ${_spv}
@@ -548,7 +548,7 @@ add_custom_command(OUTPUT ${_q20_inc}
   COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_q20_spv} ${_q20_inc} mmvq_q2_0
   DEPENDS ${_q20_spv} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py)
 add_custom_target(mmvq_q2_0.spv_h DEPENDS ${_q20_inc})
-add_dependencies(strata_vk_kernel_native_mmvq mmvq_q5_k.spv_h mmvq_q6_k.spv_h mmvq_iq3_xxs.spv_h mmvq_iq4_xs.spv_h mmvq_q8_0.spv_h mmvq_iq2_s.spv_h mmvq_q4_k.spv_h mmvq_q2_k.spv_h mmvq_q3_k.spv_h mmvq_q2_0.spv_h mmvq_slots_iq2_xxs.spv_h mmvq_slots_q5_k.spv_h mmvq_slots_q6_k.spv_h)
+add_dependencies(strata_vk_kernel_native_mmvq mmvq_q5_k.spv_h mmvq_q6_k.spv_h mmvq_iq3_xxs.spv_h mmvq_iq4_xs.spv_h mmvq_q8_0.spv_h mmvq_iq2_s.spv_h mmvq_q4_k.spv_h mmvq_q2_k.spv_h mmvq_q3_k.spv_h mmvq_q2_0.spv_h mmvq_slots_iq2_xxs.spv_h mmvq_slots_q5_k.spv_h mmvq_slots_q6_k.spv_h mmvq_slots_q2_0.spv_h)
 strata_vk_kernel(copy2 SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels LAUNCHER src/poly/kernels/copy2_vk.cpp)
 
 # Task 2.5: poly gdn_step — five CUDA kernels, one launcher lib. gdn_norm/gdn_out compile per dim

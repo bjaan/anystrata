@@ -1,0 +1,163 @@
+// vulkan/src/kernels/mmvq_slots_q2_0.comp - native_mmvq_slots for ggml type 42 (Q2_0).
+//
+// Slots transcription of mmvq_q2_0.comp exactly along the mmvq_slots_q5_k.comp precedent:
+// slot = gl_WorkGroupID.x / gx selects the (W,X,Y) binding triple; the dot (q2_q8_dot), the
+// BLOCKS_PER_ITER=64 kbx partition (kbx = tid/2 stride 64 - ROWS-independent per row), the
+// subrow staging and the ascending-subrow + xor-tree reduction are IDENTICAL per slot to the
+// single-call kernel - so slot i's answer is BITWISE native_mmvq(42, w[i], x[i], y[i], n_in,
+// n_out, 1). Rows arm: ROWS=4 (SmallK, n_in/64 < 64 for the model's 2048) or ROWS=1, the same
+// pick the single launcher makes; a fixed row's partials are arm-independent (the q5_k note
+// applies verbatim).
+//
+// The single kernel's per-column c loop rides sh[c]; here each workgroup runs ONE slot, so the
+// staging is sh[subrow][row][lane] like the q5_k slots kernel.
+//
+// Q20Block is 18 B (half d @0 + uint8 qs[16] @2, align 2): W reads go through wb/w16 (the
+// binding's word base per slot comes from the buffer's own start; the launcher binds each slot
+// at its exact arena offset, same as q5_k slots).
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0)  readonly buffer W0 { uint v[]; } bw0;
+layout(std430, binding = 1)  readonly buffer W1 { uint v[]; } bw1;
+layout(std430, binding = 2)  readonly buffer W2 { uint v[]; } bw2;
+layout(std430, binding = 3)  readonly buffer W3 { uint v[]; } bw3;
+layout(std430, binding = 4)  readonly buffer W4 { uint v[]; } bw4;
+layout(std430, binding = 5)  readonly buffer W5 { uint v[]; } bw5;
+layout(std430, binding = 6)  readonly buffer W6 { uint v[]; } bw6;
+layout(std430, binding = 7)  readonly buffer W7 { uint v[]; } bw7;
+layout(std430, binding = 8)  readonly buffer X0 { uint v[]; } bx0;
+layout(std430, binding = 9)  readonly buffer X1 { uint v[]; } bx1;
+layout(std430, binding = 10) readonly buffer X2 { uint v[]; } bx2;
+layout(std430, binding = 11) readonly buffer X3 { uint v[]; } bx3;
+layout(std430, binding = 12) readonly buffer X4 { uint v[]; } bx4;
+layout(std430, binding = 13) readonly buffer X5 { uint v[]; } bx5;
+layout(std430, binding = 14) readonly buffer X6 { uint v[]; } bx6;
+layout(std430, binding = 15) readonly buffer X7 { uint v[]; } bx7;
+layout(std430, binding = 16)          buffer Y0 { float v[]; } by0;
+layout(std430, binding = 17)          buffer Y1 { float v[]; } by1;
+layout(std430, binding = 18)          buffer Y2 { float v[]; } by2;
+layout(std430, binding = 19)          buffer Y3 { float v[]; } by3;
+layout(std430, binding = 20)          buffer Y4 { float v[]; } by4;
+layout(std430, binding = 21)          buffer Y5 { float v[]; } by5;
+layout(std430, binding = 22)          buffer Y6 { float v[]; } by6;
+layout(std430, binding = 23)          buffer Y7 { float v[]; } by7;
+
+// count, n_in, n_out, gx (blocks per slot in the flattened grid), rows (1 or 4 - the single kernel's pick)
+layout(push_constant) uniform PC { uint count; uint n_in; uint n_out; uint gx; uint rows; } pc;
+
+int sbyte(uint a, uint i) {
+    const uint b = (a >> (8u * i)) & 255u;
+    return b >= 128u ? int(b) - 256 : int(b);
+}
+int dp4a(int a, int b, int c) {
+    for (uint i = 0u; i < 4u; ++i) c += sbyte(uint(a), i) * sbyte(uint(b), i);
+    return c;
+}
+uint bperm(uint A, uint B, uint s) {
+    uint res = 0u;
+    for (uint n = 0u; n < 4u; ++n) {
+        const uint sn = (s >> (4u * n)) & 15u;
+        const uint src = ((sn >> 2u) & 1u) != 0u ? B : A;
+        res |= ((src >> (8u * (sn & 3u))) & 255u) << (8u * n);
+    }
+    return res;
+}
+
+// q2_q8_dot (mmvq_q2_0.comp) bound to slot I's W/X: rb is a byte offset INTO slot I's binding,
+// xb a word offset into slot I's x (9 words per q8_1 block).
+// byte/word assemblers per slot binding (18 B blocks straddle words, like the single kernel)
+uint wb0(uint B) { return (bw0.v[B >> 2u] >> (8u * (B & 3u))) & 0xFFu; }
+uint w160(uint B) { return wb0(B) | (wb0(B + 1u) << 8u); }
+uint wb1(uint B) { return (bw1.v[B >> 2u] >> (8u * (B & 3u))) & 0xFFu; }
+uint w161(uint B) { return wb1(B) | (wb1(B + 1u) << 8u); }
+uint wb2(uint B) { return (bw2.v[B >> 2u] >> (8u * (B & 3u))) & 0xFFu; }
+uint w162(uint B) { return wb2(B) | (wb2(B + 1u) << 8u); }
+uint wb3(uint B) { return (bw3.v[B >> 2u] >> (8u * (B & 3u))) & 0xFFu; }
+uint w163(uint B) { return wb3(B) | (wb3(B + 1u) << 8u); }
+uint wb4(uint B) { return (bw4.v[B >> 2u] >> (8u * (B & 3u))) & 0xFFu; }
+uint w164(uint B) { return wb4(B) | (wb4(B + 1u) << 8u); }
+uint wb5(uint B) { return (bw5.v[B >> 2u] >> (8u * (B & 3u))) & 0xFFu; }
+uint w165(uint B) { return wb5(B) | (wb5(B + 1u) << 8u); }
+uint wb6(uint B) { return (bw6.v[B >> 2u] >> (8u * (B & 3u))) & 0xFFu; }
+uint w166(uint B) { return wb6(B) | (wb6(B + 1u) << 8u); }
+uint wb7(uint B) { return (bw7.v[B >> 2u] >> (8u * (B & 3u))) & 0xFFu; }
+uint w167(uint B) { return wb7(B) | (wb7(B + 1u) << 8u); }
+
+#define GEN_DOT(I)                                                          \
+float q2_0_dot##I(uint rb, uint xb, uint kqs) {                             \
+    int sumi = 0;                                                           \
+    for (uint j = 0u; j < 4u; ++j) {                                        \
+        const uint q  = w16##I(rb + 2u + 8u * kqs + 2u * j);                          \
+        const uint u  = bx##I.v[xb + 1u + j * 2u];                          \
+        const uint v  = bx##I.v[xb + 1u + j * 2u + 1u];                     \
+        const uint qe = bperm(0x020100ffu, 0x020100ffu, q >> 0u);           \
+        const uint qo = bperm(0x020100ffu, 0x020100ffu, q >> 2u);           \
+        const uint qx = bperm(qe, qo, 0x5140u);                             \
+        const uint qy = bperm(qe, qo, 0x7362u);                             \
+        sumi = dp4a(int(u), int(qx), sumi);                                 \
+        sumi = dp4a(int(v), int(qy), sumi);                                 \
+    }                                                                       \
+    const float d2 = unpackHalf2x16(w16##I(rb)).x;                            \
+    const float d8 = unpackHalf2x16(bx##I.v[xb]).x;                         \
+    return (d2 * d8) * float(sumi);                                         \
+}
+GEN_DOT(0) GEN_DOT(1) GEN_DOT(2) GEN_DOT(3)
+GEN_DOT(4) GEN_DOT(5) GEN_DOT(6) GEN_DOT(7)
+
+shared float sh[4][4][32];
+
+#define GEN_WORK(I)                                                         \
+void work##I(uint grp, uint tid, uint lane, uint subrow, uint nb, uint rows, uint n_out) { \
+    const uint row0 = rows * grp;                                           \
+    const uint kqs  = tid % 2u;                                             \
+    float t0 = 0.0, t1 = 0.0, t2 = 0.0, t3 = 0.0;                           \
+    for (uint kbx = tid / 2u; kbx < nb; kbx += 64u) {                       \
+        const uint kby = kbx * 2u;                                          \
+        const uint xb = (kby + kqs) * 9u;                                   \
+        const uint rb = row0 * nb * 18u + kbx * 18u;                        \
+        if (rows == 1u) {                                                   \
+            t0 += q2_0_dot##I(rb, xb, kqs);                                 \
+        } else {                                                            \
+            if (row0 + 0u < n_out) t0 += q2_0_dot##I(rb + 0u * nb * 18u, xb, kqs); \
+            if (row0 + 1u < n_out) t1 += q2_0_dot##I(rb + 1u * nb * 18u, xb, kqs); \
+            if (row0 + 2u < n_out) t2 += q2_0_dot##I(rb + 2u * nb * 18u, xb, kqs); \
+            if (row0 + 3u < n_out) t3 += q2_0_dot##I(rb + 3u * nb * 18u, xb, kqs); \
+        }                                                                   \
+    }                                                                       \
+    sh[subrow][0u][lane] = t0;                                              \
+    if (rows == 4u) { sh[subrow][1u][lane] = t1; sh[subrow][2u][lane] = t2; sh[subrow][3u][lane] = t3; } \
+    groupMemoryBarrier(); barrier();                                        \
+    if (subrow == 0u) {                                                     \
+        for (uint i = 0u; i < rows; ++i) {                                  \
+            float acc = sh[0u][i][lane];                                    \
+            acc = acc + sh[1u][i][lane];                                    \
+            acc = acc + sh[2u][i][lane];                                    \
+            acc = acc + sh[3u][i][lane];                                    \
+            for (uint o = 16u; o > 0u; o >>= 1u) acc += subgroupShuffleXor(acc, o); \
+            if (lane == i && row0 + i < n_out) by##I.v[row0 + i] = acc;     \
+        }                                                                   \
+    }                                                                       \
+    groupMemoryBarrier(); barrier();                                        \
+}
+GEN_WORK(0) GEN_WORK(1) GEN_WORK(2) GEN_WORK(3)
+GEN_WORK(4) GEN_WORK(5) GEN_WORK(6) GEN_WORK(7)
+
+void main() {
+    const uint slot = gl_WorkGroupID.x / pc.gx;
+    const uint grp  = gl_WorkGroupID.x % pc.gx;
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint lane = tid & 31u, subrow = tid >> 5u;
+    const uint nb = pc.n_in / 64u, rows = pc.rows;
+    if (slot == 0u) work0(grp, tid, lane, subrow, nb, rows, pc.n_out);
+    else if (slot == 1u) work1(grp, tid, lane, subrow, nb, rows, pc.n_out);
+    else if (slot == 2u) work2(grp, tid, lane, subrow, nb, rows, pc.n_out);
+    else if (slot == 3u) work3(grp, tid, lane, subrow, nb, rows, pc.n_out);
+    else if (slot == 4u) work4(grp, tid, lane, subrow, nb, rows, pc.n_out);
+    else if (slot == 5u) work5(grp, tid, lane, subrow, nb, rows, pc.n_out);
+    else if (slot == 6u) work6(grp, tid, lane, subrow, nb, rows, pc.n_out);
+    else work7(grp, tid, lane, subrow, nb, rows, pc.n_out);
+}

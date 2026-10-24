@@ -1405,9 +1405,10 @@ int main(int argc, char** argv) {
         // 2048: ROWS=1 arm for 13/14; 512: the SmallK ROWS=2 arm (nb 2 < 8/4) — the host refs
         // model the single-call ROWS=4 partition, provably the same per-row lane sums (see above).
         const SlotCase cases[] = { {16, 3, 2048, 768, 66}, {13, 2, 2048, 512, 176}, {14, 2, 2048, 2048, 210},
-                                   {14, 3, 512, 64, 210}, {13, 2, 512, 7, 176} };
+                                   {14, 3, 512, 64, 210}, {13, 2, 512, 7, 176},
+                                   {42, 3, 2048, 1024, 18}, {42, 8, 2048, 2048, 18}, {42, 2, 512, 7, 18} };
         for (const auto& sc : cases) {
-            const int nb = sc.n_in / 256;
+            const int nb = sc.n_in / (sc.type == 42 ? 64 : 256);
             std::mt19937 rng(7700 + sc.type * 101 + sc.count);
             std::vector<std::vector<uint8_t>> W(sc.count);
             for (auto& w : W) {
@@ -1421,6 +1422,9 @@ int main(int argc, char** argv) {
                 const uint16_t dh = f16_rn((rng() & 1) ? -0.01f : 0.02f), dl = f16_rn((rng() & 1) ? -0.02f : 0.01f);
                 std::memcpy(w.data() + (size_t(r) * nb + b) * 176, &dh, 2);
                 std::memcpy(w.data() + (size_t(r) * nb + b) * 176 + 2, &dl, 2);
+            } else if (sc.type == 42) for (auto& w : W) for (int r = 0; r < sc.n_out; ++r) for (int b = 0; b < nb; ++b) {
+                const uint16_t dh = f16_rn((rng() & 1) ? -0.01f : 0.02f);
+                std::memcpy(w.data() + (size_t(r) * nb + b) * 18, &dh, 2);
             } else for (auto& w : W) for (int r = 0; r < sc.n_out; ++r) for (int b = 0; b < nb; ++b) {
                 const uint16_t dh = f16_rn((rng() & 1) ? -0.01f : 0.02f);
                 std::memcpy(w.data() + (size_t(r) * nb + b) * 210 + 208, &dh, 2);
@@ -1428,7 +1432,7 @@ int main(int argc, char** argv) {
             // one shared activation column (the engine repeats x[i]): quantize once
             std::vector<float> x(sc.n_in);
             for (auto& v : x) v = float(int(rng() % 2001) - 1000) / 250.0f;
-            const uint64_t x_sz = size_t(nb) * 8 * 36;
+            const uint64_t x_sz = size_t(nb) * (sc.type == 42 ? 2 : 8) * 36;
             const uint64_t ax = a.alloc(x.size() * 4), aq = a.alloc(x_sz);
             vk::copy_h2d((void*)ax, x.data(), x.size() * 4, nullptr);
             kernels::native_quantize_q8_1((const float*)strata_vk_compat::wrap(ax), strata_vk_compat::wrap(aq),
@@ -1488,6 +1492,10 @@ int main(int argc, char** argv) {
                         float acc[32], nxt[32]; std::memcpy(acc, part, sizeof acc);
                         for (int o = 16; o > 0; o >>= 1) { for (int l = 0; l < 32; ++l) nxt[l] = acc[l] + acc[l ^ o]; std::memcpy(acc, nxt, sizeof nxt); }
                         ref = acc[0];
+                    } else if (sc.type == 42) {
+                        // (a) bitwise vs the single kernel is the contract for 42 (its own host
+                        // ref is pinned against it in the type-42 section above); skip (b) here.
+                        ref = y[r];
                     } else if (sc.type == 13) {
                         const int rows = (nb < 8) ? 4 : 1;
                         ref = q5_k_ref(W[i].data(), Q.data(), nb, rows == 1 ? r : (r / 4) * 4, rows, r % 4);
