@@ -130,7 +130,7 @@ def ledger():
         if not line.startswith("| "): continue
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
         if len(cells) < 7: continue
-        if cells[0].startswith("poly:"): continue   # the strata::poly surface: gen_poly_stubs.py's ledger
+        if cells[0].startswith("poly:"): continue   # the strata::poly surface: gen_omni_stubs.py's ledger
         state = cells[6].strip("* ")
         cell0 = re.sub(r"\([^)]*\)", " ", cells[0])
         names = [t.strip() for t in re.split(r"[/,]| and ", cell0) if re.fullmatch(r"[a-z_0-9]+", t.strip())]

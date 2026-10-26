@@ -1,1 +1,0 @@
-Write an LRU cache class in Python with get and put methods, O(1) for both, using a doubly linked list and a dict. Include a short docstring and a usage example.

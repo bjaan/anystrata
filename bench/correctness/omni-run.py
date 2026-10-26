@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Configuration B arms (CORRECTNESS-PLAN.md 3.3): a fresh omnistrata-gguf process per sequence, teacher-forced on the
-reference answer, top-20 probabilities per step.  poly-run.py <file-tag> <gguf> <arm> [seq ...]
+reference answer, top-20 probabilities per step.  omni-run.py <file-tag> <gguf> <arm> [seq ...]
 arms: base   = --tail-skip 0 --no-draft --lookup 0 --window 1          (arm 1)
       draft  = --tail-skip 0 (draft block, lookup 3, window 8 defaults) (arm 2; top.txt must equal base's bytes)
       kvq8   = base + --kv q8_0                                          (arm 3)
@@ -21,7 +21,7 @@ ARMS = {'base': ['--tail-skip', '0', '--no-draft', '--lookup', '0', '--window', 
         'draft': ['--tail-skip', '0'],
         'kvq8': ['--tail-skip', '0', '--no-draft', '--lookup', '0', '--window', '1', '--kv', 'q8_0'],
         'pb512': ['--tail-skip', '0', '--no-draft', '--lookup', '0', '--window', '1', '--prompt-batch', '512']}
-OUT = ROOT / 'poly' / tag / arm; OUT.mkdir(parents=True, exist_ok=True)
+OUT = ROOT / 'omni' / tag / arm; OUT.mkdir(parents=True, exist_ok=True)
 env = dict(os.environ, STRATA_FREEZE_EXPERTS='1')
 for p in sorted(ROOT.glob('inputs/*/*.prompt.ids')):
     seq = p.name[:-len('.prompt.ids')]

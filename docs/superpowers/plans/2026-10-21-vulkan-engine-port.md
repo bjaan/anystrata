@@ -149,7 +149,7 @@ The goal of this phase is **not** running: it is `strata-poly`'s eleven host fil
 - [ ] **Task 2.6:** `native_moe` / `iq_kernels` expert decode family — the hot path. Note: `iq_kernels.cu` is large; split its entry points across 2-3 commits.
 - [ ] **Task 2.7:** KV decode family (`kv_q4`, `kv_q8`, `kv_stream`) — includes the mrope device-table path (`mrope_pos`/`mtab`: `include/strata/kernels/mrope.hpp` is host-buildable; the table rides an arena buffer).
 - [ ] **Task 2.8:** sampler + elementwise + cvec family (`elementwise.cu`, 461 lines, several entry points).
-- [ ] **Task 2.9:** gate: **first token out.** `strata-poly-vk --no-graphs` completes one prompt + one greedy token on IQ2_XXS, log shows zero traps. Then run `poly-run.py` (bench/correctness) against the llama.cpp reference at short length as a smoke test — not the formal gate, just shape-checking.
+- [ ] **Task 2.9:** gate: **first token out.** `omnistrata-gguf-vk --no-graphs` completes one prompt + one greedy token on IQ2_XXS, log shows zero traps. Then run `poly-run.py` (bench/correctness) against the llama.cpp reference at short length as a smoke test — not the formal gate, just shape-checking.
 - [ ] **Task 2.10:** spec/verify + MTP decode kernels (`verify_kernels.cu`, `src/spec/*` device parts) — speculation is how the NVIDIA numbers hit; the draft path must run before the teacher-forced harness uses realistic prompts.
 
 **Deferred-by-design (do NOT port yet):** graph capture (`--no-graphs` is the interim), the `prefill/` MMQ/pointer-table paths, `remote_experts`/`peer_experts` (multi-GPU), `nvfp4` (NVIDIA-only format, mark `n/a` in PORT-STATUS).
@@ -186,7 +186,7 @@ The goal of this phase is **not** running: it is `strata-poly`'s eleven host fil
 ---
 
 ## Test plan summary
-Unit gate every commit: `ctest --test-dir build-vk`. Model gate from Phase 2 on: `strata-poly-vk --no-graphs` must advance its trap position (strictly fewer named traps each session) and never produce output from an unimplemented path. Formal gate: Phase 5's teacher-forced harness at the fork's KL/spread numbers. Nothing merges with a silently widened tolerance or a trap that returns zeros — `missing()` exits 86 on purpose.
+Unit gate every commit: `ctest --test-dir build-vk`. Model gate from Phase 2 on: `omnistrata-gguf-vk --no-graphs` must advance its trap position (strictly fewer named traps each session) and never produce output from an unimplemented path. Formal gate: Phase 5's teacher-forced harness at the fork's KL/spread numbers. Nothing merges with a silently widened tolerance or a trap that returns zeros — `missing()` exits 86 on purpose.
 
 ---
 

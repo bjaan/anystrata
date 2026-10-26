@@ -88,6 +88,10 @@ int main(int argc, char** argv) {
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = ngl;
+    // UMA/APU law (vulkan/PORT-NOTES.md #10): the Vulkan device reports no mmap_support, so AUTO
+    // silently falls back to NONE — a full anon-RAM copy of the GGUF the kernel cannot evict, and
+    // the OOM killer takes the desktop instead. Force MMAP: weights stay page cache, reclaimable.
+    if (const char* m = std::getenv("STRATA_DUMP_MMAP"); m != nullptr && m[0] == '1') mp.load_mode = LLAMA_LOAD_MODE_MMAP;
     llama_model* mdl = llama_model_load_from_file(model.c_str(), mp);
     if (!mdl) { std::fprintf(stderr, "cannot load %s\n", model.c_str()); return 1; }
     const llama_vocab* vocab = llama_model_get_vocab(mdl);

@@ -1,1 +1,0 @@
-Three boxes are labelled Apples, Oranges, and Mixed, but every label is wrong. You may draw one fruit from one box without looking inside. Which box do you draw from, and how do you then relabel all three correctly? Explain your reasoning step by step.

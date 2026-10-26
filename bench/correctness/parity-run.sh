@@ -1,6 +1,6 @@
 #!/bin/bash
 # Run-order step 2 (CORRECTNESS-PLAN.md section 4): the component parities whose formats are in use. Registered ones
-# through ctest (one directory per test under parity/, with stdout+stderr and the exit code); the hand-run poly_*
+# through ctest (one directory per test under parity/, with stdout+stderr and the exit code); the hand-run *_poly_* (the strata::poly namespace: engine-side, kept; the harness file is now omni-run.py)
 # programs after. Reconfigures first so iq_parity registers now that numpy is present.
 set -u
 # Paths (the defaults are the homelab VM's; set them for another machine): US2_MODELS, the directory holding
