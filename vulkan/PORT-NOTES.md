@@ -221,3 +221,20 @@ reach them (they are in the .cu files, which stay uncompiled); dim3/vector types
    and evaluate Taylor sin/cos in-kernel (coefficients rounded f32: truncation 1.8e-9 sin,
    1.2e-8 cos at pi/4). One Newton step on a divide does NOT fix law 2's frcr error (measured
    no movement at all) — go through double.
+
+10. **On this APU, llama.cpp `-ngl` ANY value can out-of-memory-kill the desktop — never run it
+   without containment.** Measured law (Phase-5 gate, 2026-10-26): its Vulkan backend loads the
+   model into TWO device tiers even at `--ngl 24` — `Vulkan0` (~6.3 GiB) plus a `Vulkan_Host`
+   fallback buffer (~5.3 GiB) — and amdgpu/TTM **pins both into system RAM as non-reclaimable
+   pages**. With the 12.2 GiB GGUF resident, kswapd fires and the kernel OOM killer takes its
+   victims by score: three crashes in one day, victims were kwin_wayland, plasma-systemmonitor,
+   and the Hermes session — never the benchmark itself. Session processes carry oom_score_adj=+200
+   by default, so they DIE FIRST; the culprit keeps running. The Strata engine itself is immune —
+   it sizes its own device-local arena (9.4 GiB, proven stable all through the long gates) — so
+   this is a llama.cpp-on-APU law, and it constrains ONLY the reference legs of the correctness
+   harness. Rules that survived: (a) at most ONE llama.cpp model load at a time, kill+sleep >=20 s
+   between legs; (b) wrap every leg in `choom -n 400` (raises the leg's OWN adj so a breach kills
+   it first) + `nice -n 10`; (c) on this box prefer `--ngl 0` reference arms (pure CPU, weights as
+   mmap page cache = reclaimable, pressure evicts pages instead of people); (d) the 32K-context
+   leg (d31k) is NOT hostable here at all — record it as machine-limited, as the fork does for
+   other machines' missing sets.
