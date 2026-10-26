@@ -238,3 +238,12 @@ reach them (they are in the .cu files, which stay uncompiled); dim3/vector types
    mmap page cache = reclaimable, pressure evicts pages instead of people); (d) the 32K-context
    leg (d31k) is NOT hostable here at all — record it as machine-limited, as the fork does for
    other machines' missing sets.
+11. **ENGINE context sizing law on this APU: 16K fits, 32K fits, 64K does not (yet).** Measured
+   (2026-10-27): --max-context 65536 = 2.56 GiB f16 KV INSIDE the pinned arena -> resident 14.75 GB,
+   plus desktop ~1 GB: OOM kill, session included (Hermes died with the server; adj tie, law 10b).
+   32K (KV 1.28 GiB, resident ~13.9) and 16K (~14.1 incl. warm cache) run stable. The unlock for
+   64K is q8_0 KV (halves KV to 1.28 GiB at 64K): the HOST-side code is in-tree and parity-tested
+   (kv_q8.hpp; the fork's kvq8 correctness arm), but the Vulkan kernels
+   (kv_append_q8_step / kv_gather_q8_step, PORT-STATUS todo) must be ported first — that, plus the
+   vmm grow-never arena's 'cost the max context at startup' fallback, is the honest path to 64K.
+   Do not raise --max-context past 32768 before those kernels are green.
