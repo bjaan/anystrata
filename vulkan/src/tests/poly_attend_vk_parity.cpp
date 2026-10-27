@@ -334,7 +334,8 @@ void run(const Case& cs) {
 // chains differ by the batch chain's f16 weight rounding, which cancels in the weighted
 // average when the v rows carry a strong common term (0.7 +/- 0.0015), so the agreement
 // still rides the same rel_l1 1e-5.
-struct BatchCase { long long pos; int rows; int n_head, kv_heads, dim; size_t score_floats; const char* what; };
+struct BatchCase { long long pos; int rows; int n_head, kv_heads, dim; size_t score_floats; const char* what;
+                   bool q8 = false; size_t work_rows = 64; };
 
 void run_batch(const BatchCase& cs) {
     const int per = cs.n_head / cs.kv_heads, width = cs.kv_heads * cs.dim;
@@ -352,6 +353,45 @@ void run_batch(const BatchCase& cs) {
     vk::Arena& a = vk::Arena::instance();
     cublasHandle_t blas = nullptr;
     if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS) { std::printf("  FAIL %s: cublasCreate\n", cs.what); fails++; return; }
+
+    // ---- q8 arm (the 64K unlock), BEFORE the device run and its cache uploads: store_q8 on the
+    //      device (its own byte-exactness is pinned in poly_kernels_vk_parity), read the
+    //      codes/scales back, and rebind the HOST caches the order reference uses to the
+    //      requantized values — exactly what dequant_q8 hands the products. The chain test then
+    //      covers the arm's arithmetic and block caps, not q8's (by design large) representation
+    //      loss, and the reference's block loop mirrors the work_rows cap above.
+    const int widthv = cs.kv_heads * cs.dim;
+    std::vector<int8_t> kcode, vcode; std::vector<uint16_t> kscale, vscale;
+    uint64_t ack = 0, avc = 0, aks = 0, avs = 0, akw = 0, avw = 0;
+    if (cs.q8) {
+        kcode.assign(size_t(nrows) * widthv, 0); vcode = kcode;
+        kscale.assign(size_t(nrows) * widthv / 32, 0); vscale = kscale;
+        std::vector<float> kx(kc.size()), vx(vc.size());
+        for (size_t i = 0; i < kc.size(); ++i) kx[i] = f16_to_float(kc[i]);
+        for (size_t i = 0; i < vc.size(); ++i) vx[i] = f16_to_float(vc[i]);
+        ack = a.alloc(kcode.size()); avc = a.alloc(vcode.size());
+        aks = a.alloc(kscale.size() * 2); avs = a.alloc(vscale.size() * 2);
+        const uint64_t akx = a.alloc(kx.size() * 4), avx = a.alloc(vx.size() * 4);
+        vk::copy_h2d((void*)akx, kx.data(), kx.size() * 4, nullptr);
+        vk::copy_h2d((void*)avx, vx.data(), vx.size() * 4, nullptr);
+        poly::store_q8((const float*) strata_vk_compat::wrap(akx), (int8_t*) strata_vk_compat::wrap(ack),
+                       (uint16_t*) strata_vk_compat::wrap(aks), widthv, 0, (int) nrows, nullptr);
+        poly::store_q8((const float*) strata_vk_compat::wrap(avx), (int8_t*) strata_vk_compat::wrap(avc),
+                       (uint16_t*) strata_vk_compat::wrap(avs), widthv, 0, (int) nrows, nullptr);
+        vk::copy_d2h(kcode.data(), (void*)ack, kcode.size(), nullptr);
+        vk::copy_d2h(vcode.data(), (void*)avc, vcode.size(), nullptr);
+        vk::copy_d2h(kscale.data(), (void*)aks, kscale.size() * 2, nullptr);
+        vk::copy_d2h(vscale.data(), (void*)avs, vscale.size() * 2, nullptr);
+        for (size_t r = 0; r < size_t(nrows); ++r)
+            for (int i = 0; i < widthv; ++i) {
+                const float d = f16_to_float(kscale[r * (widthv / 32) + (i >> 5)]);
+                kc[r * widthv + i] = f16_rn(float(kcode[r * widthv + i]) * d);
+                const float dv = f16_to_float(vscale[r * (widthv / 32) + (i >> 5)]);
+                vc[r * widthv + i] = f16_rn(float(vcode[r * widthv + i]) * dv);
+            }
+        akw = a.alloc(cs.work_rows * widthv * 2 + 8);
+        avw = a.alloc(cs.work_rows * widthv * 2 + 8);
+    }
 
     // ---- ORDER reference: replay the launcher's loops (window=0, ring=0, whole=false).
     const size_t cells = cs.score_floats / 3 * 2;
@@ -371,6 +411,7 @@ void run_batch(const BatchCase& cs) {
         const int block = fit > 16 ? fit & ~15 : fit;
         for (int k0 = 0, m = 0; k0 < n_keys; k0 += m) {
             m = std::min<long long>(block, n_keys - k0);
+            if (cs.q8) m = std::min<long long>(m, (long long) cs.work_rows);   // the workspace cap (CUDA 2624)
             // scores: blk (group order) x m rows
             std::vector<float> sc(heads * m);
             for (size_t blk = 0; blk < heads; ++blk) {
@@ -442,11 +483,21 @@ void run_batch(const BatchCase& cs) {
     vk::fill_d((void*) ao, 0, size_t(cs.rows) * cs.n_head * cs.dim * 4, nullptr);
     std::vector<float> got(size_t(cs.rows) * cs.n_head * cs.dim, 0.f);
     try {
-        poly::attend_batch(blas, (float*) strata_vk_compat::wrap(aq), (uint16_t*) strata_vk_compat::wrap(ak),
-                           (uint16_t*) strata_vk_compat::wrap(av), cs.pos, cs.rows,
-                           (float*) strata_vk_compat::wrap(as), cs.score_floats,
-                           (float*) strata_vk_compat::wrap(aw), (float*) strata_vk_compat::wrap(ao),
-                           cs.dim, cs.n_head, cs.kv_heads, scale, nullptr);
+        if (cs.q8)
+            poly::attend_batch(blas, (float*) strata_vk_compat::wrap(aq), nullptr, nullptr, cs.pos, cs.rows,
+                               (float*) strata_vk_compat::wrap(as), cs.score_floats,
+                               (float*) strata_vk_compat::wrap(aw), (float*) strata_vk_compat::wrap(ao),
+                               cs.dim, cs.n_head, cs.kv_heads, scale, nullptr, 0, 0, false,
+                               poly::Kvq8{(int8_t*) strata_vk_compat::wrap(ack), (uint16_t*) strata_vk_compat::wrap(aks)},
+                               poly::Kvq8{(int8_t*) strata_vk_compat::wrap(avc), (uint16_t*) strata_vk_compat::wrap(avs)},
+                               (uint16_t*) strata_vk_compat::wrap(akw), (uint16_t*) strata_vk_compat::wrap(avw),
+                               cs.work_rows * size_t(widthv));
+        else
+            poly::attend_batch(blas, (float*) strata_vk_compat::wrap(aq), (uint16_t*) strata_vk_compat::wrap(ak),
+                               (uint16_t*) strata_vk_compat::wrap(av), cs.pos, cs.rows,
+                               (float*) strata_vk_compat::wrap(as), cs.score_floats,
+                               (float*) strata_vk_compat::wrap(aw), (float*) strata_vk_compat::wrap(ao),
+                               cs.dim, cs.n_head, cs.kv_heads, scale, nullptr);
         vk::copy_d2h(got.data(), (void*) ao, got.size() * 4, nullptr);
     } catch (const std::exception& e) {
         std::printf("  FAIL %s: attend_batch threw: %s\n", cs.what, e.what());
@@ -515,6 +566,8 @@ int main() {
         {64, 32, 16, 2, 256, size_t(1)<<18, "batch dim256 rows=32 over 64 keys"},
         {63, 100, 16, 2, 128, size_t(1)<<16, "batch dim128 rows=100: chunked blocks, odd tails"},
         {5, 40, 8, 2, 128, size_t(1)<<14, "batch multi-block rows=40 n_head=8: odd tail m=13"},
+        {64, 32, 16, 2, 256, size_t(1)<<18, "batch q8 MODEL shape: store_q8 -> dequant arm", true, 64},
+        {63, 100, 16, 2, 128, size_t(1)<<16, "batch q8 rows=100: work_rows cap 16, odd tails", true, 16},
     };
     for (const auto& cs : bcases) run_batch(cs);
     std::printf("poly_attend_vk_parity %s\n", fails == 0 ? "PASS" : "FAIL");

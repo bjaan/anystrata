@@ -706,7 +706,7 @@ add_test(NAME poly_gdn_vk_parity COMMAND poly_gdn_vk_parity)
 # Task 2.11: poly attend parity - the general fp16-KV chain (score reg<4,1> / softmax / value).
 add_executable(poly_attend_vk_parity src/tests/poly_attend_vk_parity.cpp)
 target_include_directories(poly_attend_vk_parity PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
-target_link_libraries(poly_attend_vk_parity PRIVATE strata_vk_kernel_attend strata_vk_kernel_attend_batch strata_vk_blas strata_vk_poly_kernels strata_vk_runtime strata_vk_compat strata_vk_stubs)
+target_link_libraries(poly_attend_vk_parity PRIVATE strata_vk_kernel_attend strata_vk_kernel_attend_batch strata_vk_kernel_store_q8 strata_vk_blas strata_vk_poly_kernels strata_vk_runtime strata_vk_compat strata_vk_stubs)
 add_test(NAME poly_attend_vk_parity COMMAND poly_attend_vk_parity)
 
 # Phase 3 (attempt 2): the GPU tiled GEMM's micro-parity gate - GPU arm vs the ordered-fp32 CPU
