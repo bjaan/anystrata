@@ -144,6 +144,13 @@ build-vk/bin/omnistrata --engine build-vk/bin/omnistrata-gguf-vk \
   -- --model /models/Qwen3.6-35B-A3B-GSQ-hybrid.gguf --no-graphs --max-context 16384
 ```
 
+`--max-context` on this APU: **16K and 32K are proven stable; 64K needs `--kv q8_0`** (the
+q8_0 KV cache halves the cache to 544 bytes a row and is the unlock for a large window on a
+15 GB unified box — the write kernel is ported and parity-green, the prefill read arm is wired,
+and until the decode-side kernels land it is a named trap rather than a wrong answer). 128K does
+not fit this card with this model; it is a machine for the larger pods, same as upstream's
+long-context records. The law and the measurements are in `vulkan/PORT-NOTES.md` (rules 10-11).
+
 CUDA, the reference path — Qwen3.6-35B-A3B from an Unsloth GGUF:
 
 ```
@@ -178,7 +185,8 @@ the files actually served, with sizes and SHA-256, are listed in [docs/MODEL-FIL
 | `omnistrata-gguf-dsv41` | `deepseek41` | DeepSeek-V4.1-Flash-1017 (Strata v0.2.4's engine: the four shards, Engram table, DSpark drafter; IQ1_M / IQ2_XXS / IQ2_XS GSQ-RCO) | ✓ | – | – | – | not ported |
 
 The Vulkan column reports what has run end-to-end on a Vulkan device (the BC-250 gate: `qwen35moe` files, all
-expert and dense quant formats held bitwise against the CUDA tree — see `vulkan/PORT-STATUS.md`); the other
+expert and dense quant formats held bitwise against the CUDA tree, the q8_0 KV cache's store kernel
+parity-green on the way to a 64K window — see `vulkan/PORT-STATUS.md`); the other
 families build against the same shim but wait for their own bring-up gate. Anything the Vulkan port has not
 carried yet refuses loudly, by name, and never answers with a wrong kernel.
 
@@ -266,8 +274,12 @@ toward while keeping Strata's expert-cache design, which is what lets a 12 GB mo
 
 Read [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) and the backend pages before filing anything. The Vulkan
 port's open items are enumerated in `vulkan/PORT-STATUS.md`: captured graphs are pending Phase 4.2 (run
-`--no-graphs`), prefill tiles are under tuning, and every unported format or path traps by name — loudly, never
-silently. pi's compaction defaults assume >64K windows; serve more context or lower them (USTRAT-8).
+`--no-graphs`), prefill tiles are under tuning, the q8_0 KV read on the decode path is still a named trap
+(the prompt path is wired), and every unported format or path traps by name — loudly, never silently.
+pi's compaction defaults assume >64K windows; serve more context or lower them (USTRAT-8).
+On this APU, llama.cpp reference runs must obey `vulkan/PORT-NOTES.md` rule 10 (their loader copies the
+whole GGUF into pinned anon RAM on an iGPU and the OOM killer then takes the desktop): one load at a
+time, mmap forced, and an oom-score above the session's.
 
 ## Mascot
 

@@ -35,6 +35,24 @@ cmake -S vulkan -B build-vulkan && cmake --build build-vulkan && ctest --test-di
   header calls "the single hottest decode in the engine"; bit-exactness is the CUDA side's rule because
   `(code - 1)` in the integer domain then ONE multiply cannot round.
 
+## Context sizes on a unified-memory APU
+
+The engine sizes its device arena at startup, and on the BC-250 (15.7 GiB shared) the model's
+weights leave room for a KV cache of about a gigabyte and a half beyond the expert cache:
+
+| `--max-context` | KV (fp16) | resident | status |
+| --- | --- | --- | --- |
+| 16,384 | 0.65 GiB | ~14.1 GB | proven: every long gate, pi round trips |
+| 32,768 | 1.28 GiB | ~13.9 GB | proven stable (32768 gate 2026-10-27) |
+| 65,536 | 2.56 GiB fp16 / 1.28 GiB `--kv q8_0` | — | needs the q8_0 KV cache (in progress: `store_q8` parity-green, `attend_batch` arm wired, the decode read still traps by name) |
+| 131,072 | 5.1 GiB fp16 | — | not this card; the pod machines' territory |
+
+The q8_0 cache stores K and V rows as int8 codes with one fp16 scale per 32 values (544 bytes a
+row where fp16 costs 1,024): the engine's `--kv q8_0` switch, the same arm CUDA's correctness
+harness scores as `kvq8`. Until the port's kernels all land it traps **by name** — the engine
+refuses loudly rather than answering with a wrong kernel. See `vulkan/PORT-STATUS.md`
+("q8_0 KV cache") and the driver rules in `vulkan/PORT-NOTES.md` 10-11.
+
 ## What the backend provides
 
 `src/runtime/vk_device.cpp` / `vk_runtime.cpp` + `include/strata/vulkan_runtime.hpp`:
