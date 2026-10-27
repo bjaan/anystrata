@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -39,6 +40,7 @@ namespace {
 #include "attend_batch_group_ungroup.spv.h"  // attn_ungroup_kernel arm
 #include "attend_batch_softmax.spv.h"
 #include "attend_batch_scale.spv.h"
+#include "attend_batch_dequant.spv.h"      // the q8 arm: rows of the q8 cache -> the f16 workspaces
 
 // kernels.cu:27 - the results cap the wrapper's chunk pick.
 constexpr size_t kAttendResults = size_t(8) << 20;
@@ -62,6 +64,12 @@ const vk::Kernel& pl_softmax_block() {
 const vk::Kernel& pl_scale() {
     static const vk::Kernel k = vk::kernel_load("attend_batch_scale", attend_batch_scale_spv,
                                                 attend_batch_scale_spv_len, 2, 64, 256, false);
+    return k;
+}
+
+const vk::Kernel& pl_dequant() {
+    static const vk::Kernel k = vk::kernel_load("attend_batch_dequant", attend_batch_dequant_spv,
+                                                attend_batch_dequant_spv_len, 3, 12, 256, false);
     return k;
 }
 inline long long gridll(long long n, long long block) { return (n + block - 1) / block; }
@@ -102,14 +110,23 @@ void attend_batch(void* blas, const float* q, const uint16_t* kcache, const uint
                   float* score, size_t score_floats, float* work, float* out, int dim, int n_head, int kv_heads,
                   float scale, void* stream, int window, int ring, bool whole, Kvq8 kq8, Kvq8 vq8, uint16_t* kwork,
                   uint16_t* vwork, size_t work_halves) {
-    const int per = n_head / kv_heads, width = kv_heads * dim;
+    const int per = n_head / kv_heads;
     if (rows <= 0 || n_head <= 0 || kv_heads <= 0 || n_head % kv_heads || dim % 2 || dim <= 0)
         throw std::invalid_argument("attend_batch: bad shape");
     const bool kq = kq8.codes != nullptr, vq = vq8.codes != nullptr;
     // CUDA 2575's dim==64 per==4 fast path requires tensor_cores(), which is false on the
     // AMD builds (kernels.cu:1632-1636's own note); the general chain below runs the same math
     // there.  Mirrored: no flash arm here, every shape goes through the batched products.
-    if (kq || vq) throw std::invalid_argument("attend_batch: kq8/vq8 quantized-KV arm");
+    // The q8 arm (Phase: the 64K-context unlock): CUDA 2587-2591, transcribed. width = kv_heads*dim
+    // values a cache row; the workspace's rows cap the key blocks below (CUDA 2624).
+    const int width = kv_heads * dim;
+    const int work_rows = width > 0 ? (int) std::min<size_t>(work_halves / (size_t) width, (size_t) INT_MAX) : 0;
+    if (kq && (kwork == nullptr || work_rows < 1))
+        throw std::invalid_argument("attend_batch: a q8 key cache needs a row of its workspace");
+    if (vq && (vwork == nullptr || work_rows < 1))
+        throw std::invalid_argument("attend_batch: a q8 value cache needs a row of its workspace");
+    if ((kq || vq) && (width & 63))
+        throw std::invalid_argument("attend_batch: the q8 arm reads the cache in pairs and scales in blocks of 32");
     if (pos < 0 || pos > 0x7FFFFFFFll || pos + rows > 0x7FFFFFFFll ||
         (long long) window > 0x7FFFFFFFll || (long long) ring > 0x7FFFFFFFll)
         throw std::invalid_argument("attend_batch: positions beyond int31 (the .comp kernels read one word)");
@@ -170,15 +187,37 @@ void attend_batch(void* blas, const float* q, const uint16_t* kcache, const uint
         const int fit = (int) (cells / heads);
         const int block = fit > 16 ? fit & ~15 : fit;   // the tensor cores are half as fast on a ragged block
         for (int k0 = 0, m = 0; k0 < n_keys; k0 += m) {
-            // CUDA 2619-2624: a block ends where a ring starts over (the q8 workspace cap is a
-            // trap arm - kq/vq threw above).
+            // CUDA 2619-2624: a block ends where a ring starts over; a q8 block is capped by the
+            // workspace's rows (CUDA 2624).
             const long long row = ring > 0 ? (lo0 + k0) % ring : lo0 + k0;
             m = (int) std::min<long long>(std::min<long long>(block, n_keys - k0),
                                           ring > 0 ? ring - row : n_keys);
+            if ((kq || vq) && m > work_rows) m = work_rows;   // the workspace's rows cap the block
             if (m <= 0) throw std::runtime_error("attend_batch: a key block of zero rows");
             vk::fill_d((void*) (so + cells * 4), 0, (heads * size_t(m) + 1) / 2 * 4, stream);
-            const uint16_t* krow = kcache + size_t(row) * width;   // biased compat pointers go to cublas as-is
-            const uint16_t* vrow = vcache + size_t(row) * width;
+            // CUDA 2626-2630: a q8 cache's rows are dequantized into the workspace the products
+            // read as an fp16 cache. The .comp binds whole caches (at-row indices start at 0);
+            // the launcher offsets by the block's first row (ring math), like the CUDA grid.y.
+            // CUDA 2631-2632's ternary: under q8 the ENGINE passes null caches (qwen35.cpp:395-396),
+            // so the cache-row arithmetic only happens for the fp16 arm.
+            uint16_t* krow = kq ? kwork : (uint16_t*) (kcache + size_t(row) * width);
+            uint16_t* vrow = vq ? vwork : (uint16_t*) (vcache + size_t(row) * width);
+            if (kq) {
+                const uint64_t bufs[3] = {strata_vk_compat::off(kq8.codes) + uint64_t(row) * width,
+                                          strata_vk_compat::off(kq8.scales) + uint64_t(row) * (width / 32) * 2,
+                                          strata_vk_compat::off(kwork)};
+                const uint64_t sizes[3] = {size_t(m) * width, size_t(m) * (width / 32) * 2, size_t(m) * width * 2};
+                const uint32_t dpc[3] = {uint32_t(width), uint32_t(m), uint32_t(gridll(width, 256))};
+                vk::kernel_launch_sized(pl_dequant(), int(size_t(m) * gridll(width, 256)), bufs, sizes, 3, dpc);
+            }
+            if (vq) {
+                const uint64_t bufs[3] = {strata_vk_compat::off(vq8.codes) + uint64_t(row) * width,
+                                          strata_vk_compat::off(vq8.scales) + uint64_t(row) * (width / 32) * 2,
+                                          strata_vk_compat::off(vwork)};
+                const uint64_t sizes[3] = {size_t(m) * width, size_t(m) * (width / 32) * 2, size_t(m) * width * 2};
+                const uint32_t dpc[3] = {uint32_t(width), uint32_t(m), uint32_t(gridll(width, 256))};
+                vk::kernel_launch_sized(pl_dequant(), int(size_t(m) * gridll(width, 256)), bufs, sizes, 3, dpc);
+            }
             // CUDA 2630-2637, ARG FOR ARG: score_g = scale * K_g^T Q_g (m x cols, K dim).
             const cublasStatus_t s1 = cublasGemmStridedBatchedEx(
                 h, CUBLAS_OP_T, CUBLAS_OP_N, m, (int) cols, dim, &scale,
@@ -236,7 +275,7 @@ void attend_batch(void* blas, const float* q, const uint16_t* kcache, const uint
             vk::kernel_launch_sized(pl_ungroup(), int(gx * heads), bufs, sizes, 2, pc);
         }
     }
-    (void) kwork; (void) vwork; (void) work_halves;   // the q8 workspace: that arm traps above
+
     (void) stream;   // queue/staged copies keep call order
 }
 

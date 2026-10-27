@@ -292,6 +292,11 @@ target_link_libraries(strata_vk_kernel_head_norm_rope PUBLIC strata_vk_runtime s
 # read wired for it yet). f16 packing is RN via f16_rn_bits, NOT packHalf2x16 (law 1).
 strata_vk_kernel(store_f16 SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels COMP store_f16.comp LAUNCHER src/poly/kernels/store_f16_vk.cpp)
 
+# q8_0 KV cache (the 64K-context unlock, law 11): poly store_q8 (the q8 KV write). store_q8_at
+# stays a trap (no card-time row read wired under --no-graphs). rint ties-to-even (q8_rint), NOT
+# GLSL round(); scales are f16_rn_bits; codes/scales word layouts per store_f16's law.
+strata_vk_kernel(store_q8 SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels COMP store_q8.comp LAUNCHER src/poly/kernels/store_q8_vk.cpp)
+
 # Task 2.19: poly likeliest (the sampler argmax; one workgroup of 1024 like the CUDA <<<1,1024>>>).
 strata_vk_kernel(likeliest SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels COMP likeliest.comp LAUNCHER src/poly/kernels/likeliest_vk.cpp)
 
@@ -371,7 +376,7 @@ target_link_libraries(strata_vk_kernel_attend PUBLIC strata_vk_runtime strata_vk
 # arg), plus three .comp arms (group/ungroup one file with -DUNGROUP, softmax-block, scale).
 # The kq8/vq8 and dim-64 flash arms are covered the way attend_vk.cpp traps: by name, here.
 set(_ab_spvs "")
-foreach(_n group group_ungroup softmax scale)
+foreach(_n group group_ungroup softmax scale dequant)
   if(_n STREQUAL "group")
     set(_comp attend_batch_group.comp)
     set(_def "-DUNGROUP=0")
@@ -382,7 +387,11 @@ foreach(_n group group_ungroup softmax scale)
     set(_comp attend_batch_softmax.comp)
     set(_def "")
   else()
-    set(_comp attend_batch_scale.comp)
+    if(_n STREQUAL "dequant")
+      set(_comp dequant_q8.comp)          # the q8 arm: rows of the q8 cache -> the f16 workspace
+    else()
+      set(_comp attend_batch_scale.comp)
+    endif()
     set(_def "")
   endif()
   set(_spv ${CMAKE_CURRENT_BINARY_DIR}/spv/attend_batch_${_n}.spv)
@@ -683,7 +692,7 @@ add_test(NAME native_mmvq_vk_parity COMMAND native_mmvq_vk_parity --selftest)
 # Task 2.1: unit parity for the model-demanded trio (poly's copy2/rms_norm + the q8_1 quantizer).
 add_executable(poly_kernels_vk_parity src/tests/poly_kernels_vk_parity.cpp)
 target_include_directories(poly_kernels_vk_parity PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
-target_link_libraries(poly_kernels_vk_parity PRIVATE strata_vk_kernel_copy2 strata_vk_kernel_rms_norm strata_vk_kernel_native_quantize_q8_1 strata_vk_kernel_gemv strata_vk_kernel_gemv_bf16 strata_vk_kernel_conv4_silu strata_vk_kernel_elementwise strata_vk_kernel_head_norm_rope strata_vk_kernel_store_f16 strata_vk_kernel_likeliest strata_vk_poly_kernels strata_vk_runtime strata_vk_compat strata_vk_stubs)   # stubs LAST: missing() for the poly trap lib; real launchers already resolved
+target_link_libraries(poly_kernels_vk_parity PRIVATE strata_vk_kernel_copy2 strata_vk_kernel_rms_norm strata_vk_kernel_native_quantize_q8_1 strata_vk_kernel_gemv strata_vk_kernel_gemv_bf16 strata_vk_kernel_conv4_silu strata_vk_kernel_elementwise strata_vk_kernel_head_norm_rope strata_vk_kernel_store_f16 strata_vk_kernel_store_q8 strata_vk_kernel_likeliest strata_vk_poly_kernels strata_vk_runtime strata_vk_compat strata_vk_stubs)   # stubs LAST: missing() for the poly trap lib; real launchers already resolved
 # strata_vk_poly_kernels supplies the host-defined sum_threads() the rms_norm launcher asks for; its
 # traps stay dormant here (the test calls only ported entry points).
 add_test(NAME poly_kernels_vk_parity COMMAND poly_kernels_vk_parity)
@@ -827,7 +836,7 @@ target_link_libraries(omnistrata-gguf-vk PRIVATE
   strata_vk_kernel_copy2 strata_vk_kernel_rms_norm strata_vk_kernel_native_quantize_q8_1
   strata_vk_kernel_native_mmvq
   strata_vk_kernel_gemv strata_vk_kernel_gemv_bf16 strata_vk_kernel_conv4_silu strata_vk_kernel_gdn strata_vk_kernel_elementwise
-  strata_vk_kernel_head_norm_rope strata_vk_kernel_store_f16 strata_vk_kernel_attend strata_vk_kernel_attend_batch strata_vk_kernel_likeliest
+  strata_vk_kernel_head_norm_rope strata_vk_kernel_store_f16 strata_vk_kernel_store_q8 strata_vk_kernel_attend strata_vk_kernel_attend_batch strata_vk_kernel_likeliest
   strata_vk_kernel_bf16_to_f32 strata_vk_kernel_gemm_f32
   strata_vk_poly_kernels strata_vk_core
   ggml-cpu ggml-base

@@ -758,3 +758,29 @@ STRATA_VK_BATCH=0 eager arm; 735-tok long gate generated ids '271,248068,271,248
 NOTE: git diff main..HEAD -- src include is NOT empty by itself: a concurrent session's rename
 commit dd4a161 (omnistrata) moved src/ targets; this pass touched ONLY files under vulkan/
 (git diff bdbb0fd..HEAD --stat -- src include == 0).
+
+## q8_0 KV cache — the 64K-context unlock (in progress, 2026-10-27)
+
+Why: law 11 — f16 KV at 64K (2.56 GiB) does not fit this box's pinned budget; q8_0 halves KV
+(544 B a row on qwen35moe: 256 codes + 16 scale-bytes per token). The engine's --kv q8_0 path
+exists upstream (src/poly/qwen35.cpp:353-360, the same caches CUDA's kvq8 correctness arm runs);
+the Vulkan port now carries its write and its prefill-read arm:
+
+* `store_q8` (vulkan/src/poly/kernels/store_q8.comp + store_q8_vk.cpp) — **ported, parity GREEN**:
+  4 checks in poly_kernels_vk_parity (codes + scales byte-exact vs the CUDA body over random
+  +-60000 inputs, the window's rows-before-pos untouched, and a positive ties-to-EVEN arm:
+  rintf(2.5)=2, rintf(3.5)=4 — GLSL round() would give 3). Laws honored: q8_rint mirrors CUDA's
+  ties-to-even (NOT GLSL round()); the scale is f16_rn_bits(amax/127); the explicit 1/d the CUDA
+  body computes; codes as 8 little-endian-4 uint words and scales two-f16-a-word (glslc's no-byte-
+  array law, store_f16's layout). n/32 EVEN is a launcher throw (qwen35moe 256 = nb 8 holds).
+* `attend_batch` q8 arm (dequant_q8.comp + the workspace launches in attend_batch_vk.cpp) —
+  **wired, building, ctest 14/14; the model-level gate has NOT run yet** (a live serve owns the
+  box). CUDA-faithful (kernels.cu:2587-2630): work_rows cap on the key block, per-block
+  dequantization of m rows into kwork/vwork, the fp16 GEMMs unchanged; 1D-grid flattening per
+  the runtime law; pairs written by even lanes (no word RMW race). A parity case for the arm is
+  the next step (run_batch gains a q8 variant: same order reference, f16-rounded codes as input).
+* `store_q8_at` + `attend`'s fused q8 read (decode path: attn_score_reg/attn_values template
+  arms) — still traps by name; decode q8 needs the fused arms (bigger job: attend_score.comp
+  N/STEPS variants take Q8 as a template parameter). The chain so far: prompt path.
+cublasGemmStridedBatchedEx's cache stride arg is int (ld=width: 512 values qwen35moe), so the
+64K row count is fine, but at 131072 rows the byte offsets pass int32 — check before 128K.

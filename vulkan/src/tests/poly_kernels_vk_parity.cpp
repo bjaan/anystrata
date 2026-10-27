@@ -796,6 +796,61 @@ int main() {
         check(untouched, "store_f16 leaves the rows before pos alone");
     }
 
+    // ---- q8_0 KV: store_q8 — BITWISE expected vs the CUDA body (kernels.cu:531): per 32-value
+    //      block amax over fabsf, d = amax/127f (host SSE: correctly rounded, like CUDA's), id =
+    //      d>0 ? 1/d : 0, code = clamp(rintf(x*id), -127, 127) — rintf ties to EVEN, which the
+    //      tie block below pins (GLSL round() would tie away). Scale word f16_rn_bits(d); codes
+    //      little-endian 4 a uint word (the layout store_f16.comp records).
+    {
+        const int n = 256, rows = 6; const int64_t pos = 11;   // n/32 = 8 blocks a row (even)
+        std::vector<float> x((size_t)n * rows);
+        std::mt19937 rng(908); std::uniform_real_distribution<float> u(-60000.f, 60000.f);
+        for (auto& v : x) v = u(rng);
+        // block 0 of row 0: the WHOLE block in tie range (amax 127 -> d = 1, id = 1): exact
+        // ties 2.5 -> 2, 3.5 -> 4, -2.5 -> -2, -3.5 -> -4 under rintf; round() would give +-3.
+        for (int j = 0; j < 32; ++j) x[j] = 0.f;
+        x[0] = 127.f; x[1] = 2.5f; x[2] = 3.5f; x[3] = -2.5f; x[4] = -3.5f;
+        const size_t nb = (size_t)(n >> 5);
+        std::vector<int8_t> codes((size_t)(pos + rows) * n, (int8_t)0x5A);
+        std::vector<uint16_t> scales((size_t)(pos + rows) * nb, 0xA5A5);
+        const uint64_t ax = a.alloc(x.size() * 4);
+        const uint64_t ac = a.alloc(codes.size()), as = a.alloc(scales.size() * 2);
+        vk::copy_h2d((void*)ax, x.data(), x.size() * 4, nullptr);
+        vk::copy_h2d((void*)ac, codes.data(), codes.size(), nullptr);
+        vk::copy_h2d((void*)as, scales.data(), scales.size() * 2, nullptr);
+        poly::store_q8((const float*)strata_vk_compat::wrap(ax), (int8_t*)strata_vk_compat::wrap(ac),
+                       (uint16_t*)strata_vk_compat::wrap(as), n, pos, rows, nullptr);
+        std::vector<int8_t> gc(codes.size(), 0); std::vector<uint16_t> gs(scales.size(), 0);
+        vk::copy_d2h(gc.data(), (void*)ac, gc.size(), nullptr);
+        vk::copy_d2h(gs.data(), (void*)as, gs.size() * 2, nullptr);
+        size_t bad_c = 0, bad_s = 0;
+        for (int r = 0; r < rows; ++r)
+            for (size_t b = 0; b < nb; ++b) {
+                const float* xr = &x[(size_t)r * n + b * 32];
+                float amax = 0.f;
+                for (int j = 0; j < 32; ++j) amax = std::fmax(amax, std::fabs(xr[j]));
+                const float d = amax / 127.0f;
+                const float id = d > 0.f ? 1.0f / d : 0.0f;
+                if (gs[(size_t)(pos + r) * nb + b] != f32_to_f16(d)) bad_s++;
+                for (int j = 0; j < 32; ++j) {
+                    float q = std::rintf(xr[j] * id);
+                    q = std::fmin(std::fmax(q, -127.0f), 127.0f);
+                    if (gc[(size_t)(pos + r) * n + b * 32 + j] != (int8_t)q) bad_c++;
+                }
+            }
+        check(bad_c == 0, "store_q8 codes byte-exact vs the CUDA body (rint ties-to-even)");
+        check(bad_s == 0, "store_q8 scales byte-exact f16(d)");
+        // the ties arm, asserted positively: a ties-away round() would show +-3 here
+        check(gc[(size_t)pos * n + 1] == 2 && gc[(size_t)pos * n + 2] == 4 &&
+              gc[(size_t)pos * n + 3] == (int8_t)-2 && gc[(size_t)pos * n + 4] == (int8_t)-4,
+              "store_q8 rint ties: 2.5->2 3.5->4 -2.5->-2 -3.5->-4");
+        // outside the window: the prior bytes hold (codes before pos*n, scales before pos*nb)
+        bool keep = true;
+        for (size_t i = 0; i < (size_t)pos * n && keep; ++i) if (gc[i] != (int8_t)0x5A) keep = false;
+        for (size_t i = 0; i < (size_t)pos * nb && keep; ++i) if (gs[i] != 0xA5A5) keep = false;
+        check(keep, "store_q8 leaves the rows before pos alone");
+    }
+
     // ---- Task 2.19: likeliest — the CUDA body (kernels.cu:1827) transcribed exactly: the
     //      strided max/sum partitions of a 1024-thread block, the xor trees 16..1, the in-order
     //      part[0..31] folds. TOKEN is an integer: equality expected (first index of the max,

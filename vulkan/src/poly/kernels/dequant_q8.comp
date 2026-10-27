@@ -1,0 +1,74 @@
+// vulkan/src/poly/kernels/dequant_q8.comp - rows of a q8_0 KV cache dequantized into the fp16
+// workspace the batched attention products read (the attend_batch q8 arm; the CUDA body is
+// src/poly/kernels.cu:2555 dequant_q8_kernel, launched per key-block at 2627-2630).
+//
+// The runtime dispatches 1D grids only (vk_runtime's law): one workgroup = one unit of the
+// CUDA dim3(grid(width,256), m) flattened as gb = row * gx + chunk (r = gb / gx, x-chunk =
+// gb % gx) so every thread of a workgroup shares its row, like blockIdx.y.
+//   d    = half2float(scales[r * (width/32) + i/32])         (r = row, the CUDA `row + blockIdx.y`)
+//   out  = float2half((float) codes[r * width + i] * d)      (int8 sign-extend, f32 product)
+// BITWISE target: code*scale as f32 then RN-to-f16 (f16_rn_bits; the CUDA __float2half rule),
+// NOT packHalf2x16 (law 1 truncates). The layout mirrors store_q8's words: codes little-endian
+// 4 a uint word, scales two f16 a word (low, high). The launcher offsets codes/scales by the
+// block's first row (`row` from ring math), so this shader indexes 0..m-1 rows.
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer CODES { uint v[]; } bc;
+layout(std430, binding = 1) readonly buffer SCALES { uint v[]; } bs;
+layout(std430, binding = 2) buffer OUT { uint v[]; } bo;   // f16 pairs
+
+// width values a row (n_kv*dim: a multiple of 32 by the engine's law; even by construction),
+// rows m, gx = ceil(width/256) the CUDA grid.x; total workgroups = rows * gx.
+layout(push_constant) uniform PC { uint width; uint rows; uint gx; } pc;
+
+uint f16_rn_bits(float f) {
+    const uint b = floatBitsToUint(f);
+    const uint sign = (b >> 16u) & 0x8000u;
+    int exp = int((b >> 23u) & 0xFFu) - 127 + 15;
+    uint man = b & 0x7FFFFFu;
+    if (exp >= 31) return sign | 0x7C00u;
+    if (exp <= 0) {
+        man |= 0x800000u;
+        const uint sh = uint(1 - exp) + 13u;
+        uint h = (sh >= 32u) ? 0u : (man >> sh);
+        const uint rem = (sh >= 32u) ? 0u : (man & ((1u << sh) - 1u));
+        if (sh < 32u && (rem > (1u << (sh - 1u)) || (rem == (1u << (sh - 1u)) && (h & 1u) != 0u))) h++;
+        return sign | h;
+    }
+    uint hman = man >> 13u; uint rem = man & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (hman & 1u) != 0u)) { hman++; if (hman == 0x400u) { hman = 0u; exp++; if (exp >= 31) return sign | 0x7C00u; } }
+    return sign | (uint(exp) << 10u) | hman;
+}
+
+float f16_to_f32_bits(uint h) { return unpackHalf2x16(h & 0xFFFFu).x; }   // unpack reads exactly: no truncation involved
+
+uint code_at(uint word, uint lane) {          // signed byte lane -> sign-extended int
+    const uint b = (word >> (8u * lane)) & 0xFFu;
+    return b | ((b & 0x80u) != 0u ? 0xFFFFFF00u : 0u);
+}
+
+void main() {
+    const uint gb = gl_WorkGroupID.x;
+    const uint r = gb / pc.gx;                       // the CUDA blockIdx.y (row)
+    const uint i = (gb - r * pc.gx) * 256u + gl_LocalInvocationID.x;   // the CUDA blockIdx.x*256+tid
+    if (i >= pc.width || r >= pc.rows) return;
+    const uint word = bc.v[r * (pc.width / 4u) + (i >> 2u)];
+    const uint sw = bs.v[r * (pc.width / 32u) / 2u + (i >> 6u)];      // scale word: blocks 2b, 2b+1
+    const uint sbits = ((i >> 5u) & 1u) == 0u ? (sw & 0xFFFFu) : (sw >> 16u);
+    const float d = f16_to_f32_bits(sbits);
+    const float q = float(int(code_at(word, i & 3u))) * d;
+    const uint h = f16_rn_bits(q);
+    // two adjacent values share a word: lane (i&1). A plain per-thread read-modify-write of the
+    // output word races between the pair; instead even i writes the whole word (reads its odd
+    // neighbour itself) and odd threads sit out.
+    if ((i & 1u) == 0u) {
+        const uint word1 = bc.v[r * (pc.width / 4u) + ((i + 1u) >> 2u)];
+        const uint sw1 = bs.v[r * (pc.width / 32u) / 2u + ((i + 1u) >> 6u)];
+        const uint sbits1 = (((i + 1u) >> 5u) & 1u) == 0u ? (sw1 & 0xFFFFu) : (sw1 >> 16u);
+        const float d1 = f16_to_f32_bits(sbits1);
+        const uint h1 = f16_rn_bits(float(int(code_at(word1, (i + 1u) & 3u))) * d1);
+        bo.v[r * (pc.width / 2u) + (i >> 1u)] = h | (h1 << 16u);
+    }
+}

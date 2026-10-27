@@ -1,0 +1,95 @@
+// vulkan/src/poly/kernels/store_q8.comp - the q8_0 KV write (the poly engine's quantized cache).
+//
+// The translation of src/poly/kernels.cu store_q8_kernel (531-550) and store_q8_at_kernel
+// (553-573): one 32-value block: amax over fabs, d = amax/127 (stored f16), id = d>0 ? 1/d : 0,
+// code = clamp(rint(x*id), -127, 127). CUDA rintf is TIES-TO-EVEN — GLSL round() is ties-away
+// (quantize_q8_1.comp's finding), so q8_rint implements the even rule explicitly.
+//
+// Layout law (as in store_f16.comp): glslc rejects byte/half arrays in std430, so
+//   - codes live as uint words: a block's 32 int8 codes are words blk*8..blk*8+7, little-endian
+//     lanes (word j holds values j*4..j*4+3 — the int8_t* order CUDA writes);
+//   - scales live as uint words, two consecutive f16 (low, high) — the half* order.
+// One thread writes TWO blocks (a whole scale word: no cross-thread word race) and the launcher
+// requires nb = n/32 EVEN (true for every q8-capable model: qwen35moe n_kv*head_dim = 256,
+// nb = 8): with nb even, blocks 2k and 2k+1 of the flat (row, blk) order always share a row and
+// their cache scale slots are adjacent, exactly one word.
+//
+// mode split (the two CUDA wrappers make the same split):
+//   ring < 0  : positional — the launcher baked (cache + pos*n, scales + pos*nb) into the
+//               bindings, row = flat row index r.
+//   ring >= 0 : at — the target cache row comes from the device cell bat.v[0]:
+//               row = ring > 0 ? (at + r) % ring : at + r   (the engine passes ring 0 for the
+//               no-modulo recorder arm, exactly like store_q8_at(..., ring)).
+// A ring wrap that maps two source rows to the same cache row races the same cells CUDA races;
+// the launcher documents it and never sees it in practice (rows <= context).
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer X { float v[]; } bx;
+layout(std430, binding = 1) buffer CODES { uint v[]; } bc;
+layout(std430, binding = 2) buffer SCALES { uint v[]; } bs;
+layout(std430, binding = 3) readonly buffer AT { uint v[]; } bat;      // unused here: descriptor-shape parity with the launcher
+
+// n values a row, nb blocks a row, pairs = rows*nb/2 threads. ring is -1 (positional) by launcher law.
+layout(push_constant) uniform PC { uint n; uint nb; uint pairs; int ring; } pc;
+
+uint f16_rn_bits(float f) {
+    const uint b = floatBitsToUint(f);
+    const uint sign = (b >> 16u) & 0x8000u;
+    int exp = int((b >> 23u) & 0xFFu) - 127 + 15;
+    uint man = b & 0x7FFFFFu;
+    if (exp >= 31) return sign | 0x7C00u;                 // overflow -> infinity
+    if (exp <= 0) {                                       // subnormal/underflow: shift-and-round
+        man |= 0x800000u;
+        const uint sh = uint(1 - exp) + 13u;
+        uint h = (sh >= 32u) ? 0u : (man >> sh);
+        const uint rem = (sh >= 32u) ? 0u : (man & ((1u << sh) - 1u));
+        if (sh < 32u && (rem > (1u << (sh - 1u)) || (rem == (1u << (sh - 1u)) && (h & 1u) != 0u))) h++;
+        return sign | h;
+    }
+    uint hman = man >> 13u; uint rem = man & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (hman & 1u) != 0u)) { hman++; if (hman == 0x400u) { hman = 0u; exp++; if (exp >= 31) return sign | 0x7C00u; } }
+    return sign | (uint(exp) << 10u) | hman;
+}
+
+// CUDA rintf: round to nearest, ties to even, on the whole range we meet (|v| < 2^31).
+float q8_rint(float v) {
+    const float fl = floor(v);
+    const float fr = v - fl;
+    if (fr > 0.5) return fl + 1.0;
+    if (fr < 0.5) return fl;
+    // exact tie: choose the even of {fl, fl+1}
+    return (fract(fl * 0.5) == 0.0) ? fl : fl + 1.0;
+}
+
+// Quantize one 32-value block (xoff = first value's float index, cw = first codes word).
+uint qblock(uint xoff, uint cw) {
+    float amax = 0.0;
+    for (int j = 0; j < 32; ++j) amax = max(amax, abs(bx.v[xoff + uint(j)]));
+    const float d = amax / 127.0;
+    const float id = d > 0.0 ? 1.0 / d : 0.0;
+    for (int w = 0; w < 8; ++w) {
+        uint word = 0u;
+        for (int j = 0; j < 4; ++j) {
+            const float q = min(max(q8_rint(bx.v[xoff + uint(w * 4 + j)] * id), -127.0), 127.0);
+            word |= (uint(int(q)) & 0xFFu) << (8u * uint(j));
+        }
+        bc.v[cw + uint(w)] = word;
+    }
+    return f16_rn_bits(d);
+}
+
+void main() {
+    const uint pair = gl_GlobalInvocationID.x;
+    if (pair >= pc.pairs) return;
+    const uint nb = pc.nb, n = pc.n;
+    const uint s0 = 2u * pair, s1 = 2u * pair + 1u;      // flat block indices
+    const uint r0 = s0 / nb, b0 = s0 - r0 * nb;
+    const uint r1 = s1 / nb, b1 = s1 - r1 * nb;          // nb even: r1 == r0 (launcher's law)
+
+    const uint lo = qblock(r0 * n + b0 * 32u, r0 * (n / 4u) + b0 * 8u);
+    const uint hi = qblock(r1 * n + b1 * 32u, r1 * (n / 4u) + b1 * 8u);
+    // the scale word: consecutive cache slots (nb even: r1 == r0, b1 == b0+1)
+    bs.v[pair] = lo | (hi << 16u);
+}
