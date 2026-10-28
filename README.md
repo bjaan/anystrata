@@ -265,6 +265,8 @@ no CUDA, no ROCm)** with Qwen3.6-35B-A3B GSQ-hybrid 2-bit, 10,240/10,240 experts
 | prefill (735 / 4,954 token prompts) | 32 / 50 tok/s (5.5x after the GPU tiled GEMM; tuning continues) |
 | `pi` coding agent (1.6K-token system prompt) | served repeatedly: 52 s round trip, KV reuse, grammar parse |
 | parity vs the CUDA tree | ~50,000 outputs bitwise; runtime driver laws per GPU, measured |
+| context on the APU | 16K / 32K stable (14.1 / 13.9 GB resident); 64K needs `--kv q8_0` (store + prefill-read ported, the decode read traps by name) — PORT-NOTES laws 10-11 |
+| correctness gate (teacher-forced vs llama.cpp at the pin, 1,678 steps) | step-weighted KL 1.39x llama.cpp's own CPU-vs-GPU floor (bar: 1.5x); argmax agrees at every gap>=0.5-nat position but one near tie; draft arm bitwise-inert — table in `vulkan/PORT-STATUS.md` |
 
 (llama.cpp's own Vulkan backend on the same card and model: ~76 tok/s decode — the ceiling this backend climbs
 toward while keeping Strata's expert-cache design, which is what lets a 12 GB model sit entirely inside
