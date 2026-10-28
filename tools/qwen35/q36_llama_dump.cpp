@@ -114,6 +114,10 @@ int main(int argc, char** argv) {
     const int nctx = cx ? std::atoi(cx) : 4096;
     cp.n_ctx = nctx;
     cp.n_batch = nctx;
+    // STRATA_DUMP_NO_OP_OFFLOAD=1: keep host-assigned ops on the CPU (the Vulkan backend on this
+    // APU has no kernel for the fused-HC/graph host op; with op_offload the graph builder aborts
+    // on it: "output that is a host tensor without backend"). Laws 10-11, PORT-NOTES.
+    if (const char* eo = std::getenv("STRATA_DUMP_NO_OP_OFFLOAD"); eo && eo[0] == '1') cp.op_offload = false;
     // STRATA_DUMP_UBATCH: the micro-batch (default: the context, capped at 4096). A 32K prompt as one micro-batch
     // needs a 35 GB compute buffer (UD-Q3_K_M on a 48 GB card, 2026-10-18); the prompt is then read in pieces of
     // this size, which changes nothing but the compute buffer and which rows share an MMQ tile.
