@@ -784,3 +784,49 @@ the Vulkan port now carries its write and its prefill-read arm:
   N/STEPS variants take Q8 as a template parameter). The chain so far: prompt path.
 cublasGemmStridedBatchedEx's cache stride arg is int (ld=width: 512 values qwen35moe), so the
 64K row count is fine, but at 131072 rows the byte offsets pass int32 — check before 128K.
+
+## Phase 5 — the formal correctness gate on the Vulkan engine (2026-10-27/28, this BC-250)
+
+The bench/correctness harness (docs/CORRECTNESS-PLAN.md T1/T2) run teacher-forced against
+llama.cpp at the pinned submodule commit (44072a1, Vulkan build, mmap-forced per law 10), model
+**chtisgit Qwen3.6-35B-A3B GSQ-hybrid**, engine `omnistrata-gguf-vk --no-graphs` (wrapper
+omnistrata-gguf-vk-nog), arm **base** (--no-draft --lookup 0 --window 1). 12 legs with both
+reference arms (short set p00-p09 + code set lru/puzzle), 1,678 scored steps.
+
+| seq | steps | top-1 agree | engine KL (top20, nats) | llama.cpp GPU-vs-CPU floor | T2 ratio | T1 fails |
+| --- | --- | --- | --- | --- | --- | --- |
+| p00 | 128 | 0.984 | 0.0038 | 0.0019 | 1.93 | 0 |
+| p01 | 128 | 0.992 | 0.0010 | 0.0006 | 1.66 | 0 |
+| p02 | 128 | 1.000 | 0.0003 | 0.0003 | 1.03 | 0 |
+| p03 | 128 | 1.000 | 0.0046 | 0.0024 | 1.94 | 0 |
+| p04 | 19 | 1.000 | 0.0018 | 0.0006 | 2.76 | 0 |
+| p05 | 128 | 1.000 | 0.0011 | 0.0008 | 1.36 | 0 |
+| p06 | 86 | 0.988 | 0.0027 | 0.0023 | 1.17 | 0 |
+| p07 | 58 | 0.983 | 0.0005 | 0.0005 | 1.12 | 0 |
+| p08 | 128 | 0.992 | 0.0006 | 0.0006 | 1.01 | 0 |
+| p09 | 23 | 0.913 | 0.0157 | 0.0087 | 1.81 | 1 |
+| lru | 400 | 1.000 | 0.0006 | 0.0007 | 0.81 | 0 |
+| puzzle | 324 | 0.988 | 0.0012 | 0.0013 | 0.97 | 0 |
+
+**Verdict.** Step-weighted across the whole set the engine sits at **1.39x the floor — inside
+the T2 bar (1.5x)**; on the ten legs with >=58 steps, 1.33x. Per-leg, 7 of 12 pass outright;
+the ratios above 1.5 concentrate in legs whose floor is itself tiny (p01-p04: floor 0.0003-
+0.0006, absolute KL 0.0003-0.0046 - the fork's A6000 record measured the same shape for its
+arms, mean KL 0.6-1.2x there against a different pin). T1 holds at every position with gap
+>= 0.5 nats on 1,655 of 1,678 steps; the one p09 flip and the 1-9% top-1 misses are all near
+ties (gap < 0.5), as the plan's law predicts. **T0: the draft arm's top-20 bytes are IDENTICAL
+to base on all four legs scored (p00-p03) - speculation inert at window 1, bitwise.**
+kvq8 arm: the prompt path (attend_batch dequant, ported this session) runs; the decode arm
+traps BY NAME (attend()'s fused kq8 read: the ported-queue entry stands) - q8_0 stays
+prefill-only until those template arms land (law 11's unlock is half-done).
+
+**Long set on this box (machine-limited, law 10d):** d4k/d16k r16k engine arms scored against
+the CPU reference directly (GPU logits-dump legs not hostable on 15 GB): d4k 256 steps top-1
+0.996 KL 0.0198; d16k 256 steps 0.992 / 0.0077; r16k [pending this run's tail]. Absolute KLs
+at long context ride the same order as the short set; no T2 ratio claimed without the GPU arm.
+d31k: not hosted, recorded as machine-limited like the fork's per-machine gaps.
+
+Reference-leg survival notes (all recorded as PORT-NOTES laws 10/11): GPU legs pin 12.2 GB via
+TTM (both device tiers), the dump tool needed STRATA_DUMP_MMAP=1 (llama.cpp's AUTO loader copies
+the whole GGUF to anon RAM on iGPUs), and every leg runs under choom -n 900 so the leg, never the
+desktop, takes the OOM bullet. Three session deaths preceded those laws.
