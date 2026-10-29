@@ -258,3 +258,18 @@ reach them (they are in the .cu files, which stay uncompiled); dim3/vector types
    copy sites route through strata::vk::copy_h2d/copy_d2h DIRECTLY (poly copy2 launcher), not
    only the compat strata_memcpy: capture-awareness must live at BOTH levels or the capture body
    drains mid-record (flush_wait-in-capture abort, which is the LOUD refusal working).
+
+13. **The BC-250's RADV DOES export a combined memory type — the arena can be host-mapped
+   (measured 2026-10-29).** The banner's `uma=1` comes from memoryTypes[3]/[4]:
+   DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT inside the DEVICE_LOCAL heap (heap 1) — the
+   probe-side check vk_device.cpp already uses finds them, but the arena's own
+   mem_type(DEVICE_LOCAL) request landed on the PURE type 0 (first match). Asking for the
+   combined flags maps every arena piece: the whole load path's uploads become plain
+   memcpys into GPU-visible memory (31,336 direct / 0 staged on the hybrid; the old lane did
+   memcpy→stage + transfer submit + per-copy queue wait, one DRAM pass and one submit each).
+   48-token canary: mapped vs staged lanes BITWISE IDENTICAL. Rules: pieces map only if the
+   type they ACTUALLY got is HOST_VISIBLE|HOST_COHERENT (mem_type's fallback may pick pure
+   DEVICE_LOCAL: record chosen_type and map by that); ordering stays the eager law (copies
+   still flush_wait FIRST — the win is the removed stage, not relaxed syncs); STRATA_VK_NO_MAP_ARENA=1
+   A/Bs it. Do NOT confuse with heap 0 (5.1 GiB, flags "None"): that is the system heap and
+   law 10's pinning problem lives there.

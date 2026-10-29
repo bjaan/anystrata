@@ -893,3 +893,17 @@ helpers re-locking g_m under their callers self-DEADLOCKED (lock law: callers ho
 the leaf); (c) engine.cpp's copy2 host-pair classification already routes the router readback
 through copy_d2h — the capture branch had to be in copy_h2d/copy_d2h, not only in the compat
 strata_memcpy (a compat-only fix leaves the poly launcher path eager-draining mid-capture).
+
+
+## UMA load-path collapse: the host-mapped arena (2026-10-29)
+
+The histogram of the hybrid bring-up (STRATA_VK_FLUSH_WHY): 30,720 x 288 KiB staged h2d copies
++ every eager drain. RADV exports DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT (types 3/4 in the
+device-local heap — the banner's uma=1), so arena pieces now ALLOCATE+MAP host-visible and
+copy_h2d/d2h/fill_d take a direct memcpy lane inside a mapped piece (31,336 direct / 0 staged).
+Verified: full ctest 15/15; hybrid canary 48 ids BITWISE IDENTICAL mapped vs
+STRATA_VK_NO_MAP_ARENA=1; load wall ~30-35 s either way — the SSD->page-cache read dominates
+on a warm box (a 300 s gap between runs evicted page cache re-shows it), the removed stage is
+pure GPU-copy traffic + ~31k submits saved; the benefit concentrates on expert SWAP-INS at
+capacity (the regime the 64K/fp16-arena squeeze creates, and Flash-Next-class models on this
+box): each swap-in skips one full DRAM round trip. Laws: PORT-NOTES 13.

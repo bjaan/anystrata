@@ -41,11 +41,20 @@ std::mutex& g_km();
 
 namespace {
 
-struct Piece { uint64_t base; uint64_t size; VkBuffer buf; VkDeviceMemory mem; };
+// `map` != null: the piece's memory is HOST_VISIBLE|HOST_COHERENT as well as DEVICE_LOCAL
+// (this RADV exports exactly such a type in the device-local heap: gfx1013 type 7, flags
+// 0xC1). The UMA collapse of the load path: an expert upload into a mapped piece is a plain
+// memcpy - no staging buffer, no transfer command, no submit - one whole memory pass fewer.
+// (Ordering kept honest the same way: copy_* still drain pending work first; the win is the
+// removed stage+copy, not a relaxed sync.)
+struct Piece { uint64_t base; uint64_t size; VkBuffer buf; VkDeviceMemory mem; void* map; };
 std::vector<Piece> g_pieces;
 uint64_t g_cursor = 0;
 std::mutex g_m;
 
+// find a type with ALL of `want`; caller may pass DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT and
+// fall back to plain DEVICE_LOCAL (never the reverse: host-visible WITHOUT device-local would
+// put the arena in the system heap and re-make the pinning problem law 10 is about).
 uint32_t mem_type(uint32_t bits, VkMemoryPropertyFlags want) {
     VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties((VkPhysicalDevice)vk_physical_handle(), &mp);
@@ -56,6 +65,24 @@ uint32_t mem_type(uint32_t bits, VkMemoryPropertyFlags want) {
     throw std::runtime_error("vk_runtime: no usable memory type");
 }
 
+#include <atomic>
+// lane counters (STRATA_VK_FLUSH_WHY=1 prints them at exit): direct = mapped-piece memcpy,
+// staged = the old stage+submit path.
+static std::atomic<long long> g_lane_direct{0}, g_lane_staged{0};
+static struct LaneDump { ~LaneDump() {
+    if (g_lane_direct || g_lane_staged)
+        std::fprintf(stderr, "strata-vk: copy_h2d lanes: mapped-direct=%lld staged=%lld\n",
+                     (long long)g_lane_direct, (long long)g_lane_staged); } } g_lane_dump;
+// the UMA fast lane: host bytes for a span that lies wholly inside ONE mapped piece, else null.
+// Only legal when the GPU is known idle for that span (the eager copy paths flush_wait FIRST,
+// which drains kernels AND graph replays: after that, nothing races the bytes, and coherent
+// mapped memory makes every earlier GPU write visible to the CPU and vice versa).
+void* piece_direct(uint64_t off, uint64_t bytes) {
+    for (auto& p : g_pieces)
+        if (p.map && off >= p.base && off + bytes <= p.base + p.size)
+            return (char*)p.map + (off - p.base);
+    return nullptr;
+}
 VkBuffer piece_of(uint64_t off, uint64_t bytes, uint64_t& piece_off) {
     for (auto& p : g_pieces)
         if (off >= p.base && off + bytes <= p.base + p.size) { piece_off = off - p.base; return p.buf; }
@@ -120,6 +147,7 @@ uint64_t arena_add(uint64_t bytes) {   // returns the base the region was PLACED
         // max_allocation_size (env-overridable; the probe pins 512 MiB) stays the cap.
         uint64_t sz = bytes > max_alloc ? max_alloc : bytes;
         VkBuffer buf = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE;
+        uint32_t chosen_type = 0xFFFFFFFFu;   // the type the allocation ACTUALLY got
         for (;;) {
             VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
             bci.size = sz;
@@ -132,14 +160,35 @@ uint64_t arena_add(uint64_t bytes) {   // returns the base the region was PLACED
             VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev, buf, &mr);
             VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
             mai.allocationSize = mr.size;
-            mai.memoryTypeIndex = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            if (vkAllocateMemory(dev, &mai, nullptr, &mem) == VK_SUCCESS) break;
+            static const bool want_map = getenv("STRATA_VK_NO_MAP_ARENA") == nullptr;
+            // the file's mem_type() falls back to DEVICE_LOCAL when the combined ask has no type,
+            // but that fallback would silently land pieces in ANY device-local type: fine -
+            // map_piece() below only maps what is actually host-visible.
+            mai.memoryTypeIndex = mem_type(mr.memoryTypeBits, want_map
+                ? (VkMemoryPropertyFlags)(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+                : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (vkAllocateMemory(dev, &mai, nullptr, &mem) == VK_SUCCESS) { chosen_type = mai.memoryTypeIndex; break; }
             vkDestroyBuffer(dev, buf, nullptr); buf = VK_NULL_HANDLE;
             if (sz < (32ull << 20)) throw std::runtime_error("vkAllocateMemory -> out of memory: arena piece exhausted halving");
             sz /= 2;
         }
         RT(vkBindBufferMemory(dev, buf, mem, 0));
-        Piece p; p.base = g_cursor; p.size = sz; p.buf = buf; p.mem = mem;
+        Piece p; p.base = g_cursor; p.size = sz; p.buf = buf; p.mem = mem; p.map = nullptr;
+        // map only if the type the allocation ACTUALLY got is host-visible (mem_type's
+        // fallback may have chosen a pure DEVICE_LOCAL one): vkGetBufferDeviceAddress-free
+        // introspection through the memory requirements' type bits.
+        {
+            VkPhysicalDeviceMemoryProperties mp;
+            vkGetPhysicalDeviceMemoryProperties((VkPhysicalDevice)vk_physical_handle(), &mp);
+            const VkMemoryPropertyFlags f = chosen_type < mp.memoryTypeCount
+                ? mp.memoryTypes[chosen_type].propertyFlags : 0;
+            const VkMemoryPropertyFlags need =
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            if ((f & need) == need && vkMapMemory(dev, mem, 0, VK_WHOLE_SIZE, 0, &p.map) != VK_SUCCESS)
+                p.map = nullptr;
+        }
         g_pieces.push_back(p);
         g_cursor += sz;
         bytes -= sz;
@@ -645,6 +694,12 @@ void copy_h2d(void* dst, const void* src, uint64_t bytes, void*) {
         graph_record_h2d((uint64_t)(uintptr_t)dst, src, bytes); return; }   // a captured memcpy node
     flush_wait_why("copy_h2d"); flush_wait();   // eager-copy rule: never let a stage write race a recorded stage copy
     uint64_t at = (uint64_t)(uintptr_t)dst, off = 0;
+    // UMA fast lane: a span inside one MAPPED piece needs no stage and no transfer - the
+    // flush_wait above already drained every kernel/graph that could touch the bytes, and
+    // HOST_COHERENT makes the write GPU-visible. This deletes one full DRAM round trip per
+    // upload (the GSQ-hybrid load: 30,720 x 288 KiB staged copies measured 2026-10-29).
+    if (void* d = piece_direct(at, bytes)) { std::memcpy(d, src, bytes); g_lane_direct++; return; }
+    g_lane_staged++;
     while (off < bytes) {
         uint64_t n = bytes - off < (2ull << 20) ? bytes - off : (2ull << 20);
         if (uint64_t room = piece_room(at + off)) { if (n > room) n = room; }
@@ -659,6 +714,10 @@ void copy_d2h(void* dst, const void* src, uint64_t bytes, void*) {
     if (capturing()) { std::lock_guard<std::mutex> plk(g_pm);
         graph_record_d2h((uint64_t)(uintptr_t)src, dst, bytes); return; }   // a captured memcpy node
     flush_wait_why("copy_d2h"); flush_wait();   // the d2h result is what the sampler needs: right sync point
+    {   // UMA fast lane (mirror of copy_h2d): read the mapped piece straight out
+        uint64_t at0 = (uint64_t)(uintptr_t)src;
+        if (void* d = piece_direct(at0, bytes)) { std::memcpy(dst, d, bytes); return; }
+    }
     uint64_t at = (uint64_t)(uintptr_t)src, off = 0;
     while (off < bytes) {
         uint64_t n = bytes - off < (2ull << 20) ? bytes - off : (2ull << 20);
@@ -689,6 +748,10 @@ void fill_d(void* dst, uint8_t byte, uint64_t bytes, void*) {
     }
     std::lock_guard<std::mutex> lk(g_m);
     flush_wait_why("fill_d"); flush_wait();   // eager-copy rule (fill writes the shared stage too)
+    {   // UMA fast lane: memset a span inside one mapped piece
+        uint64_t at0 = (uint64_t)(uintptr_t)dst;
+        if (void* d = piece_direct(at0, bytes)) { std::memset(d, byte, bytes); return; }
+    }
     stage_ensure(1ull << 20);
     const uint64_t chunk = g_stage_size;
     uint64_t off = 0;
