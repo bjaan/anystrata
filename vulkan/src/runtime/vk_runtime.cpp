@@ -66,6 +66,15 @@ VkBuffer piece_of(uint64_t off, uint64_t bytes, uint64_t& piece_off) {
 // clip to this so a span NEVER crosses a piece boundary (Task 1.4: the engine's 512 MiB allocations
 // land as max-allocation piece chains, and a chunk that straddles one used to throw - the region
 // itself is fine; the chunking just has to respect the chain).
+// bytes from `off` to the end of its enclosing piece (0 if none): the honest whole-buffer
+// bound for a launcher that cannot see an allocation's length but knows the engine's
+// allocations never straddle pieces (arena_add's law) — every card-time row index lands below
+// the allocation end, which is at or before the piece end.
+uint64_t piece_tail_at(uint64_t off) {
+    for (auto& p : g_pieces)
+        if (p.base <= off && off < p.base + p.size) return p.base + p.size - off;
+    return 0;
+}
 uint64_t piece_room(uint64_t off) {
     for (auto& p : g_pieces)
         if (off >= p.base && off < p.base + p.size) return p.base + p.size - off;
@@ -279,32 +288,83 @@ void flush_wait_why(const char* why) {
 }
 }  // namespace (the pending-CB helpers above; the graph layer below gets strata::vk linkage)
 // ---------- Phase 4.2: graph capture (the plan's Phase 4; replaces the compat graph traps) ----------
-// A captured graph is ONE pre-recorded command buffer (multi-submit usage) plus the descriptor
-// pool its sets were allocated from (kept alive for the graph's life; never reset). BeginCapture
-// opens it; launches record into it exactly like the pending path but with the OLD barrier law
-// (full-RW after EVERY dispatch - no cluster elision while capturing: bit-safe by construction,
-// the eager pre-4.1 ordering replayed as one submit). Copies/events/fills during capture ABORT
-// loudly (a drain during capture is illegal; a silently skipped copy would replay nothing).
-// EndCapture closes the CB; GraphLaunch submits it (waiting the graph's own previous fence
-// first: CUDA's stream semantics serialize replays, and Vulkan forbids re-submitting a CB that
-// is still executing). Instantiate is the capture close point in the engine's flow (EndCapture
-// then Instantiate then destroy graph): the graph HANDLE carries the CB/pool until instantiate
-// moves it to the exec handle.
-// pools chain: one small pool per 128 sets (a typical layer graph records tens of dispatches);
-// the sets must outlive the CB's record, the CB must stay valid for replays: pools free only at
-// graph destroy. (A big shared pool preallocates descriptors RADV never releases; measured cost
-// would be hundreds of MB across ~1,600 layer graphs.)
+// A captured graph is ONE pre-recorded command buffer (multi-submit usage) plus chained
+// descriptor pools; BeginCapture opens it, launches record into it with the eager per-dispatch
+// full-RW barrier law (bit-safe: the replay's ordering is exactly the eager one), EndCapture
+// closes it, GraphLaunch submits it as one queue op. cudaMemcpy sites inside a capture become
+// in-CB transfer nodes: H2D freezes the host bytes at capture time (CUDA memcpy-node
+// semantics), D2H writes the graph's own mapped staging and is delivered to the host at the
+// next drain of that replay's fence (flush_wait / device_sync / re-launch / destroy) — the
+// engine reads D2H results only past its event/stream syncs, which land exactly there. The
+// engine's replay pass writes token positions OUTSIDE any graph (run()'s eager copy2 of h_at_),
+// so frozen H2D bytes never carry per-token data. A capture-body SYNC (stream_sync/event) is
+// still an illegal wiring: refused loudly.
+// Pools chain at 128 sets (a layer graph records tens of dispatches; ~1,600 layer graphs must
+// not each preallocate RADV descriptor memory).
 constexpr uint32_t kGraphPoolSets = 128;
+struct StageChunk { VkBuffer buf; VkDeviceMemory mem; void* map; uint64_t base; uint64_t size; };
+struct D2HWait { uint64_t stage_at; void* dst; uint64_t bytes; };   // chain address -> host, at drain
 struct GraphObj { VkCommandBuffer cb = VK_NULL_HANDLE; std::vector<VkDescriptorPool> dps;
+                  std::vector<StageChunk> stages; uint64_t stage_cursor = 0;
+                  std::vector<D2HWait> d2h_def;                    // the spec, recorded at capture
+                  std::vector<D2HWait> d2h_run;                    // pendings of the CURRENT replay
+                  VkFence fence = VK_NULL_HANDLE; bool live = false;
                   uint32_t sets_left = 0; uint32_t dispatches = 0; bool open = false; };
 static GraphObj g_cap;
 static std::vector<GraphObj> g_graphs;        // instantiated graphs (exec handles index these)
-static std::vector<VkFence> g_graph_fence;    // one per exec: the LAST replay of that graph
-static std::vector<bool> g_graph_fence_live;
 static bool g_capturing = false;
-uint32_t capture_dispatches() { return g_graphs.size(); }
+void graph_service(GraphObj& g);
+
+void stage_chunk(GraphObj& g, uint64_t need) {
+    VkDevice dev = (VkDevice)vk_handle();
+    uint64_t sz = need < (16ull << 10) ? (16ull << 10) : need;      // 16 KiB minimum chunks
+    StageChunk c{};
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = sz;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    RT(vkCreateBuffer(dev, &bci, nullptr, &c.buf));
+    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev, c.buf, &mr);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = mr.size;
+    mai.memoryTypeIndex = mem_type(mr.memoryTypeBits,
+        (VkMemoryPropertyFlags)(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
+    RT(vkAllocateMemory(dev, &mai, nullptr, &c.mem));
+    RT(vkBindBufferMemory(dev, c.buf, c.mem, 0));
+    RT(vkMapMemory(dev, c.mem, 0, mai.allocationSize, 0, &c.map));
+    c.base = g.stage_cursor; c.size = sz;
+    g.stages.push_back(c);
+}
+// reserve `bytes` contiguous on the staging chain (bump the last chunk, else a new one):
+// returns buffer + chunk offset + host map; the ABSOLUTE chain address (base + off) is what
+// D2H delivery resolves. g_pm held (stages mutate under it).
+void stage_alloc(GraphObj& g, uint64_t bytes, VkBuffer& b, uint64_t& off, void** host) {
+    g.stage_cursor = (g.stage_cursor + 3ull) & ~3ull;
+    if (!g.stages.empty()) {
+        auto& c = g.stages.back();
+        if (g.stage_cursor >= c.base && g.stage_cursor - c.base + bytes <= c.size) {
+            b = c.buf; off = g.stage_cursor - c.base; *host = (char*)c.map + off;
+            g.stage_cursor += bytes; return;
+        }
+    }
+    stage_chunk(g, bytes);
+    auto& c = g.stages.back();
+    g.stage_cursor = c.base;
+    b = c.buf; off = 0; *host = c.map; g.stage_cursor += bytes;
+}
+// the memcpy-node barrier law in miniature: the full-RW barrier after each recorded op matches
+// the eager ordering (a transfer's writes visible to every following node).
+void cap_barrier(VkCommandBuffer cb) {
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                       VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 1, &mb, 0, nullptr, 0, nullptr);
+}
 
 void graph_begin() {
+    std::lock_guard<std::mutex> lk(g_m);      // the file's order: pieces under g_m, g_pm the leaf
     std::lock_guard<std::mutex> plk(g_pm);
     if (g_capturing) throw std::runtime_error("vk_runtime: capture already open");
     pend_flush_locked();                     // prior eager work is submitted first: capture starts clean
@@ -328,57 +388,121 @@ uint32_t graph_end() {   // returns the recorded dispatch count; registers a gra
     std::lock_guard<std::mutex> plk(g_pm);
     if (!g_capturing) throw std::runtime_error("vk_runtime: graph_end with no capture open");
     RT(vkEndCommandBuffer(g_cap.cb));
-    g_graphs.push_back(g_cap);
-    g_graph_fence.push_back(VK_NULL_HANDLE);
-    g_graph_fence_live.push_back(false);
-    const uint32_t d = g_cap.dispatches;
+    g_graphs.push_back(std::move(g_cap));
+    const uint32_t d = g_graphs.back().dispatches;
     g_cap = GraphObj{}; g_capturing = false;
     return d;
 }
 void graph_destroy(uint32_t gi) {
     std::lock_guard<std::mutex> plk(g_pm);
-    if (gi >= g_graphs.size()) return;
+    if (gi >= g_graphs.size() || !g_graphs[gi].cb) return;
     VkDevice dev = (VkDevice)vk_handle();
-    if (g_graph_fence[gi] != VK_NULL_HANDLE) {
-        RT(vkWaitForFences(dev, 1, &g_graph_fence[gi], VK_TRUE, ~0ull));
-        vkDestroyFence(dev, g_graph_fence[gi], nullptr);
-    }
-    for (auto dp : g_graphs[gi].dps) vkDestroyDescriptorPool(dev, dp, nullptr);
-    g_graphs[gi].dps.clear();
-    vkFreeCommandBuffers(dev, g_pool, 1, &g_graphs[gi].cb);
-    g_graphs[gi] = GraphObj{};
+    GraphObj& g = g_graphs[gi];
+    if (g.live) { RT(vkWaitForFences(dev, 1, &g.fence, VK_TRUE, ~0ull)); vkDestroyFence(dev, g.fence, nullptr); g.live = false; }
+    graph_service(g);                         // the last replay's D2H results are still owed
+    for (auto dp : g.dps) vkDestroyDescriptorPool(dev, dp, nullptr);
+    g.dps.clear();
+    for (auto& c : g.stages) { vkUnmapMemory(dev, c.mem); vkDestroyBuffer(dev, c.buf, nullptr); vkFreeMemory(dev, c.mem, nullptr); }
+    g.stages.clear();
+    vkFreeCommandBuffers(dev, g_pool, 1, &g.cb);
+    g.cb = VK_NULL_HANDLE;
 }
 void graph_launch(uint32_t gi) {
     std::lock_guard<std::mutex> plk(g_pm);
     if (!g_capturing && g_pend.cb) pend_flush_locked();   // eager work first: stream order
     if (gi >= g_graphs.size() || !g_graphs[gi].cb) throw std::runtime_error("vk_runtime: graph launch of an unregistered/destroyed graph");
     VkDevice dev = (VkDevice)vk_handle();
+    GraphObj& g = g_graphs[gi];
     // CUDA stream semantics: this replay runs after the graph's previous replay completed.
-    if (g_graph_fence_live[gi]) {
-        RT(vkWaitForFences(dev, 1, &g_graph_fence[gi], VK_TRUE, ~0ull));
-        vkDestroyFence(dev, g_graph_fence[gi], nullptr);
-    }
+    if (g.live) { RT(vkWaitForFences(dev, 1, &g.fence, VK_TRUE, ~0ull)); vkDestroyFence(dev, g.fence, nullptr); }
+    graph_service(g);                          // the previous replay's D2H, if any
+    g.d2h_run = g.d2h_def;                     // arm delivery for THIS replay
     VkFence f; VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     RT(vkCreateFence(dev, &fi, nullptr, &f));
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1; si.pCommandBuffers = &g_graphs[gi].cb;
+    si.commandBufferCount = 1; si.pCommandBuffers = &g.cb;
     RT(vkQueueSubmit((VkQueue)vk_default_queue(), 1, &si, f));
-    g_graph_fence[gi] = f; g_graph_fence_live[gi] = true;
+    g.fence = f; g.live = true;
 }
-void graph_sync_all() {   // device_sync/stream_sync also drain graph fences
-    std::lock_guard<std::mutex> plk(g_pm);
-    VkDevice dev = (VkDevice)vk_handle();
-    for (size_t i = 0; i < g_graph_fence.size(); ++i) if (g_graph_fence_live[i]) {
-        vkWaitForFences(dev, 1, &g_graph_fence[i], VK_TRUE, ~0ull);
-        vkDestroyFence(dev, g_graph_fence[i], nullptr);
-        g_graph_fence[i] = VK_NULL_HANDLE; g_graph_fence_live[i] = false;
-    }
-}
+
+uint64_t piece_tail(uint64_t off) { std::lock_guard<std::mutex> lk(g_m); return piece_tail_at(off); }
 bool capturing() { return g_capturing; }
 uint32_t graph_dispatches(uint32_t gi) { std::lock_guard<std::mutex> plk(g_pm);
     return gi < g_graphs.size() ? g_graphs[gi].dispatches : 0; }
 uint32_t capture_graph_count() { std::lock_guard<std::mutex> plk(g_pm); return (uint32_t)g_graphs.size(); }
+void graph_sync_all() {
+    std::lock_guard<std::mutex> plk(g_pm);
+    VkDevice dev = (VkDevice)vk_handle();
+    for (auto& g : g_graphs) if (g.live) {
+        vkWaitForFences(dev, 1, &g.fence, VK_TRUE, ~0ull);
+        vkDestroyFence(dev, g.fence, nullptr);
+        g.live = false; graph_service(g);
+    }
+}
 
+// ---- recorded copies (capture bodies): (arena offset, host ptr) pairs walk piece boundaries.
+void graph_record_h2d(uint64_t arena_off, const void* host, uint64_t bytes) {
+    // LOCK-FREE: callers hold g_m (pieces) and g_pm (leaf); re-locking g_m deadlocks.
+    uint64_t off = 0;
+    while (off < bytes) {
+        uint64_t n = bytes - off;
+        if (uint64_t room = piece_room(arena_off + off)) { if (n > room) n = room; }
+        VkBuffer sb; uint64_t so; void* smap;
+        stage_alloc(g_cap, n, sb, so, &smap);
+        std::memcpy(smap, (const char*)host + off, n);              // freeze the bytes NOW
+        uint64_t po; VkBuffer pb = piece_of(arena_off + off, n, po);
+        if (!pb) throw std::runtime_error("vk_runtime: captured h2d copy crosses an arena piece");
+        VkBufferCopy r{so, po, n};
+        vkCmdCopyBuffer(g_cap.cb, sb, pb, 1, &r);
+        cap_barrier(g_cap.cb);
+        off += n;
+    }
+}
+void graph_record_d2h(uint64_t arena_off, void* host_dst, uint64_t bytes) {
+    // LOCK-FREE: callers hold g_m (pieces) and g_pm (leaf); re-locking g_m deadlocks.
+    uint64_t off = 0;
+    while (off < bytes) {
+        uint64_t n = bytes - off;
+        if (uint64_t room = piece_room(arena_off + off)) { if (n > room) n = room; }
+        VkBuffer sb; uint64_t so; void* smap;
+        stage_alloc(g_cap, n, sb, so, &smap);
+        uint64_t po; VkBuffer pb = piece_of(arena_off + off, n, po);
+        if (!pb) throw std::runtime_error("vk_runtime: captured d2h copy crosses an arena piece");
+        VkBufferCopy r{po, so, n};
+        vkCmdCopyBuffer(g_cap.cb, pb, sb, 1, &r);
+        cap_barrier(g_cap.cb);
+        g_cap.d2h_def.push_back(D2HWait{g_cap.stage_cursor - n, host_dst ? (char*)host_dst + off : nullptr, n});
+        off += n;
+    }
+}
+void graph_record_d2d(uint64_t dst_off, uint64_t src_off, uint64_t bytes) {
+    // LOCK-FREE: callers hold g_m (pieces) and g_pm (leaf); re-locking g_m deadlocks.
+    uint64_t off = 0;
+    while (off < bytes) {
+        uint64_t n = bytes - off;
+        if (uint64_t room = piece_room(dst_off + off)) { if (n > room) n = room; }
+        if (uint64_t room = piece_room(src_off + off)) { if (n > room) n = room; }
+        uint64_t po_s, po_d;
+        VkBuffer pb_s = piece_of(src_off + off, n, po_s), pb_d = piece_of(dst_off + off, n, po_d);
+        if (!pb_s || !pb_d) throw std::runtime_error("vk_runtime: captured d2d copy crosses an arena piece");
+        VkBufferCopy r{po_s, po_d, n};
+        vkCmdCopyBuffer(g_cap.cb, pb_s, pb_d, 1, &r);
+        cap_barrier(g_cap.cb);
+        off += n;
+    }
+}
+// deliver a drained replay's staged D2H bytes to their host destinations. NOTE the split:
+// d2h_def is the capture-time SPEC (stale until a replay runs); d2h_run is armed by launch and
+// consumed here. Servicing the DEF before the first replay would copy never-written staging.
+void graph_service(GraphObj& g) {
+    for (auto& w : g.d2h_run)
+        for (auto& c : g.stages)
+            if (w.stage_at >= c.base && w.stage_at < c.base + c.size) {
+                if (w.dst) std::memcpy(w.dst, (const char*)c.map + (w.stage_at - c.base), w.bytes);
+                break;
+            }
+    g.d2h_run.clear();
+}
 // (back to the file's anonymous namespace for the flush/launch paths below, which use the
 // graph state above and the g_* state further down; declared-visible since they are in this TU)
 namespace {
@@ -386,17 +510,21 @@ void flush_wait() {          // flush pending, then wait ALL in-flight fences (a
     if (g_capturing) {       // a sync point inside a capture body: recorded as-is would reorder;
                              // silently dropping it would replay wrong. Loud trap (the port's law).
         std::fprintf(stderr, "strata-vk: flush_wait inside a graph capture - the capture body hit a sync/copy site; refusing\n");
+        if (getenv("STRATA_VK_CAPTURE_TRACE")) {
+            void* bt[24]; int n = backtrace(bt, 24);
+            backtrace_symbols_fd(bt, n, 2);
+        }
         std::abort();
     }
     // stall time spent draining the queue:
     static const bool ft = getenv("STRATA_VK_LAUNCH_TIME") != nullptr;
     const auto t0 = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> plk(g_pm);
-    // graph replays in flight belong to the same stream: drain their fences too
-    for (size_t i = 0; i < g_graph_fence.size(); ++i) if (g_graph_fence_live[i]) {
-        RT(vkWaitForFences((VkDevice)vk_handle(), 1, &g_graph_fence[i], VK_TRUE, ~0ull));
-        vkDestroyFence((VkDevice)vk_handle(), g_graph_fence[i], nullptr);
-        g_graph_fence[i] = VK_NULL_HANDLE; g_graph_fence_live[i] = false;
+    // graph replays in flight belong to the same stream: drain their fences and deliver D2H
+    for (auto& g : g_graphs) if (g.live) {
+        RT(vkWaitForFences((VkDevice)vk_handle(), 1, &g.fence, VK_TRUE, ~0ull));
+        vkDestroyFence((VkDevice)vk_handle(), g.fence, nullptr);
+        g.live = false; graph_service(g);
     }
     pend_flush_locked();
     VkQueue q = (VkQueue)vk_default_queue();
@@ -472,10 +600,10 @@ void* stream_create() { return (void*)(uintptr_t) g_stream_token.fetch_add(1); }
 void stream_destroy(void*) {}
 void stream_sync(void*) { flush_wait_why("stream_sync"); flush_wait(); }
 void device_sync() { std::lock_guard<std::mutex> plk(g_pm);
-                     for (size_t i = 0; i < g_graph_fence.size(); ++i) if (g_graph_fence_live[i]) {
-                         RT(vkWaitForFences((VkDevice)vk_handle(), 1, &g_graph_fence[i], VK_TRUE, ~0ull));
-                         vkDestroyFence((VkDevice)vk_handle(), g_graph_fence[i], nullptr);
-                         g_graph_fence[i] = VK_NULL_HANDLE; g_graph_fence_live[i] = false;
+                     for (auto& g : g_graphs) if (g.live) {
+                         RT(vkWaitForFences((VkDevice)vk_handle(), 1, &g.fence, VK_TRUE, ~0ull));
+                         vkDestroyFence((VkDevice)vk_handle(), g.fence, nullptr);
+                         g.live = false; graph_service(g);
                      }
                      pend_flush_locked();
                      RT(vkDeviceWaitIdle((VkDevice)vk_handle()));
@@ -513,6 +641,8 @@ void copy_h2d(void* dst, const void* src, uint64_t bytes, void*) {
         }
     }
     std::lock_guard<std::mutex> lk(g_m);
+    if (capturing()) { std::lock_guard<std::mutex> plk(g_pm);
+        graph_record_h2d((uint64_t)(uintptr_t)dst, src, bytes); return; }   // a captured memcpy node
     flush_wait_why("copy_h2d"); flush_wait();   // eager-copy rule: never let a stage write race a recorded stage copy
     uint64_t at = (uint64_t)(uintptr_t)dst, off = 0;
     while (off < bytes) {
@@ -526,6 +656,8 @@ void copy_h2d(void* dst, const void* src, uint64_t bytes, void*) {
 }
 void copy_d2h(void* dst, const void* src, uint64_t bytes, void*) {
     std::lock_guard<std::mutex> lk(g_m);
+    if (capturing()) { std::lock_guard<std::mutex> plk(g_pm);
+        graph_record_d2h((uint64_t)(uintptr_t)src, dst, bytes); return; }   // a captured memcpy node
     flush_wait_why("copy_d2h"); flush_wait();   // the d2h result is what the sampler needs: right sync point
     uint64_t at = (uint64_t)(uintptr_t)src, off = 0;
     while (off < bytes) {
@@ -540,18 +672,17 @@ void copy_d2h(void* dst, const void* src, uint64_t bytes, void*) {
 void fill_d(void* dst, uint8_t byte, uint64_t bytes, void*) {
     if (g_capturing) {   // Phase 4.2: fills ARE recordable (vkCmdFillBuffer, the CUDA
                          // cudaMemsetAsync analogue): no staging, no drain. Chunk by piece.
-        std::lock_guard<std::mutex> lk(g_m);       // pieces: g_m, then g_pm (the leaf), matching
-        std::lock_guard<std::mutex> caplk(g_pm);   // the launch path's order
-        VkDevice dev = (VkDevice)vk_handle();
+        std::lock_guard<std::mutex> lk2(g_m);      // the file's order: pieces g_m, g_pm the leaf
+        std::lock_guard<std::mutex> caplk(g_pm);
         const uint32_t pat = uint32_t(byte) * 0x01010101u;
         uint64_t at = (uint64_t)(uintptr_t)dst, off = 0;
         while (off < bytes) {
             uint64_t n = bytes - off;
             if (uint64_t room = piece_room(at + off)) { if (n > room) n = room; }
-            auto it = std::find_if(g_pieces.begin(), g_pieces.end(), [&](const Piece& p){
-                return p.base <= at + off && at + off + n <= p.base + p.size; });
-            if (it == g_pieces.end()) throw std::runtime_error("vk_runtime: fill crosses an arena piece");
-            vkCmdFillBuffer(g_cap.cb, it->buf, (at + off) - it->base, n, pat);
+            uint64_t po; VkBuffer pb = piece_of(at + off, n, po);
+            if (!pb) throw std::runtime_error("vk_runtime: captured fill crosses an arena piece");
+            vkCmdFillBuffer(g_cap.cb, pb, po, n, pat);
+            cap_barrier(g_cap.cb);
             off += n;
         }
         return;

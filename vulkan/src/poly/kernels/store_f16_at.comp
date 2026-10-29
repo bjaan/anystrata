@@ -1,0 +1,49 @@
+// vulkan/src/poly/kernels/store_f16_at.comp - the graph-path f16 KV write: the CUDA body
+// src/poly/kernels.cu:522-530 store_f16_at_kernel (+ the wrapper at :2288), demanded by the
+// replayed decode arms (head_norm_rope/at and attn_store with at != null; engine.cpp:2694-2696
+// writes h_at_/at_ OUTSIDE the graph, the captured launch reads the row from the card cell).
+//
+// Same f16 law as store_f16.comp (f16_rn_bits, NOT packHalf2x16: law 1), same word layout, and
+// the at-row math of kernels.cu:525: row = ring > 0 ? (*at + trow) % ring : *at + trow.
+// The i64 *at cell is read by its LOW u32 word only - the attend_score.comp law: sequence rows
+// are int31 (the launcher guards *at + rows < 2^31 against the cell's two words), so the low
+// word IS the position and no Int64 capability is needed. The cache binding starts AT the
+// cache base (target rows are card-time): rows*n/2 words bound the write span.
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer X { float v[]; } bx;
+layout(std430, binding = 1) buffer D { uint v[]; } bd;             // whole cache, f16 pairs
+layout(std430, binding = 2) readonly buffer AT { uint v[]; } bat;  // *at (low u32 = the row)
+
+// row_pairs = n/2 (f16 words a row); pairs = rows * row_pairs total.
+layout(push_constant) uniform PC { uint pairs; uint row_pairs; uint at_lo; int ring; } pc;
+
+uint f16_rn_bits(float f) {
+    const uint b = floatBitsToUint(f);
+    const uint sign = (b >> 16u) & 0x8000u;
+    int exp = int((b >> 23u) & 0xFFu) - 127 + 15;
+    uint man = b & 0x7FFFFFu;
+    if (exp >= 31) return sign | 0x7C00u;                 // overflow -> infinity
+    if (exp <= 0) {                                       // subnormal/underflow: shift-and-round
+        man |= 0x800000u;
+        const uint sh = uint(1 - exp) + 13u;
+        uint h = (sh >= 32u) ? 0u : (man >> sh);
+        const uint rem = (sh >= 32u) ? 0u : (man & ((1u << sh) - 1u));
+        if (sh < 32u && (rem > (1u << (sh - 1u)) || (rem == (1u << (sh - 1u)) && (h & 1u) != 0u))) h++;
+        return sign | h;
+    }
+    uint hman = man >> 13u; uint rem = man & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (hman & 1u) != 0u)) { hman++; if (hman == 0x400u) { hman = 0u; exp++; if (exp >= 31) return sign | 0x7C00u; } }
+    return sign | (uint(exp) << 10u) | hman;
+}
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.pairs) return;
+    const uint trow = i / pc.row_pairs, dword = i - trow * pc.row_pairs;
+    uint row = bat.v[0] + trow;               // int31 law: the low word is the row position
+    if (pc.ring > 0) row = row % uint(pc.ring);
+    bd.v[row * pc.row_pairs + dword] = f16_rn_bits(bx.v[2u * i]) | (f16_rn_bits(bx.v[2u * i + 1u]) << 16u);
+}

@@ -1,0 +1,76 @@
+// vulkan/src/poly/kernels/store_q8_at.comp - the graph-path q8_0 KV write: the CUDA body
+// src/poly/kernels.cu:553-573 store_q8_at_kernel (+ wrapper :2301). The same q8 laws as
+// store_q8.comp (q8_rint ties-to-even = CUDA rintf, f16_rn_bits scales, 4-int8 words, two-f16
+// scale words, one thread two blocks) with the at-row math: the target cache row comes from
+// the device cell (low u32 word = the row, int31 law), % ring when ring > 0 — kernels.cu:560.
+// The bindings start at the cache BASES (whole caches: rows are card-time); the launcher
+// bounds them by their arena piece tails.
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer X { float v[]; } bx;
+layout(std430, binding = 1) buffer CODES { uint v[]; } bc;
+layout(std430, binding = 2) buffer SCALES { uint v[]; } bs;
+layout(std430, binding = 3) readonly buffer AT { uint v[]; } bat;   // *at low word = the row
+
+// n values a row, nb blocks a row, pairs = rows*nb/2 threads.
+layout(push_constant) uniform PC { uint n; uint nb; uint pairs; int ring; } pc;
+
+uint f16_rn_bits(float f) {
+    const uint b = floatBitsToUint(f);
+    const uint sign = (b >> 16u) & 0x8000u;
+    int exp = int((b >> 23u) & 0xFFu) - 127 + 15;
+    uint man = b & 0x7FFFFFu;
+    if (exp >= 31) return sign | 0x7C00u;
+    if (exp <= 0) {
+        man |= 0x800000u;
+        const uint sh = uint(1 - exp) + 13u;
+        uint h = (sh >= 32u) ? 0u : (man >> sh);
+        const uint rem = (sh >= 32u) ? 0u : (man & ((1u << sh) - 1u));
+        if (sh < 32u && (rem > (1u << (sh - 1u)) || (rem == (1u << (sh - 1u)) && (h & 1u) != 0u))) h++;
+        return sign | h;
+    }
+    uint hman = man >> 13u; uint rem = man & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (hman & 1u) != 0u)) { hman++; if (hman == 0x400u) { hman = 0u; exp++; if (exp >= 31) return sign | 0x7C00u; } }
+    return sign | (uint(exp) << 10u) | hman;
+}
+
+float q8_rint(float v) {                       // CUDA rintf: ties to EVEN
+    const float fl = floor(v);
+    const float fr = v - fl;
+    if (fr > 0.5) return fl + 1.0;
+    if (fr < 0.5) return fl;
+    return (fract(fl * 0.5) == 0.0) ? fl : fl + 1.0;
+}
+
+uint qblock(uint xoff, uint cw) {              // codes word base cw
+    float amax = 0.0;
+    for (int j = 0; j < 32; ++j) amax = max(amax, abs(bx.v[xoff + uint(j)]));
+    const float d = amax / 127.0;
+    const float id = d > 0.0 ? 1.0 / d : 0.0;
+    for (int w = 0; w < 8; ++w) {
+        uint word = 0u;
+        for (int j = 0; j < 4; ++j) {
+            const float q = min(max(q8_rint(bx.v[xoff + uint(w * 4 + j)] * id), -127.0), 127.0);
+            word |= (uint(int(q)) & 0xFFu) << (8u * uint(j));
+        }
+        bc.v[cw + uint(w)] = word;
+    }
+    return f16_rn_bits(d);
+}
+
+void main() {
+    const uint pair = gl_GlobalInvocationID.x;
+    if (pair >= pc.pairs) return;
+    const uint nb = pc.nb, n = pc.n;
+    const uint s0 = 2u * pair, s1 = s0 + 1u;          // flat block indices
+    const uint r0 = s0 / nb, b0 = s0 - r0 * nb;
+    const uint r1 = s1 / nb, b1 = s1 - r1 * nb;       // nb even: r1 == r0, b1 == b0+1
+    uint at = bat.v[0];                               // int31 law: the low word is the row
+    uint row0 = at + r0, row1 = at + r1;
+    if (pc.ring > 0) { row0 %= uint(pc.ring); row1 %= uint(pc.ring); }
+    const uint lo = qblock(r0 * n + b0 * 32u, row0 * (n / 4u) + b0 * 8u);
+    const uint hi = qblock(r1 * n + b1 * 32u, row1 * (n / 4u) + b1 * 8u);
+    bs.v[row0 * (nb / 2u) + b0 / 2u] = lo | (hi << 16u);
+}

@@ -125,7 +125,9 @@ void blas_destroy(void* blas) { if (blas) cublasDestroy((cublasHandle_t) blas); 
               "swiglu_clamp_rows": "vulkan/src/poly/kernels/elementwise_vk.cpp",
               "head_norm_rope": "vulkan/src/poly/kernels/head_norm_rope_vk.cpp",
               "store_f16": "vulkan/src/poly/kernels/store_f16_vk.cpp",
-              "store_q8": "vulkan/src/poly/kernels/store_q8_vk.cpp",   # store_q8_at stays a trap: no card-time row read wired (--no-graphs)
+              "store_q8": "vulkan/src/poly/kernels/store_q8_vk.cpp",
+              "store_q8_at": "vulkan/src/poly/kernels/store_q8_at_vk.cpp",     # the graph path's card-time rows (Phase 4.2)
+              "store_f16_at": "vulkan/src/poly/kernels/store_f16_at_vk.cpp",   # Phase 4.2: replayed decode arms read the row from the at cell
               "attend": "vulkan/src/poly/kernels/attend_vk.cpp",
               "attend_batch": "vulkan/src/poly/kernels/attend_batch_vk.cpp",
               "likeliest": "vulkan/src/poly/kernels/likeliest_vk.cpp",

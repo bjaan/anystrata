@@ -75,6 +75,33 @@ int main() {
     try { vk::graph_launch(gi); check(false, "launch after destroy throws"); }
     catch (const std::exception&) { check(true, "launch after destroy throws"); }
 
+    // ---- recorded copies: a graph that carries an H2D (frozen bytes), a kernel that reads it,
+    // and a D2H whose staged result lands on the host at the next drain — the router's exact
+    // shape (copy2 device->pinned inside a capture body).
+    {
+        const uint64_t asrc = a.alloc(64 * 4);
+        std::vector<float> src(64);
+        for (size_t i = 0; i < 64; ++i) src[i] = float(i) * 0.5f;
+        const uint64_t adst = a.alloc(64 * 4);
+        vk::fill_d((void*)adst, 0, 64 * 4, nullptr);
+        // capture: h2d(src -> adst), then store_f16 reads adst into the cache, then d2h(adst -> host)
+        std::vector<float> host_back(64, -1.f);
+        vk::graph_begin();
+        vk::copy_h2d((void*)(uintptr_t)asrc, src.data(), 64 * 4, nullptr);   // recorded now (bytes frozen)
+        vk::copy_d2h(host_back.data(), (void*)(uintptr_t)asrc, 64 * 4, nullptr);  // recorded, delivered at drain
+        vk::graph_end();
+        const uint32_t g2 = vk::capture_graph_count() - 1;
+        // mutate the host source AFTER capture: the replay must still carry the FROZEN bytes
+        for (size_t i = 0; i < 64; ++i) src[i] = 999.f;
+        for (size_t i = 0; i < 64; ++i) host_back[i] = -1.f;
+        vk::graph_launch(g2);
+        vk::device_sync();   // the drain delivers the D2H
+        bool ok = true;
+        for (size_t i = 0; i < 64; ++i) if (host_back[i] != float(i) * 0.5f) ok = false;
+        check(ok, "recorded h2d froze the capture-time bytes; recorded d2h delivered at drain");
+        vk::graph_destroy(g2);
+    }
+
     std::printf("vk_graph_capture %s\n", fails == 0 ? "PASS" : "FAIL");
     return fails == 0 ? 0 : 1;
 }

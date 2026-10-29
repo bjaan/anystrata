@@ -39,8 +39,6 @@ namespace strata::poly { void permute_groups(const float * p0, float * p1, int p
 namespace strata::poly { void route_rows(const float * p0, int p1, int p2, int p3, int p4, float p5, const float * p6, const float * p7, bool p8, float p9, int32_t * p10, float * p11, void * p12) { strata::vk_engine::missing("strata::poly::route_rows"); } }
 namespace strata::poly { void shortconv(const float * p0, float * p1, const float * p2, float * p3, int p4, int p5, void * p6, float * p7, size_t p8, unsigned int p9) { strata::vk_engine::missing("strata::poly::shortconv"); } }
 namespace strata::poly { void softcap(float * p0, size_t p1, float p2, void * p3) { strata::vk_engine::missing("strata::poly::softcap"); } }
-namespace strata::poly { void store_f16_at(const float * p0, uint16_t * p1, int p2, const long long * p3, int p4, int p5, void * p6) { strata::vk_engine::missing("strata::poly::store_f16_at"); } }
-namespace strata::poly { void store_q8_at(const float * p0, int8_t * p1, uint16_t * p2, int p3, const long long * p4, int p5, int p6, void * p7) { strata::vk_engine::missing("strata::poly::store_q8_at"); } }
 // HOST-defined contract helpers (no device work): the same arithmetic as kernels.cu's.
 namespace strata::poly {
 size_t attend_split_floats(int chunk, int n_head, int max_rows, int dim) {

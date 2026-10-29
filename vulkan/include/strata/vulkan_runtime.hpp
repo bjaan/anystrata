@@ -95,6 +95,8 @@ bool capturing();                 // a capture is open: copies/syncs inside the 
 uint32_t capture_graph_count();   // registered graphs (launch indices are this order)
 uint32_t graph_dispatches(uint32_t gi);   // launches a captured graph recorded (its node count)
 
+uint64_t piece_tail(uint64_t arena_off);  // bytes from off to its piece end (whole-buffer bound)
+
 void copy_h2d(void* dst_arena, const void* src_host, uint64_t bytes, void* stream);
 void copy_d2h(void* dst_host, const void* src_arena, uint64_t bytes, void* stream);
 void fill_d(void* dst_arena, uint8_t byte, uint64_t bytes, void* stream);
