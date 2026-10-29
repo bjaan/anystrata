@@ -92,4 +92,6 @@ Skirt bands = the quant formats the engine proves bitwise; hair-tie discs = the 
 size (docs/pack-format.md); bootlaces as a node chain (optional detail) = the arena's piece
 chain. She documents the engine — when adding a variant, encode a real fact.
 
-MEDIA-adjacent: current vector concept sketch lives at `vulkan/docs/strata-chan.svg`.
+MEDIA: no artwork is shipped with the sheet (the early SVG concept sketches were removed
+2026-10-29 — they predated the name settling on Any Cyan and rendered the wrong age reading).
+The sheet IS the canon: render from its constants, or not at all.

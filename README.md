@@ -295,7 +295,8 @@ time, mmap forced, and an oom-score above the session's.
 
 ## Mascot
 
-**Any Cyan** — the engine's character sheet: [vulkan/docs/mascot.md](vulkan/docs/mascot.md). An early-twenties
+**Any Cyan** — the engine's character sheet (the sheet is the art: render from it, no image is
+shipped): [vulkan/docs/mascot.md](vulkan/docs/mascot.md). An early-twenties
 engineer in a PCB-teal cardigan; a three-disc hair-tie (the expert cache: cached / warm / cold), a strata-banded
 skirt (the bitwise quant formats), a hairpin engraved **391** — the answer she first computed on the BC-250 — and
 Silly the crate-bird hauling an 18-byte Q2_0 block. She belongs to every card that runs the engine.
