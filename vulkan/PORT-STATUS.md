@@ -820,11 +820,20 @@ kvq8 arm: the prompt path (attend_batch dequant, ported this session) runs; the 
 traps BY NAME (attend()'s fused kq8 read: the ported-queue entry stands) - q8_0 stays
 prefill-only until those template arms land (law 11's unlock is half-done).
 
-**Long set on this box (machine-limited, law 10d):** d4k/d16k r16k engine arms scored against
+**Long set on this box (machine-limited, law 10d):** d4k/d16k/r16k engine arms scored against
 the CPU reference directly (GPU logits-dump legs not hostable on 15 GB): d4k 256 steps top-1
-0.996 KL 0.0198; d16k 256 steps 0.992 / 0.0077; r16k [pending this run's tail]. Absolute KLs
-at long context ride the same order as the short set; no T2 ratio claimed without the GPU arm.
-d31k: not hosted, recorded as machine-limited like the fork's per-machine gaps.
+0.996 KL 0.0198; d16k 256 steps 0.992 / 0.0077; r16k 510 steps 0.984 / 0.0116, zero T1 fails
+(2,048 more scored steps at long context). Absolute KLs at long context ride the same order as
+the short set; no T2 ratio claimed without the GPU arm. One harness pitfall caught mid-record:
+the realtext r16k leg must be teacher-forced on the FIXED answer.ids (the plan's convention for
+that set) — forcing it on the hybrid greedy answer (which diverges at token 3) scored a bogus
+KL 7.8 before the mismatch was found; both sides re-forced, clean. d31k: not hosted, recorded
+as machine-limited like the fork's per-machine gaps.
+
+kvq8 arm at the model level: p00-p02 produced their prompt-path steps through the new
+attend_batch q8 dequant arm and halt at attend()'s fused q8 decode read - the trap chain
+advances exactly as the ledger predicts; the fused arms are the next port task (unlocks both
+the complete kvq8 legs and the 64K serve, law 11).
 
 Reference-leg survival notes (all recorded as PORT-NOTES laws 10/11): GPU legs pin 12.2 GB via
 TTM (both device tiers), the dump tool needed STRATA_DUMP_MMAP=1 (llama.cpp's AUTO loader copies
