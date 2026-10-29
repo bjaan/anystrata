@@ -346,8 +346,12 @@ inline cudaError_t strata_memcpy(void* dst, const void* src, size_t bytes, cudaM
             strata::vk::copy_d2h(dst, (void*)(std::uintptr_t) off(src), bytes, s);
             break;
         case cudaMemcpyDeviceToDevice: {
-            // No device-side copy primitive yet: walk it through a host scratch (correct, not fast -
-            // speed is a PORT-STATUS todo; D2D moves are small state tables in the engine today).
+            if (strata::vk::cap_here()) {           // Phase 4.2: a real device copy node
+                strata::vk::graph_record_d2d((std::uintptr_t) off(dst), (std::uintptr_t) off(src), bytes);
+                break;
+            }
+            // No eager device-side copy primitive: walk it through a host scratch (correct, not
+            // fast - speed is a PORT-STATUS todo; D2D moves are small state tables today).
             static thread_local std::vector<uint8_t> scratch;
             constexpr size_t chunk = 2ull << 20;
             scratch.resize(chunk);

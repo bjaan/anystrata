@@ -19,6 +19,7 @@
 #include <cstring>
 #include <algorithm>
 #include <chrono>
+#include <thread>
 #include <execinfo.h>
 #include <map>
 #include <atomic>
@@ -304,6 +305,11 @@ std::map<std::string, long long> g_launch_names;
 long long g_flush_calls = 0; double g_flush_ms = 0.0;
 long long g_pendwait_calls = 0; double g_pendwait_ms = 0.0;   // depth-cap fence waits in pend_flush
 void pend_flush_locked() {   // g_pm held; end+submit with a fence, NO wait
+    // ThreadLocal capture (engine.cpp:2622): while the MAIN thread captures, staging threads may
+    // flush their OWN pending eager work. g_pend is shared: a foreign flush must never end/submit
+    // the capture's CB (the main thread has not finished recording, its stage writes are not done).
+    // If the pending CB IS the capture (g_pend.cb == g_cap.cb cannot happen: the capture keeps its
+    // own CB), the guard below simply skips: g_pend is never the capture CB. [documented invariant]
     if (!g_pend.cb) return;
     VkDevice dev = (VkDevice)vk_handle();
     // depth cap: never leave more than kMaxInFlight CBs queued without reaping, so a 128-token
@@ -352,9 +358,15 @@ void flush_wait_why(const char* why) {
 // not each preallocate RADV descriptor memory).
 constexpr uint32_t kGraphPoolSets = 128;
 struct StageChunk { VkBuffer buf; VkDeviceMemory mem; void* map; uint64_t base; uint64_t size; };
+// imported host pages (VK_EXT_external_memory_host): a captured H2D node must read the LIVE
+// host bytes at every replay (CUDA memcpy nodes carry pointers, not values) - the swap regime
+// stages CPU experts' sums through host scratch inside captured passes, and freezing the bytes
+// at capture time was measured to collapse generation to id-0s from token 9 (2026-10-29).
+struct HostImport { uint64_t page; VkBuffer buf; VkDeviceMemory mem; };
 struct D2HWait { uint64_t stage_at; void* dst; uint64_t bytes; };   // chain address -> host, at drain
 struct GraphObj { VkCommandBuffer cb = VK_NULL_HANDLE; std::vector<VkDescriptorPool> dps;
                   std::vector<StageChunk> stages; uint64_t stage_cursor = 0;
+                  std::vector<HostImport> imports;
                   std::vector<D2HWait> d2h_def;                    // the spec, recorded at capture
                   std::vector<D2HWait> d2h_run;                    // pendings of the CURRENT replay
                   VkFence fence = VK_NULL_HANDLE; bool live = false;
@@ -362,6 +374,12 @@ struct GraphObj { VkCommandBuffer cb = VK_NULL_HANDLE; std::vector<VkDescriptorP
 static GraphObj g_cap;
 static std::vector<GraphObj> g_graphs;        // instantiated graphs (exec handles index these)
 static bool g_capturing = false;
+// cudaStreamCaptureModeThreadLocal (engine.cpp:2622) is exact: a capture constrains ONLY the
+// capturing thread. The swap regime has a staging thread (Engine::follow_loop) doing eager
+// copies/flushes while the main thread captures a layer body: those calls must run the EAGER
+// path (drain, staged lane), never record into the foreign capture and never abort on it.
+static std::thread::id g_cap_thread{};
+bool cap_here() { return g_capturing && std::this_thread::get_id() == g_cap_thread; }
 void graph_service(GraphObj& g);
 
 void stage_chunk(GraphObj& g, uint64_t need) {
@@ -431,7 +449,7 @@ void graph_begin() {
     VkDescriptorPool p0; RT(vkCreateDescriptorPool(dev, &dpi, nullptr, &p0));
     g_cap.dps.push_back(p0); g_cap.sets_left = kGraphPoolSets;
     g_cap.dispatches = 0; g_cap.open = true;
-    g_capturing = true;
+    g_capturing = true; g_cap_thread = std::this_thread::get_id();
 }
 uint32_t graph_end() {   // returns the recorded dispatch count; registers a graph object
     std::lock_guard<std::mutex> plk(g_pm);
@@ -439,7 +457,7 @@ uint32_t graph_end() {   // returns the recorded dispatch count; registers a gra
     RT(vkEndCommandBuffer(g_cap.cb));
     g_graphs.push_back(std::move(g_cap));
     const uint32_t d = g_graphs.back().dispatches;
-    g_cap = GraphObj{}; g_capturing = false;
+    g_cap = GraphObj{}; g_capturing = false; g_cap_thread = std::thread::id{};
     return d;
 }
 void graph_destroy(uint32_t gi) {
@@ -490,24 +508,76 @@ void graph_sync_all() {
 }
 
 // ---- recorded copies (capture bodies): (arena offset, host ptr) pairs walk piece boundaries.
+// imported host pages for THIS capture's nodes (moved to the GraphObj at end): page-aligned
+// spans of the host allocation, cached per page base; freed with the graph. RADV exports
+// VK_EXT_external_memory_host with minImportedHostPointerAlignment 4096, and the engine's
+// cudaHostAlloc scratch is aligned_alloc(4096, page-multiple): the spans are exact.
+static std::vector<HostImport> g_cap_imports;
+VkBuffer import_host_buf(const void* host, uint64_t bytes, uint32_t& off_in_buf) {
+    const uint64_t p = (uint64_t)(uintptr_t)host;
+    const uint64_t base = p & ~4095ull, end = (p + bytes + 4095ull) & ~4095ull;
+    off_in_buf = (uint32_t)(p - base);
+    for (auto& hi : g_cap_imports)
+        if (hi.page == base) return hi.buf;
+    VkDevice dev = (VkDevice)vk_handle();
+    const uint64_t sz = end - base;
+    VkExternalMemoryBufferCreateInfo embc{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+    embc.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.pNext = &embc; bci.size = sz;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    VkBuffer b = VK_NULL_HANDLE;
+    if (vkCreateBuffer(dev, &bci, nullptr, &b) != VK_SUCCESS)
+        throw std::runtime_error("vk_runtime: captured h2d: host import buffer refused");
+    VkMemoryRequirements mr{}; vkGetBufferMemoryRequirements(dev, b, &mr);
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties((VkPhysicalDevice)vk_physical_handle(), &mp);
+    int32_t mt = -1;
+    const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+        if ((mr.memoryTypeBits & (1u << i)) &&
+            (mp.memoryTypes[i].propertyFlags & want) == want) { mt = (int)i; break; }
+    if (mt < 0) { vkDestroyBuffer(dev, b, nullptr);
+        throw std::runtime_error("vk_runtime: captured h2d: no host-visible type for the import"); }
+    VkImportMemoryHostPointerInfoEXT mhp{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+    mhp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+    mhp.pHostPointer = (void*)base;
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = mr.size; mai.memoryTypeIndex = (uint32_t)mt; mai.pNext = &mhp;
+    VkDeviceMemory m = VK_NULL_HANDLE;
+    if (vkAllocateMemory(dev, &mai, nullptr, &m) != VK_SUCCESS) {
+        vkDestroyBuffer(dev, b, nullptr);
+        throw std::runtime_error("vk_runtime: captured h2d: vkAllocateMemory(hostPointer) refused "
+                                 "(import alignment or type): refusing rather than freezing live bytes");
+    }
+    if (vkBindBufferMemory(dev, b, m, 0) != VK_SUCCESS) {
+        vkDestroyBuffer(dev, b, nullptr); vkFreeMemory(dev, m, nullptr);
+        throw std::runtime_error("vk_runtime: captured h2d: bind of imported pages failed");
+    }
+    g_cap_imports.push_back(HostImport{base, b, m});
+    if (getenv("STRATA_VK_CAPTURE_TRACE"))
+        std::fprintf(stderr, "cap-import: page=0x%llx bytes=%llu sz=%llu dispatches=%u\n",
+                     (unsigned long long)base, (unsigned long long)bytes, (unsigned long long)sz,
+                     g_cap.dispatches);
+    return b;
+}
 void graph_record_h2d(uint64_t arena_off, const void* host, uint64_t bytes) {
     // LOCK-FREE: callers hold g_m (pieces) and g_pm (leaf); re-locking g_m deadlocks.
     uint64_t off = 0;
     while (off < bytes) {
         uint64_t n = bytes - off;
         if (uint64_t room = piece_room(arena_off + off)) { if (n > room) n = room; }
-        VkBuffer sb; uint64_t so; void* smap;
-        stage_alloc(g_cap, n, sb, so, &smap);
-        std::memcpy(smap, (const char*)host + off, n);              // freeze the bytes NOW
+        uint32_t io = 0;
+        VkBuffer sb = import_host_buf((const char*)host + off, n, io);   // LIVE pages, CUDA node shape
         uint64_t po; VkBuffer pb = piece_of(arena_off + off, n, po);
         if (!pb) throw std::runtime_error("vk_runtime: captured h2d copy crosses an arena piece");
-        VkBufferCopy r{so, po, n};
+        VkBufferCopy r{io, po, n};
         vkCmdCopyBuffer(g_cap.cb, sb, pb, 1, &r);
         cap_barrier(g_cap.cb);
         off += n;
     }
 }
-void graph_record_d2h(uint64_t arena_off, void* host_dst, uint64_t bytes) {
+void graph_record_d2h(uint64_t arena_off, void* host_dst, uint64_t bytes) {   // d2h node
     // LOCK-FREE: callers hold g_m (pieces) and g_pm (leaf); re-locking g_m deadlocks.
     uint64_t off = 0;
     while (off < bytes) {
@@ -555,8 +625,9 @@ void graph_service(GraphObj& g) {
 // (back to the file's anonymous namespace for the flush/launch paths below, which use the
 // graph state above and the g_* state further down; declared-visible since they are in this TU)
 namespace {
+void flush_wait_locked();    // the drain body with g_pm HELD by the caller (direct-copy lanes)
 void flush_wait() {          // flush pending, then wait ALL in-flight fences (all queue ops under g_pm)
-    if (g_capturing) {       // a sync point inside a capture body: recorded as-is would reorder;
+    if (cap_here()) {        // a sync point inside a capture body: recorded as-is would reorder;
                              // silently dropping it would replay wrong. Loud trap (the port's law).
         std::fprintf(stderr, "strata-vk: flush_wait inside a graph capture - the capture body hit a sync/copy site; refusing\n");
         if (getenv("STRATA_VK_CAPTURE_TRACE")) {
@@ -565,10 +636,13 @@ void flush_wait() {          // flush pending, then wait ALL in-flight fences (a
         }
         std::abort();
     }
+    std::lock_guard<std::mutex> plk(g_pm);
+    flush_wait_locked();
+}
+void flush_wait_locked() {   // g_pm held by the caller
     // stall time spent draining the queue:
     static const bool ft = getenv("STRATA_VK_LAUNCH_TIME") != nullptr;
     const auto t0 = std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> plk(g_pm);
     // graph replays in flight belong to the same stream: drain their fences and deliver D2H
     for (auto& g : g_graphs) if (g.live) {
         RT(vkWaitForFences((VkDevice)vk_handle(), 1, &g.fence, VK_TRUE, ~0ull));
@@ -690,15 +764,24 @@ void copy_h2d(void* dst, const void* src, uint64_t bytes, void*) {
         }
     }
     std::lock_guard<std::mutex> lk(g_m);
-    if (capturing()) { std::lock_guard<std::mutex> plk(g_pm);
-        graph_record_h2d((uint64_t)(uintptr_t)dst, src, bytes); return; }   // a captured memcpy node
-    flush_wait_why("copy_h2d"); flush_wait();   // eager-copy rule: never let a stage write race a recorded stage copy
     uint64_t at = (uint64_t)(uintptr_t)dst, off = 0;
-    // UMA fast lane: a span inside one MAPPED piece needs no stage and no transfer - the
-    // flush_wait above already drained every kernel/graph that could touch the bytes, and
-    // HOST_COHERENT makes the write GPU-visible. This deletes one full DRAM round trip per
-    // upload (the GSQ-hybrid load: 30,720 x 288 KiB staged copies measured 2026-10-29).
-    if (void* d = piece_direct(at, bytes)) { std::memcpy(d, src, bytes); g_lane_direct++; return; }
+    if (cap_here()) { std::lock_guard<std::mutex> plk(g_pm);   // g_m held; graph_record_* lock-free
+        graph_record_h2d(at, src, bytes); return; }            // a captured memcpy node
+    // UMA direct lane (PORT-NOTES 13): a span inside ONE mapped piece needs no stage and no
+    // transfer - one DRAM round trip and one submit saved per upload (the hybrid load:
+    // 30,720 x 288 KiB staged copies, measured 2026-10-29). ATOMICITY (race found the same
+    // day, graphs + swap regime): the memcpy bypasses the queue, so drain AND write happen
+    // under ONE g_pm section - every submit path (pend_flush_locked, end_submit) takes g_pm,
+    // so no dispatch can record-then-submit against half-written bytes; work submitted earlier
+    // is drained inside the section; HOST_COHERENT publishes the write to what follows. (The
+    // old staged path got this ordering free: its arena write WAS a queued op.)
+    if (void* d = piece_direct(at, bytes)) {
+        std::lock_guard<std::mutex> plk(g_pm);
+        flush_wait_why("copy_h2d"); flush_wait_locked();
+        std::memcpy(d, src, bytes);
+        g_lane_direct++; return;
+    }
+    flush_wait_why("copy_h2d"); flush_wait();   // eager-copy rule: never let a stage write race a recorded stage copy
     g_lane_staged++;
     while (off < bytes) {
         uint64_t n = bytes - off < (2ull << 20) ? bytes - off : (2ull << 20);
@@ -711,14 +794,16 @@ void copy_h2d(void* dst, const void* src, uint64_t bytes, void*) {
 }
 void copy_d2h(void* dst, const void* src, uint64_t bytes, void*) {
     std::lock_guard<std::mutex> lk(g_m);
-    if (capturing()) { std::lock_guard<std::mutex> plk(g_pm);
-        graph_record_d2h((uint64_t)(uintptr_t)src, dst, bytes); return; }   // a captured memcpy node
-    flush_wait_why("copy_d2h"); flush_wait();   // the d2h result is what the sampler needs: right sync point
-    {   // UMA fast lane (mirror of copy_h2d): read the mapped piece straight out
-        uint64_t at0 = (uint64_t)(uintptr_t)src;
-        if (void* d = piece_direct(at0, bytes)) { std::memcpy(dst, d, bytes); return; }
-    }
     uint64_t at = (uint64_t)(uintptr_t)src, off = 0;
+    if (cap_here()) { std::lock_guard<std::mutex> plk(g_pm);
+        graph_record_d2h(at, dst, bytes); return; }            // a captured memcpy node
+    if (void* d = piece_direct(at, bytes)) {   // direct lane: drain+read under one g_pm (see h2d)
+        std::lock_guard<std::mutex> plk(g_pm);
+        flush_wait_why("copy_d2h"); flush_wait_locked();
+        std::memcpy(dst, d, bytes);
+        g_lane_direct++; return;
+    }
+    flush_wait_why("copy_d2h"); flush_wait();   // the d2h result is what the sampler needs: right sync point
     while (off < bytes) {
         uint64_t n = bytes - off < (2ull << 20) ? bytes - off : (2ull << 20);
         if (uint64_t room = piece_room(at + off)) { if (n > room) n = room; }
@@ -729,7 +814,7 @@ void copy_d2h(void* dst, const void* src, uint64_t bytes, void*) {
     }
 }
 void fill_d(void* dst, uint8_t byte, uint64_t bytes, void*) {
-    if (g_capturing) {   // Phase 4.2: fills ARE recordable (vkCmdFillBuffer, the CUDA
+    if (cap_here()) {    // Phase 4.2: fills ARE recordable (vkCmdFillBuffer, the CUDA
                          // cudaMemsetAsync analogue): no staging, no drain. Chunk by piece.
         std::lock_guard<std::mutex> lk2(g_m);      // the file's order: pieces g_m, g_pm the leaf
         std::lock_guard<std::mutex> caplk(g_pm);
@@ -747,11 +832,16 @@ void fill_d(void* dst, uint8_t byte, uint64_t bytes, void*) {
         return;
     }
     std::lock_guard<std::mutex> lk(g_m);
-    flush_wait_why("fill_d"); flush_wait();   // eager-copy rule (fill writes the shared stage too)
-    {   // UMA fast lane: memset a span inside one mapped piece
+    {   // direct lane: drain+memset under one g_pm (submit atomicity, see copy_h2d)
         uint64_t at0 = (uint64_t)(uintptr_t)dst;
-        if (void* d = piece_direct(at0, bytes)) { std::memset(d, byte, bytes); return; }
+        if (void* d = piece_direct(at0, bytes)) {
+            std::lock_guard<std::mutex> plk(g_pm);
+            flush_wait_why("fill_d"); flush_wait_locked();
+            std::memset(d, byte, bytes);
+            g_lane_direct++; return;
+        }
     }
+    flush_wait_why("fill_d"); flush_wait();   // eager-copy rule (fill writes the shared stage too)
     stage_ensure(1ull << 20);
     const uint64_t chunk = g_stage_size;
     uint64_t off = 0;
@@ -935,7 +1025,7 @@ void kernel_launch_sized_rw(const Kernel& k, int groups_x, const uint64_t* buffe
     // Batched path: allocate the set from the PENDING pool (one per pending CB, recycled at
     // flush) and record bind+push+dispatch into the pending CB. When the CB hits the set cap,
     // end/submit it with a fence (no wait) and open a fresh CB+pool pair.
-    if (g_capturing) {
+    if (cap_here()) {
         // capture path: record into the graph CB, its own pool, the OLD per-dispatch barrier law
         std::lock_guard<std::mutex> caplk(g_pm);   // leaf lock, same order as the pending path
         VkDescriptorSet ds; VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};

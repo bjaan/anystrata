@@ -907,3 +907,29 @@ on a warm box (a 300 s gap between runs evicted page cache re-shows it), the rem
 pure GPU-copy traffic + ~31k submits saved; the benefit concentrates on expert SWAP-INS at
 capacity (the regime the 64K/fp16-arena squeeze creates, and Flash-Next-class models on this
 box): each swap-in skips one full DRAM round trip. Laws: PORT-NOTES 13.
+
+
+## Open bug (recorded 2026-10-29, deterministic): graphs + expert-SWAP regime + speculation -> id-0 collapse
+
+Isolation matrix (hybrid, canary ids, 4096 ctx, max-new 32; `--vram-reserve-mib 11000` forces a
+2.0 GiB expert cache -> ~35% of experts on CPU with the staging thread live):
+
+| graphs | cache | speculation | result |
+| --- | --- | --- | --- |
+| on | full (10,240) | on  | OK — bitwise == eager (the 48-id A/B, f0d1f9e) |
+| off | swap | on  | OK (5.18 tok/s, 20/21 guesses) |
+| on  | swap | off | OK (correct ids, run A) |
+| off | swap | off | OK, == run A |
+| **on** | **swap** | **on** | **COLLAPSE: ids go 0 from token 9, identical across >=4 runs** |
+
+Trace under STRATA_VK_CAPTURE_TRACE: `cap-import=0, cap-axpy=0` — no host upload is recorded
+inside ANY capture in this regime, so the frozen-staging-bytes theory is dead; STRATA_VK_NO_ELIDE
+does not change it. The staging thread (follow_loop) and the capturing thread share the queue and
+the arena; the captured layer passes record slot bindings while swaps move experts - the CUDA
+build survives the same interleaving (verified: eager == CUDA semantics here by the fork's own
+regression tests), so the delta is in the port's capture or record path, not the engine.
+Workaround (safe, verified): run the SWAP regime with `--no-graphs` (eager path is correct,
+slow by design: 5-8 tok/s at 35% residency); the FULL-RESIDENCY regime — the only one this box
+serves today at 16K/32K/64K-q8 — is unaffected and keeps graphs. Next step when this is picked
+up: bisect inside the collapse combo (the spec verify pass records L.card==1 passes whose
+captured d_slots_/expert bindings predate a swap that happens between capture and replay).

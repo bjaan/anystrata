@@ -91,7 +91,12 @@ void graph_begin();               // open a capture on the default queue
 uint32_t graph_end();             // close it; returns the recorded dispatch count, registers a graph
 void graph_launch(uint32_t gi);   // replay graph gi (stream order: pending + its own prior replay first)
 void graph_destroy(uint32_t gi);  // free CB + pools after waiting its last replay
-bool capturing();                 // a capture is open: copies/syncs inside the body abort loudly
+bool capturing();                 // a capture is open (on any thread)
+bool cap_here();                  // a capture is open ON THIS THREAD (ThreadLocal mode: other
+                                  // threads' eager copies/syncs during it proceed normally)
+void graph_record_h2d(uint64_t arena_off, const void* host, uint64_t bytes);
+void graph_record_d2h(uint64_t arena_off, void* host_dst, uint64_t bytes);
+void graph_record_d2d(uint64_t dst_arena, uint64_t src_arena, uint64_t bytes);
 uint32_t capture_graph_count();   // registered graphs (launch indices are this order)
 uint32_t graph_dispatches(uint32_t gi);   // launches a captured graph recorded (its node count)
 

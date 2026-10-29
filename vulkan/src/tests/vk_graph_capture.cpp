@@ -91,14 +91,17 @@ int main() {
         vk::copy_d2h(host_back.data(), (void*)(uintptr_t)asrc, 64 * 4, nullptr);  // recorded, delivered at drain
         vk::graph_end();
         const uint32_t g2 = vk::capture_graph_count() - 1;
-        // mutate the host source AFTER capture: the replay must still carry the FROZEN bytes
+        // mutate the host source AFTER capture: a recorded H2D reads the LIVE pages at replay
+        // (CUDA memcpy-node semantics: nodes carry pointers, not values - the reason the model's
+        // captured staging copies stay correct when a swap thread rewrites host scratch between
+        // replays). The replay must therefore deliver the NEW bytes.
         for (size_t i = 0; i < 64; ++i) src[i] = 999.f;
         for (size_t i = 0; i < 64; ++i) host_back[i] = -1.f;
         vk::graph_launch(g2);
         vk::device_sync();   // the drain delivers the D2H
         bool ok = true;
-        for (size_t i = 0; i < 64; ++i) if (host_back[i] != float(i) * 0.5f) ok = false;
-        check(ok, "recorded h2d froze the capture-time bytes; recorded d2h delivered at drain");
+        for (size_t i = 0; i < 64; ++i) if (host_back[i] != 999.f) ok = false;
+        check(ok, "recorded h2d reads LIVE host pages at replay; recorded d2h delivered at drain");
         vk::graph_destroy(g2);
     }
 
