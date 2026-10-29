@@ -286,3 +286,14 @@ reach them (they are in the .cu files, which stay uncompiled); dim3/vector types
    a staging thread aborted mid-capture was the first symptom. And the direct-memcpy arena lane
    bypasses the queue, so drain+memcpy must share ONE g_pm section (every submit path takes
    g_pm): the staged path got that ordering free because its arena write WAS a queue op.
+
+13b. **Measured CORRECTION to law 13 (same day): the mapped-arena direct lane is NOT faster on
+   this box.** Swap-regime A/B (7.5 GiB arena, 2x each): loads 16.4/18.1 s mapped vs 15.2/15.2 s
+   staged; decode 4.94-5.14 vs 4.93-5.49 (noise). The theory ("one DRAM pass fewer must win")
+   failed on hardware: a CPU memcpy into HOST_COHERENT mapped device memory pays snoop/coherency
+   per write, exactly what the saved GPU-DMA pass costs; the GPU's own copy is nearly free. The
+   default is back to pure DEVICE_LOCAL pieces + the staged lane; STRATA_VK_MAP_ARENA=1 opts into
+   mapped pieces + the direct lane (kept: honest on machines whose caches differ, and the lane
+   counters show which path ran). The graph-node host IMPORT (law 14, external_memory_host) is
+   SEPARATE, needed for correctness, and stays. Lesson for every future "obviously redundant"
+   copy on UMA: measure the lane, not the theory.
