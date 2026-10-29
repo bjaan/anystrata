@@ -11,6 +11,8 @@ MIT License ([LICENSE](LICENSE)); some parts and every model have their own lice
 
 # anystrata — Strata for every GPU
 
+
+
 One `make`, no vendor SDK: an inference engine and OpenAI-compatible server for Mixture-of-Experts LLMs, built
 around one idea — **the experts live in VRAM**: each token reads only the few experts it routes to, so a 35B MoE
 runs at chat speed on the card you already own. The default build speaks **Vulkan**: any AMD under Mesa, any APU,
@@ -25,6 +27,12 @@ make                             # the Vulkan engine: build-vk/bin/{anystrata-gg
 make test                        # the front end against a fake engine; no GPU, no model
 make build                       # the CUDA engine, opt-in: build/bin/{anystrata-pack, anystrata-gguf, libstrata_kq.so, anystrata}
 ```
+
+<p align="center">
+  <img src="assets/any-cyan.png"
+       alt="Any Cyan — the anystrata mascot"
+       width="350">
+</p>
 
 ## Why this exists
 
@@ -291,9 +299,28 @@ time, mmap forced, and an oom-score above the session's.
 
 ## Mascot
 
-**Any Cyan** — the engine's character sheet (the sheet is the art: render from it, no image is
-shipped): [vulkan/docs/mascot.md](vulkan/docs/mascot.md). An early-twenties
-engineer in a PCB-teal cardigan; a three-disc hair-tie (the expert cache: cached / warm / cold), a strata-banded
-skirt (the bitwise quant formats), a hairpin engraved **391** — the answer she first computed on the BC-250 — and
-Silly the crate-bird hauling an 18-byte Q2_0 block. She belongs to every card that runs the engine.
-Cute, but she documents it.
+<table>
+  <tr>
+    <td width="280" valign="top">
+      <img src="vulkan/docs/any-cyan-approves.png"
+           alt="Any Cyan, the anystrata mascot"
+           width="260" />
+    </td>
+    <td valign="top">
+      <strong>Any Cyan</strong> — anystrata's mascot.
+      See her <a href="vulkan/docs/mascot.md">character sheet</a>.
+      <p>
+        An early-twenties engineer in a PCB-teal cardigan;
+        a three-disc hair-tie (the expert cache: cached / warm / cold),
+        a strata-banded skirt (the bitwise quant formats),
+        a hairpin engraved <strong>391</strong> —
+        the answer she first computed on the BC-250 —
+        and Silly the crate-bird hauling an 18-byte Q2_0 block.
+      </p>
+      <p>
+        She belongs to every card that runs the engine.
+        Cute, but she documents it.
+      </p>
+    </td>
+  </tr>
+</table>
