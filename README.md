@@ -141,8 +141,11 @@ all 10,240 routed experts in VRAM) on a Mesa-AMD card, with the Qwen3.6 sampling
 build-vk/bin/omnistrata --engine build-vk/bin/omnistrata-gguf-vk \
   -m /models/Qwen3.6-35B-A3B-GSQ-hybrid.gguf --host 127.0.0.1 --port 18090 \
   --alias qwen3.6-35b-a3b-gsq-hybrid --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0 --presence-penalty 1.5 \
-  -- --model /models/Qwen3.6-35B-A3B-GSQ-hybrid.gguf --no-graphs --max-context 16384
+  -- --model /models/Qwen3.6-35B-A3B-GSQ-hybrid.gguf --max-context 16384
 ```
+
+(Captured graphs are the default and bitwise-verified inert on this backend — `--no-graphs`
+remains as an A/B toggle for debugging.)
 
 `--max-context` on this APU: **16K / 32K with the fp16 cache, and 64K with `--kv q8_0`** — the
 q8_0 KV cache (int8 codes, one fp16 scale per 32 values: 544 bytes a row where fp16 costs 1,024)
@@ -266,7 +269,7 @@ no CUDA, no ROCm)** with Qwen3.6-35B-A3B GSQ-hybrid 2-bit, 10,240/10,240 experts
 | `pi` coding agent (1.6K-token system prompt) | served repeatedly: 52 s round trip, KV reuse, grammar parse |
 | parity vs the CUDA tree | ~50,000 outputs bitwise; runtime driver laws per GPU, measured |
 | context on the APU | 16K / 32K stable (14.1 / 13.9 GB resident); 64K needs `--kv q8_0` (store + prefill-read ported, the decode read traps by name) — PORT-NOTES laws 10-11 |
-| correctness gate (teacher-forced vs llama.cpp at the pin, 1,678 steps) | step-weighted KL 1.39x llama.cpp's own CPU-vs-GPU floor (bar: 1.5x); argmax agrees at every gap>=0.5-nat position but one near tie; draft arm bitwise-inert — table in `vulkan/PORT-STATUS.md` |
+| correctness gate (teacher-forced vs llama.cpp at the pin) | base arm 1,678 steps: step-weighted KL 1.39x llama.cpp's own CPU-vs-GPU floor (bar: 1.5x); argmax agrees at every gap>=0.5-nat position but one near tie; draft arm bitwise-inert (T0); q8_0-KV arm 1,096 steps at 1.82x (the storage trade, zero argmax flips); graphs bitwise-inert — table in `vulkan/PORT-STATUS.md` |
 
 (llama.cpp's own Vulkan backend on the same card and model: ~76 tok/s decode — the ceiling this backend climbs
 toward while keeping Strata's expert-cache design, which is what lets a 12 GB model sit entirely inside

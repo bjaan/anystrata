@@ -842,9 +842,24 @@ KL 7.8 before the mismatch was found; both sides re-forced, clean. d31k: not hos
 as machine-limited like the fork's per-machine gaps.
 
 kvq8 arm at the model level: p00-p02 produced their prompt-path steps through the new
-attend_batch q8 dequant arm and halt at attend()'s fused q8 decode read - the trap chain
-advances exactly as the ledger predicts; the fused arms are the next port task (unlocks both
-the complete kvq8 legs and the 64K serve, law 11).
+attend_batch q8 dequant arm and halted at attend()'s fused q8 decode read; once that read
+landed (e7e42f9), the FULL arm re-ran clean (2026-10-29, --no-graphs so the delta is ONLY
+the q8 cache): all 10 short legs, 1,096 steps:
+
+p00 128 top-1 .992 kl .0054 2.76x | p01 128 .992 .0010 1.59x | p02 128 1.000 .0002 0.97x
+p03 128 .984 .0048 2.05x | p04 19 1.000 .0014 2.23x | p05 128 .984 .0011 1.30x
+p06 86 1.000 .0028 1.23x | p07 58 .983 .0008 1.65x | p08 128 .992 .0008 1.27x
+p09 23 .913 .0141 1.62x     (step-weighted: 1.82x the llama.cpp floor)
+
+T1: ZERO failures across all 1,096 steps (the q8 cache flipped no gap>=0.5 position; the
+one base-arm flip does not appear here either). The 1.82x over the floor is the expected
+q8_0 representation cost (absolute KL ~0.002 mean - same order as the base arm's 0.003):
+the KV quantization is a storage decision, not an arithmetic bug; the store/dequant/fused
+reads are all bitwise-verified against the CUDA tree. 64K serve runs (law 11's unlock)
+carry this documented trade.
+
+Graphs A/B (Phase 4.2 law): 48-token canary generation, --no-graphs vs graphs: BITWISE
+IDENTICAL ids (cmp clean). Graphs are the Vulkan default from 85a87a1.
 
 Reference-leg survival notes (all recorded as PORT-NOTES laws 10/11): GPU legs pin 12.2 GB via
 TTM (both device tiers), the dump tool needed STRATA_DUMP_MMAP=1 (llama.cpp's AUTO loader copies
