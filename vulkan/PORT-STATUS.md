@@ -933,3 +933,10 @@ slow by design: 5-8 tok/s at 35% residency); the FULL-RESIDENCY regime — the o
 serves today at 16K/32K/64K-q8 — is unaffected and keeps graphs. Next step when this is picked
 up: bisect inside the collapse combo (the spec verify pass records L.card==1 passes whose
 captured d_slots_/expert bindings predate a swap that happens between capture and replay).
+Narrowing (same day): --no-draft alone still collapses; --window 2 still collapses; --lookup 0
+(window+draft defaults) is CLEAN -> the trigger is the prompt-tail LOOKUP guesser (its verify
+pass is the first multi-token capture whose recorded expert bindings go stale under a swap).
+Candidate fix next session: retire per-layer capture keys when a swap moved that layer's slots
+(the slot table is host-visible to the engine; record() lifetime belongs to the engine), or
+replay-gate on all_cached() at launch time and drop to eager when the cache moved - matching
+what CUDA's recapture cadence does implicitly via head_key/room growth.
