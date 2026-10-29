@@ -11,28 +11,28 @@ MIT License ([LICENSE](LICENSE)); some parts and every model have their own lice
 
 # anystrata — Strata for every GPU
 
-
-
-One `make`, no vendor SDK: an inference engine and OpenAI-compatible server for Mixture-of-Experts LLMs, built
-around one idea — **the experts live in VRAM**: each token reads only the few experts it routes to, so a 35B MoE
-runs at chat speed on the card you already own. The default build speaks **Vulkan**: any AMD under Mesa, any APU,
-any GPU ROCm abandoned — just the driver already installed. No installer, no downloads at build or start, no
-Python between a request and a token. The CUDA, HIP, SYCL and Metal backends stay for the cards where they win;
-CUDA remains the reference everything is measured against.
-
-```
-git clone <this repo> && cd anystrata
-git submodule update --init      # shallow, third_party/llama.cpp @ robertkarl/llama.cpp (a6de9af3)
-make                             # the Vulkan engine: build-vk/bin/{anystrata-gguf-vk, anystrata}
-make test                        # the front end against a fake engine; no GPU, no model
-make build                       # the CUDA engine, opt-in: build/bin/{anystrata-pack, anystrata-gguf, libstrata_kq.so, anystrata}
-```
-
-<p align="center">
-  <img src="vulkan/docs/any-cyan.png"
-       alt="Any Cyan — the anystrata mascot"
-       width="350">
-</p>
+<table>
+  <tr>
+    <td width="280" valign="top">
+      <img src="vulkan/docs/any.png" alt="Any Cyan, the anystrata mascot" width="260" />
+    </td>
+    <td valign="top">
+      <p>
+        One <code>make</code>, no vendor SDK: an inference engine and OpenAI-compatible server for
+        Mixture-of-Experts LLMs, built around one idea — <strong>the experts live in VRAM</strong>:
+        each token reads only the few experts it routes to, so a 35B MoE runs at chat speed on
+        the card you already own.
+      </p>
+      <p>
+        The default build speaks <strong>Vulkan</strong>: any AMD under Mesa, any APU,
+        any GPU ROCm abandoned — just the driver already installed. No installer, no downloads
+        at build or start, no Python between a request and a token. The CUDA, HIP, SYCL and
+        Metal backends stay for the cards where they win; CUDA remains the reference everything
+        is measured against.
+      </p>
+    </td>
+  </tr>
+</table>
 
 ## Why this exists
 
