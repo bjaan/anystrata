@@ -779,11 +779,22 @@ the Vulkan port now carries its write and its prefill-read arm:
   dequantization of m rows into kwork/vwork, the fp16 GEMMs unchanged; 1D-grid flattening per
   the runtime law; pairs written by even lanes (no word RMW race). A parity case for the arm is
   the next step (run_batch gains a q8 variant: same order reference, f16-rounded codes as input).
-* `store_q8_at` + `attend`'s fused q8 read (decode path: attn_score_reg/attn_values template
-  arms) — still traps by name; decode q8 needs the fused arms (bigger job: attend_score.comp
-  N/STEPS variants take Q8 as a template parameter). The chain so far: prompt path.
-cublasGemmStridedBatchedEx's cache stride arg is int (ld=width: 512 values qwen35moe), so the
-64K row count is fine, but at 131072 rows the byte offsets pass int32 — check before 128K.
+* `attend` fused q8 read (2026-10-28, e7e42f9): ATT_Q8=1 variants of ALL four score reg arms
+  and all three value arms, bound at 4/5 (codes: 4 int8 a word, scales: one f16 per 32 values,
+  x = float(code)*d as f32 — CUDA-faithful, no f16 step unlike the workspace arm). Parity:
+  three q8 cases rel_l1 ~1e-7 vs the order reference AND the naive reference. Span law: exact
+  bindings, NO +8 word slack (width % 32 == 0 keeps reads in-row; the slack crossed pieces —
+  the f16 cache's u64-read law does NOT carry to q8 words).
+* Model gate (--kv q8_0, hybrid, 16K): FULL end-to-end, zero traps — canary ids stable, decode
+  11-13 tok/s (q8 read arms add ~30% decode cost at short ctx; prefill unaffected). The earlier
+  pitfall (the test's host ref double-transformed the packed scale words while the kernel was
+  right) is why the isolate-arms method (q8 keys only / q8 values only) stays in the toolbox.
+* store_q8_at: still a trap (no wired card-time row reader under --no-graphs; Phase 4.2's at-
+  counters will demand it).
+* LAW 11 UNLOCKED: serve at --max-context 65536 --kv q8_0 ran on the box (q8 KV 1.28 GiB vs
+  fp16's 2.56): arena fits, all 10,240 experts STILL resident (8.4 GiB), resident RAM ~13.8 GB.
+  cublasGemmStridedBatchedEx's ld stays int-safe at 64K rows (width 512 values); 128K would put
+  codes' byte offsets past int32 — still machine-limited for other reasons (law 11).
 
 ## Phase 5 — the formal correctness gate on the Vulkan engine (2026-10-27/28, this BC-250)
 
