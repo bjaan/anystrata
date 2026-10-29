@@ -17,7 +17,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <chrono>
+#include <execinfo.h>
 #include <map>
 #include <atomic>
 #include <mutex>
@@ -266,11 +268,136 @@ void pend_flush_locked() {   // g_pm held; end+submit with a fence, NO wait
     g_inflight.push_back(InFlight{f, g_pend.cb, g_pend.dp});
     g_pend = PendingCB{};
 }
+void flush_wait_why(const char* why) {
+    // STRATA_VK_FLUSH_WHY=1: count drains by call site (the 4.2-slim measurement: WHO drains).
+    static const bool on = getenv("STRATA_VK_FLUSH_WHY") != nullptr;
+    if (!on) return;
+    static std::map<std::string, long long> counts;
+    static struct Dump { ~Dump() {
+        for (auto& kv : counts) std::fprintf(stderr, "  flush_wait %s: %lld\n", kv.first.c_str(), kv.second); } } dump;
+    counts[why]++;
+}
+}  // namespace (the pending-CB helpers above; the graph layer below gets strata::vk linkage)
+// ---------- Phase 4.2: graph capture (the plan's Phase 4; replaces the compat graph traps) ----------
+// A captured graph is ONE pre-recorded command buffer (multi-submit usage) plus the descriptor
+// pool its sets were allocated from (kept alive for the graph's life; never reset). BeginCapture
+// opens it; launches record into it exactly like the pending path but with the OLD barrier law
+// (full-RW after EVERY dispatch - no cluster elision while capturing: bit-safe by construction,
+// the eager pre-4.1 ordering replayed as one submit). Copies/events/fills during capture ABORT
+// loudly (a drain during capture is illegal; a silently skipped copy would replay nothing).
+// EndCapture closes the CB; GraphLaunch submits it (waiting the graph's own previous fence
+// first: CUDA's stream semantics serialize replays, and Vulkan forbids re-submitting a CB that
+// is still executing). Instantiate is the capture close point in the engine's flow (EndCapture
+// then Instantiate then destroy graph): the graph HANDLE carries the CB/pool until instantiate
+// moves it to the exec handle.
+// pools chain: one small pool per 128 sets (a typical layer graph records tens of dispatches);
+// the sets must outlive the CB's record, the CB must stay valid for replays: pools free only at
+// graph destroy. (A big shared pool preallocates descriptors RADV never releases; measured cost
+// would be hundreds of MB across ~1,600 layer graphs.)
+constexpr uint32_t kGraphPoolSets = 128;
+struct GraphObj { VkCommandBuffer cb = VK_NULL_HANDLE; std::vector<VkDescriptorPool> dps;
+                  uint32_t sets_left = 0; uint32_t dispatches = 0; bool open = false; };
+static GraphObj g_cap;
+static std::vector<GraphObj> g_graphs;        // instantiated graphs (exec handles index these)
+static std::vector<VkFence> g_graph_fence;    // one per exec: the LAST replay of that graph
+static std::vector<bool> g_graph_fence_live;
+static bool g_capturing = false;
+uint32_t capture_dispatches() { return g_graphs.size(); }
+
+void graph_begin() {
+    std::lock_guard<std::mutex> plk(g_pm);
+    if (g_capturing) throw std::runtime_error("vk_runtime: capture already open");
+    pend_flush_locked();                     // prior eager work is submitted first: capture starts clean
+    VkDevice dev = (VkDevice)vk_handle();
+    ensure_cmd_pool();
+    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = g_pool; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
+    RT(vkAllocateCommandBuffers(dev, &cai, &g_cap.cb));
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = 0;   // NOT one-time: the graph replays this CB many times
+    RT(vkBeginCommandBuffer(g_cap.cb, &bi));
+    VkDescriptorPoolSize psz{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kGraphPoolSets * 16};
+    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpi.maxSets = kGraphPoolSets; dpi.poolSizeCount = 1; dpi.pPoolSizes = &psz;
+    VkDescriptorPool p0; RT(vkCreateDescriptorPool(dev, &dpi, nullptr, &p0));
+    g_cap.dps.push_back(p0); g_cap.sets_left = kGraphPoolSets;
+    g_cap.dispatches = 0; g_cap.open = true;
+    g_capturing = true;
+}
+uint32_t graph_end() {   // returns the recorded dispatch count; registers a graph object
+    std::lock_guard<std::mutex> plk(g_pm);
+    if (!g_capturing) throw std::runtime_error("vk_runtime: graph_end with no capture open");
+    RT(vkEndCommandBuffer(g_cap.cb));
+    g_graphs.push_back(g_cap);
+    g_graph_fence.push_back(VK_NULL_HANDLE);
+    g_graph_fence_live.push_back(false);
+    const uint32_t d = g_cap.dispatches;
+    g_cap = GraphObj{}; g_capturing = false;
+    return d;
+}
+void graph_destroy(uint32_t gi) {
+    std::lock_guard<std::mutex> plk(g_pm);
+    if (gi >= g_graphs.size()) return;
+    VkDevice dev = (VkDevice)vk_handle();
+    if (g_graph_fence[gi] != VK_NULL_HANDLE) {
+        RT(vkWaitForFences(dev, 1, &g_graph_fence[gi], VK_TRUE, ~0ull));
+        vkDestroyFence(dev, g_graph_fence[gi], nullptr);
+    }
+    for (auto dp : g_graphs[gi].dps) vkDestroyDescriptorPool(dev, dp, nullptr);
+    g_graphs[gi].dps.clear();
+    vkFreeCommandBuffers(dev, g_pool, 1, &g_graphs[gi].cb);
+    g_graphs[gi] = GraphObj{};
+}
+void graph_launch(uint32_t gi) {
+    std::lock_guard<std::mutex> plk(g_pm);
+    if (!g_capturing && g_pend.cb) pend_flush_locked();   // eager work first: stream order
+    if (gi >= g_graphs.size() || !g_graphs[gi].cb) throw std::runtime_error("vk_runtime: graph launch of an unregistered/destroyed graph");
+    VkDevice dev = (VkDevice)vk_handle();
+    // CUDA stream semantics: this replay runs after the graph's previous replay completed.
+    if (g_graph_fence_live[gi]) {
+        RT(vkWaitForFences(dev, 1, &g_graph_fence[gi], VK_TRUE, ~0ull));
+        vkDestroyFence(dev, g_graph_fence[gi], nullptr);
+    }
+    VkFence f; VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    RT(vkCreateFence(dev, &fi, nullptr, &f));
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1; si.pCommandBuffers = &g_graphs[gi].cb;
+    RT(vkQueueSubmit((VkQueue)vk_default_queue(), 1, &si, f));
+    g_graph_fence[gi] = f; g_graph_fence_live[gi] = true;
+}
+void graph_sync_all() {   // device_sync/stream_sync also drain graph fences
+    std::lock_guard<std::mutex> plk(g_pm);
+    VkDevice dev = (VkDevice)vk_handle();
+    for (size_t i = 0; i < g_graph_fence.size(); ++i) if (g_graph_fence_live[i]) {
+        vkWaitForFences(dev, 1, &g_graph_fence[i], VK_TRUE, ~0ull);
+        vkDestroyFence(dev, g_graph_fence[i], nullptr);
+        g_graph_fence[i] = VK_NULL_HANDLE; g_graph_fence_live[i] = false;
+    }
+}
+bool capturing() { return g_capturing; }
+uint32_t graph_dispatches(uint32_t gi) { std::lock_guard<std::mutex> plk(g_pm);
+    return gi < g_graphs.size() ? g_graphs[gi].dispatches : 0; }
+uint32_t capture_graph_count() { std::lock_guard<std::mutex> plk(g_pm); return (uint32_t)g_graphs.size(); }
+
+// (back to the file's anonymous namespace for the flush/launch paths below, which use the
+// graph state above and the g_* state further down; declared-visible since they are in this TU)
+namespace {
 void flush_wait() {          // flush pending, then wait ALL in-flight fences (all queue ops under g_pm)
+    if (g_capturing) {       // a sync point inside a capture body: recorded as-is would reorder;
+                             // silently dropping it would replay wrong. Loud trap (the port's law).
+        std::fprintf(stderr, "strata-vk: flush_wait inside a graph capture - the capture body hit a sync/copy site; refusing\n");
+        std::abort();
+    }
     // stall time spent draining the queue:
     static const bool ft = getenv("STRATA_VK_LAUNCH_TIME") != nullptr;
     const auto t0 = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> plk(g_pm);
+    // graph replays in flight belong to the same stream: drain their fences too
+    for (size_t i = 0; i < g_graph_fence.size(); ++i) if (g_graph_fence_live[i]) {
+        RT(vkWaitForFences((VkDevice)vk_handle(), 1, &g_graph_fence[i], VK_TRUE, ~0ull));
+        vkDestroyFence((VkDevice)vk_handle(), g_graph_fence[i], nullptr);
+        g_graph_fence[i] = VK_NULL_HANDLE; g_graph_fence_live[i] = false;
+    }
     pend_flush_locked();
     VkQueue q = (VkQueue)vk_default_queue();
     RT(vkQueueWaitIdle(q));   // drains EVERYTHING (incl. other threads' recorded work)
@@ -343,8 +470,14 @@ Arena& Arena::instance() { static Arena a; return a; }
 std::atomic<uint64_t> g_stream_token{1};
 void* stream_create() { return (void*)(uintptr_t) g_stream_token.fetch_add(1); }
 void stream_destroy(void*) {}
-void stream_sync(void*) { flush_wait(); }
-void device_sync() { std::lock_guard<std::mutex> plk(g_pm); pend_flush_locked();
+void stream_sync(void*) { flush_wait_why("stream_sync"); flush_wait(); }
+void device_sync() { std::lock_guard<std::mutex> plk(g_pm);
+                     for (size_t i = 0; i < g_graph_fence.size(); ++i) if (g_graph_fence_live[i]) {
+                         RT(vkWaitForFences((VkDevice)vk_handle(), 1, &g_graph_fence[i], VK_TRUE, ~0ull));
+                         vkDestroyFence((VkDevice)vk_handle(), g_graph_fence[i], nullptr);
+                         g_graph_fence[i] = VK_NULL_HANDLE; g_graph_fence_live[i] = false;
+                     }
+                     pend_flush_locked();
                      RT(vkDeviceWaitIdle((VkDevice)vk_handle()));
                      VkDevice dev = (VkDevice)vk_handle();
                      for (auto& x : g_inflight) { vkDestroyFence(dev, x.fence, nullptr);
@@ -356,13 +489,31 @@ struct Ev { };
 void* event_create() { return new Ev{}; }
 void event_destroy(void* e) { delete (Ev*)e; }
 // host-clock timing: the queue must be idle when the event is recorded
-void event_record(void*, void*) { flush_wait(); }
+void event_record(void*, void*) { flush_wait_why("event_record"); flush_wait(); }
 void event_wait(void*, void*) {}
 float event_elapsed(void*, void*) { return 0.f; }
 
 void copy_h2d(void* dst, const void* src, uint64_t bytes, void*) {
+    if (getenv("STRATA_VK_FLUSH_WHY")) {   // (size, offset) histogram of eager h2d copies (probe only)
+        static std::map<std::pair<uint64_t,uint64_t>, long long> hist;
+        static long long g_bt_done = 0;
+        static struct HD { ~HD() {
+            std::fprintf(stderr, "  copy_h2d (size, dst) pairs (top 12):\n");
+            std::vector<std::pair<std::pair<uint64_t,uint64_t>, long long>> v(hist.begin(), hist.end());
+            std::sort(v.begin(), v.end(), [](auto& a, auto& b){ return a.second > b.second; });
+            for (size_t i = 0; i < v.size() && i < 12; ++i)
+                std::fprintf(stderr, "    %8llu B  dst +%llu: %lld\n", (unsigned long long)v[i].first.first,
+                             (unsigned long long)v[i].first.second, (long long)v[i].second); } } hd;
+        hist[{bytes, (uint64_t)(uintptr_t)dst}]++;
+        if (bytes == 294912 && g_bt_done < 3) {   // who: one backtrace per site, 3 max
+            g_bt_done++;
+            void* bt[16]; int n = backtrace(bt, 16);
+            std::fprintf(stderr, "copy_h2d 288KiB backtrace:\n");
+            backtrace_symbols_fd(bt, n, 2);
+        }
+    }
     std::lock_guard<std::mutex> lk(g_m);
-    flush_wait();   // eager-copy rule: never let a stage write race a recorded stage copy
+    flush_wait_why("copy_h2d"); flush_wait();   // eager-copy rule: never let a stage write race a recorded stage copy
     uint64_t at = (uint64_t)(uintptr_t)dst, off = 0;
     while (off < bytes) {
         uint64_t n = bytes - off < (2ull << 20) ? bytes - off : (2ull << 20);
@@ -375,7 +526,7 @@ void copy_h2d(void* dst, const void* src, uint64_t bytes, void*) {
 }
 void copy_d2h(void* dst, const void* src, uint64_t bytes, void*) {
     std::lock_guard<std::mutex> lk(g_m);
-    flush_wait();   // the d2h result is what the sampler needs: right sync point
+    flush_wait_why("copy_d2h"); flush_wait();   // the d2h result is what the sampler needs: right sync point
     uint64_t at = (uint64_t)(uintptr_t)src, off = 0;
     while (off < bytes) {
         uint64_t n = bytes - off < (2ull << 20) ? bytes - off : (2ull << 20);
@@ -387,8 +538,26 @@ void copy_d2h(void* dst, const void* src, uint64_t bytes, void*) {
     }
 }
 void fill_d(void* dst, uint8_t byte, uint64_t bytes, void*) {
+    if (g_capturing) {   // Phase 4.2: fills ARE recordable (vkCmdFillBuffer, the CUDA
+                         // cudaMemsetAsync analogue): no staging, no drain. Chunk by piece.
+        std::lock_guard<std::mutex> lk(g_m);       // pieces: g_m, then g_pm (the leaf), matching
+        std::lock_guard<std::mutex> caplk(g_pm);   // the launch path's order
+        VkDevice dev = (VkDevice)vk_handle();
+        const uint32_t pat = uint32_t(byte) * 0x01010101u;
+        uint64_t at = (uint64_t)(uintptr_t)dst, off = 0;
+        while (off < bytes) {
+            uint64_t n = bytes - off;
+            if (uint64_t room = piece_room(at + off)) { if (n > room) n = room; }
+            auto it = std::find_if(g_pieces.begin(), g_pieces.end(), [&](const Piece& p){
+                return p.base <= at + off && at + off + n <= p.base + p.size; });
+            if (it == g_pieces.end()) throw std::runtime_error("vk_runtime: fill crosses an arena piece");
+            vkCmdFillBuffer(g_cap.cb, it->buf, (at + off) - it->base, n, pat);
+            off += n;
+        }
+        return;
+    }
     std::lock_guard<std::mutex> lk(g_m);
-    flush_wait();   // eager-copy rule (fill writes the shared stage too)
+    flush_wait_why("fill_d"); flush_wait();   // eager-copy rule (fill writes the shared stage too)
     stage_ensure(1ull << 20);
     const uint64_t chunk = g_stage_size;
     uint64_t off = 0;
@@ -572,6 +741,36 @@ void kernel_launch_sized_rw(const Kernel& k, int groups_x, const uint64_t* buffe
     // Batched path: allocate the set from the PENDING pool (one per pending CB, recycled at
     // flush) and record bind+push+dispatch into the pending CB. When the CB hits the set cap,
     // end/submit it with a fence (no wait) and open a fresh CB+pool pair.
+    if (g_capturing) {
+        // capture path: record into the graph CB, its own pool, the OLD per-dispatch barrier law
+        std::lock_guard<std::mutex> caplk(g_pm);   // leaf lock, same order as the pending path
+        VkDescriptorSet ds; VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        if (g_cap.sets_left == 0) {   // next pool in the chain
+            VkDescriptorPoolSize psz{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kGraphPoolSets * 16};
+            VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            dpi.maxSets = kGraphPoolSets; dpi.poolSizeCount = 1; dpi.pPoolSizes = &psz;
+            VkDescriptorPool p; RT(vkCreateDescriptorPool(dev, &dpi, nullptr, &p));
+            g_cap.dps.push_back(p); g_cap.sets_left = kGraphPoolSets;
+        }
+        dai.descriptorPool = g_cap.dps.back(); dai.descriptorSetCount = 1; dai.pSetLayouts = &impl.dsl;
+        RT(vkAllocateDescriptorSets(dev, &dai, &ds));
+        g_cap.sets_left--;
+        std::vector<VkWriteDescriptorSet> wrc(n_buffers);
+        for (int i = 0; i < n_buffers; i++) {
+            wrc[i] = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            wrc[i].dstSet = ds; wrc[i].dstBinding = (uint32_t)i; wrc[i].descriptorCount = 1;
+            wrc[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wrc[i].pBufferInfo = &dbi[i];
+        }
+        vkUpdateDescriptorSets(dev, (uint32_t)n_buffers, wrc.data(), 0, nullptr);
+        vkCmdBindPipeline(g_cap.cb, VK_PIPELINE_BIND_POINT_COMPUTE, impl.pipe);
+        vkCmdBindDescriptorSets(g_cap.cb, VK_PIPELINE_BIND_POINT_COMPUTE, impl.layout, 0, 1, &ds, 0, nullptr);
+        if (impl.pc_bytes && push_constants)
+            vkCmdPushConstants(g_cap.cb, impl.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, impl.pc_bytes, push_constants);
+        vkCmdDispatch(g_cap.cb, (uint32_t)groups_x, 1, 1);
+        emit_full_barrier(g_cap.cb);        // the eager ordering, frozen: every dispatch fenced off
+        g_cap.dispatches++;
+        return;
+    }
     std::lock_guard<std::mutex> plk(g_pm);
     if (!g_pend.cb || g_pend.sets >= max_sets_per_cb()) {
         pend_flush_locked();      // submit the full CB (if any), fence, no wait

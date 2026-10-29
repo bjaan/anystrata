@@ -782,6 +782,12 @@ target_include_directories(strata_vk_core PUBLIC
   ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(strata_vk_core PUBLIC strata_vk_compat)
 
+# Phase 4.2: the capture layer pinned alone (record/replay bits vs eager; destroy; flags)
+add_executable(vk_graph_capture src/tests/vk_graph_capture.cpp)
+target_include_directories(vk_graph_capture PRIVATE ${STRATA_ROOT}/include ${STRATA_ROOT}/src/poly ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
+target_link_libraries(vk_graph_capture PRIVATE strata_vk_kernel_store_f16 strata_vk_runtime strata_vk_compat)
+add_test(NAME vk_graph_capture COMMAND vk_graph_capture)
+
 add_executable(vk_core_smoke src/tests/vk_core_smoke.cpp ${STRATA_ROOT}/src/platform/memory.cpp)
 target_include_directories(vk_core_smoke PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(vk_core_smoke PRIVATE strata_vk_core)

@@ -86,6 +86,15 @@ void  event_wait(void* e, void* s);                      // stream waits on even
 float event_elapsed(void* from, void* to);
 
 // ---- copies between the arena and host memory (pinned or ordinary; the loader handles staging).
+// ---- Phase 4.2: graph capture (compat cudaGraph* family drives these).
+void graph_begin();               // open a capture on the default queue
+uint32_t graph_end();             // close it; returns the recorded dispatch count, registers a graph
+void graph_launch(uint32_t gi);   // replay graph gi (stream order: pending + its own prior replay first)
+void graph_destroy(uint32_t gi);  // free CB + pools after waiting its last replay
+bool capturing();                 // a capture is open: copies/syncs inside the body abort loudly
+uint32_t capture_graph_count();   // registered graphs (launch indices are this order)
+uint32_t graph_dispatches(uint32_t gi);   // launches a captured graph recorded (its node count)
+
 void copy_h2d(void* dst_arena, const void* src_host, uint64_t bytes, void* stream);
 void copy_d2h(void* dst_host, const void* src_arena, uint64_t bytes, void* stream);
 void fill_d(void* dst_arena, uint8_t byte, uint64_t bytes, void* stream);

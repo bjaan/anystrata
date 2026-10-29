@@ -537,25 +537,47 @@ inline cudaError_t cudaEventElapsedTime(float* ms, cudaEvent_t from, cudaEvent_t
     return cudaSuccess;
 }
 
-// ---- the graph family: TRAPS ------------------------------------------------------------------------------
-// The plan is explicit: `--no-graphs` is the interim, and a fake capture would replay NOTHING while
-// reporting success.  These name themselves and stop the run; Phase 4 replaces them with recorded command
-// buffers.  `graph.cpp` (the only file that drives this family today) is not compiled by this backend.
+// ---- the graph family: Phase 4.2, recorded command buffers ---------------------------------------------
+// vk_runtime's capture layer (graph_begin/end/launch/destroy) drives these. A capture records the
+// body's launches into ONE multi-submit command buffer with the eager per-dispatch barrier law;
+// replay is one vkQueueSubmit. A sync/copy site inside a capture body aborts LOUDLY (the runtime
+// checks `capturing()` at every drain point) - the doorbell law says nothing may be skipped in
+// silence. graph.cpp (core) is still not compiled here; engine.cpp's record()/replayed() drive
+// this family directly under --graphs.
 [[noreturn]] inline void strata_vk_graph_trap(const char* what) {
     std::fprintf(stderr, "strata-vk: %s not ported; run with --no-graphs\n", what);
     std::abort();
 }
-inline cudaError_t cudaStreamBeginCapture(cudaStream_t, cudaStreamCaptureMode) { strata_vk_graph_trap("cudaStreamBeginCapture"); }
-inline cudaError_t cudaStreamEndCapture(cudaStream_t, cudaGraph_t*) { strata_vk_graph_trap("cudaStreamEndCapture"); }
-inline cudaError_t cudaGraphDestroy(cudaGraph_t) { strata_vk_graph_trap("cudaGraphDestroy"); }
-inline cudaError_t cudaGraphExecDestroy(cudaGraphExec_t) { strata_vk_graph_trap("cudaGraphExecDestroy"); }
-inline cudaError_t cudaGraphGetNodes(cudaGraph_t, cudaGraphNode_t*, size_t*) { strata_vk_graph_trap("cudaGraphGetNodes"); }
+// handles: (index+1) as a pointer; 0/null is the engine's own "none" value.
+inline cudaError_t cudaStreamBeginCapture(cudaStream_t, cudaStreamCaptureMode) {
+    strata::vk::graph_begin(); return cudaSuccess; }
+inline cudaError_t cudaStreamEndCapture(cudaStream_t, cudaGraph_t* g) {
+    if (!g) return cudaErrorInvalidValue;
+    strata::vk::graph_end();
+    // the graph handle is the LAST registered index: engine.cpp ends capture right after each body
+    *g = (cudaGraph_t)(uintptr_t)(strata::vk::capture_graph_count());   // 1-based via the count
+    return cudaSuccess; }
+inline cudaError_t cudaGraphDestroy(cudaGraph_t) { return cudaSuccess; }   // the exec owns the CB now
+inline cudaError_t cudaGraphExecDestroy(cudaGraphExec_t e) {
+    if (!e) return cudaSuccess;
+    strata::vk::graph_destroy((uint32_t)((uintptr_t)e - 1)); return cudaSuccess; }
+inline cudaError_t cudaGraphGetNodes(cudaGraph_t g, cudaGraphNode_t*, size_t* n) {
+    if (n) *n = g ? strata::vk::graph_dispatches((uint32_t)((uintptr_t)g - 1)) : 0; return cudaSuccess; }
 inline cudaError_t cudaGraphGetEdges(cudaGraph_t, cudaGraphNode_t*, cudaGraphNode_t*, cudaGraphEdgeData*, size_t*) { strata_vk_graph_trap("cudaGraphGetEdges"); }
 inline cudaError_t cudaGraphGetEdges_v2(cudaGraph_t, cudaGraphNode_t*, cudaGraphNode_t*, cudaGraphEdgeData*, size_t*) { strata_vk_graph_trap("cudaGraphGetEdges_v2"); }
-inline cudaError_t cudaGraphInstantiate(cudaGraphExec_t*, cudaGraph_t, cudaGraphNode_t*, char*, size_t) { strata_vk_graph_trap("cudaGraphInstantiate"); }
-inline cudaError_t cudaGraphInstantiate(cudaGraphExec_t*, cudaGraph_t, unsigned long long) { strata_vk_graph_trap("cudaGraphInstantiate"); }
-inline cudaError_t cudaGraphInstantiateWithFlags(cudaGraphExec_t*, cudaGraph_t, unsigned long long) { strata_vk_graph_trap("cudaGraphInstantiateWithFlags"); }
-inline cudaError_t cudaGraphLaunch(cudaGraphExec_t, cudaStream_t) { strata_vk_graph_trap("cudaGraphLaunch"); }
+inline cudaError_t cudaGraphInstantiate(cudaGraphExec_t* e, cudaGraph_t g, cudaGraphNode_t*, char*, size_t) {
+    if (!e || !g) return cudaErrorInvalidValue;
+    *e = g;                       // same index: the captured CB becomes the exec directly
+    return cudaSuccess; }
+inline cudaError_t cudaGraphInstantiate(cudaGraphExec_t* e, cudaGraph_t g, unsigned long long) {
+    if (!e || !g) return cudaErrorInvalidValue;
+    *e = g; return cudaSuccess; }
+inline cudaError_t cudaGraphInstantiateWithFlags(cudaGraphExec_t* e, cudaGraph_t g, unsigned long long) {
+    if (!e || !g) return cudaErrorInvalidValue;
+    *e = g; return cudaSuccess; }
+inline cudaError_t cudaGraphLaunch(cudaGraphExec_t e, cudaStream_t) {
+    if (!e) return cudaErrorInvalidValue;
+    strata::vk::graph_launch((uint32_t)((uintptr_t)e - 1)); return cudaSuccess; }
 inline cudaError_t cudaGraphUpload(cudaGraphExec_t, cudaStream_t) { strata_vk_graph_trap("cudaGraphUpload"); }
 inline cudaError_t cudaGraphNodeGetType(cudaGraphNode_t, cudaGraphNodeType*) { strata_vk_graph_trap("cudaGraphNodeGetType"); }
 inline cudaError_t cudaGraphKernelNodeGetParams(cudaGraphNode_t, cudaKernelNodeParams*) { strata_vk_graph_trap("cudaGraphKernelNodeGetParams"); }
