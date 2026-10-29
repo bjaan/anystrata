@@ -161,7 +161,14 @@ uint64_t arena_add(uint64_t bytes) {   // returns the base the region was PLACED
             VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev, buf, &mr);
             VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
             mai.allocationSize = mr.size;
-            static const bool want_map = getenv("STRATA_VK_NO_MAP_ARENA") == nullptr;
+            // MEASURED (2026-10-29, swap-regime A/B x2 each): the mapped-direct lane is NOT
+            // faster on this APU - loads 16.4/18.1 s vs 15.2/15.2 s staged, decode equal in
+            // noise: a CPU memcpy into host-COHERENT mapped device memory pays snoop costs,
+            // while the staged path's GPU-side DMA runs at full speed and the host only ever
+            // memcpys ordinary cached RAM. The SSD and CPU-experts dominate either way.
+            // Default: pure DEVICE_LOCAL (the staged lane). STRATA_VK_MAP_ARENA=1 opts into
+            // mapped pieces + the direct lane (kept for machines where the math differs).
+            static const bool want_map = getenv("STRATA_VK_MAP_ARENA") != nullptr;
             // the file's mem_type() falls back to DEVICE_LOCAL when the combined ask has no type,
             // but that fallback would silently land pieces in ANY device-local type: fine -
             // map_piece() below only maps what is actually host-visible.
