@@ -149,7 +149,10 @@ build-vk/bin/anystrata --engine build-vk/bin/anystrata-gguf-vk \
 ```
 
 (Captured graphs are the default and bitwise-verified inert on this backend — `--no-graphs`
-remains as an A/B toggle for debugging.)
+remains as an A/B toggle for debugging, and is the recommended setting for the SWAP regime
+(`--vram-reserve-mib` big enough that experts leave the card): a deterministic collapse there
+is recorded as an open bug in `vulkan/PORT-STATUS.md`; every full-residency serve config on
+this box — including 64K with `--kv q8_0` — runs on graphs and is verified bitwise.)
 
 `--max-context` on this APU: **16K / 32K with the fp16 cache, and 64K with `--kv q8_0`** — the
 q8_0 KV cache (int8 codes, one fp16 scale per 32 values: 544 bytes a row where fp16 costs 1,024)

@@ -273,3 +273,16 @@ reach them (they are in the .cu files, which stay uncompiled); dim3/vector types
    still flush_wait FIRST — the win is the removed stage, not relaxed syncs); STRATA_VK_NO_MAP_ARENA=1
    A/Bs it. Do NOT confuse with heap 0 (5.1 GiB, flags "None"): that is the system heap and
    law 10's pinning problem lives there.
+
+14. **Recorded H2D inside a graph reads LIVE host pages (external_memory_host import), never
+   frozen copies (measured 2026-10-29).** A CUDA graph memcpy node carries POINTERS and re-reads
+   the host buffer at every replay; freezing bytes into a stage at capture corrupts any capture
+   whose body includes a host-pinned scratch another thread rewrites (the swap regime's h_cpu_ /
+   expert staging). RADV imports page-aligned host allocations
+   (VK_EXT_external_memory_host, minImportedHostPointerAlignment=4096; the compat cudaHostAlloc
+   is aligned_alloc(4096, page-multiple): exact). Imports are per-graph objects, freed at
+   graph_destroy. Also: ThreadLocal capture mode is EXACT — foreign threads' flush_wait/copy
+   calls during someone else's capture must take the eager path (cap_here(), not capturing());
+   a staging thread aborted mid-capture was the first symptom. And the direct-memcpy arena lane
+   bypasses the queue, so drain+memcpy must share ONE g_pm section (every submit path takes
+   g_pm): the staged path got that ordering free because its arena write WAS a queue op.
