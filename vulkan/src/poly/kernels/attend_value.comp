@@ -8,6 +8,10 @@
 // the 2D grid dim3(kv_heads*dims, blocks/y) flattened x-fastest by the launcher (gxdim carries
 // kv_heads*dims).
 //
+// Q8 arm (ATT_Q8=1, the kvq8 decode read; the CUDA template arms attn_value_kernel<true>/
+// attn_value_t_kernel<T,true>): codes at the fp16 cache's element index (4 int8 a uint word,
+// LE lanes), one f16 scale per 32-value block (2 f16 a word), x = float(code)*d as an f32
+// product (kernels.cu:1266,1271-1272:1531-1535) - the binding layout mirrors store_q8's words.
 // fp16 cache decode is BIT-EXACT (the f16_to_float bit build shared with attend_score.comp;
 // half -> float is exact, subnormals normalized, no truncation).
 //
@@ -33,6 +37,9 @@
 #ifndef ATT_VARIANT
 #define ATT_VARIANT 0
 #endif
+#ifndef ATT_Q8
+#define ATT_Q8 0
+#endif
 
 layout(local_size_x = 1024) in;   // VALUE_DIMS (32) * VALUE_SHARES (32)
 
@@ -44,6 +51,10 @@ layout(std430, binding = 0) readonly buffer WT { float v[]; } bwt;   // transpos
 layout(std430, binding = 1) readonly buffer VC { uint v[]; } bvc;    // fp16 value cache, u32 pairs
 layout(std430, binding = 2)           buffer OUT { float v[]; } bout;
 layout(std430, binding = 3) readonly buffer AT { uint v[]; } bat;    // on-card pos; bound to OUT when null
+#if ATT_Q8
+layout(std430, binding = 4) readonly buffer VC8 { uint v[]; } bvc8;  // codes: 4 int8 a word
+layout(std430, binding = 5) readonly buffer VS8 { uint v[]; } bvs8;  // scales: 2 f16 a word
+#endif
 
 layout(push_constant) uniform PC {
     uint n_keys, dim, n_head, kv_heads, pos, first, tokens,
@@ -115,8 +126,16 @@ void main() {
     for (int i = 0; i < 8; ++i) acc[i] = 0.0;
     for (int j = int(s); j < span; j += 32) {
         const uint e = uint(row) * width + uint(g) * pc.dim + dd;   // CUDA 1337: v = vcache + g*dim + dd
+#if ATT_Q8
+        const uint cw = bvc8.v[e >> 2u];
+        const uint b = (cw >> (8u * (e & 3u))) & 0xFFu;
+        const uint sw = bvs8.v[(e >> 5u) >> 1u];
+        const float d = f16_to_float(((e >> 5u) & 1u) == 0u ? (sw & 0xFFFFu) : (sw >> 16u));
+        const float x = float(int(b | ((b & 0x80u) != 0u ? 0xFFFFFF00u : 0u))) * d;
+#else
         const uint pair = bvc.v[e >> 1u];
         const float x = f16_to_float((e & 1u) != 0u ? (pair >> 16u) : (pair & 0xFFFFu));
+#endif
         for (int i = 0; i < live; ++i)
             acc[i] += bsc.v[wq[i] + uint(j)] * x;   // CUDA 1275: shfl(weight, i) * x, then +=
         row += 32;
@@ -147,8 +166,16 @@ void main() {
     const uint vcol = uint(g) * pc.dim + dd;
     for (int j = int(s); j < span; j += 32) {
         const uint e = uint(row) * width + vcol;
+#if ATT_Q8
+        const uint cw = bvc8.v[e >> 2u];
+        const uint b = (cw >> (8u * (e & 3u))) & 0xFFu;
+        const uint sw = bvs8.v[(e >> 5u) >> 1u];
+        const float d = f16_to_float(((e >> 5u) & 1u) == 0u ? (sw & 0xFFFFu) : (sw >> 16u));
+        const float x = float(int(b | ((b & 0x80u) != 0u ? 0xFFFFFF00u : 0u))) * d;
+#else
         const uint pair = bvc.v[e >> 1u];
         const float x = f16_to_float((e & 1u) != 0u ? (pair >> 16u) : (pair & 0xFFFFu));
+#endif
         acc[0][0] += bwt.v[wb0 + uint(j) * 8u + 0u] * x;
         acc[0][1] += bwt.v[wb0 + uint(j) * 8u + 1u] * x;
         acc[0][2] += bwt.v[wb0 + uint(j) * 8u + 2u] * x;

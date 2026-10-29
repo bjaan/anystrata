@@ -52,6 +52,14 @@ namespace {
 #include "attend_value_t1.spv.h"
 #include "attend_value_t2.spv.h"
 #include "attend_value_plain.spv.h"
+// the fused q8 arms (ATT_Q8=1): the kvq8 decode read, law 11's unlock
+#include "attend_score_4_1_q8.spv.h"
+#include "attend_score_8_2_q8.spv.h"
+#include "attend_score_4_2_q8.spv.h"
+#include "attend_score_4_4_q8.spv.h"
+#include "attend_value_t1_q8.spv.h"
+#include "attend_value_t2_q8.spv.h"
+#include "attend_value_plain_q8.spv.h"
 
 // force_subgroup32=false everywhere (the rms_norm/gdn reasoning): every shuffle offset here is
 // <= 16 or an absolute read of lane < 8, and aligned 32-lane blocks never mix under wave64;
@@ -77,12 +85,47 @@ const vk::Kernel& pl_score(int n, int steps) {
     }
     return it->second;
 }
+// the fused q8 score arms (ATT_Q8=1): same four reg variants, codes/scales bound 4/5.
+const vk::Kernel& pl_score_q8(int n, int steps) {
+    static std::map<std::pair<int, int>, vk::Kernel> ks;
+    auto it = ks.find({n, steps});
+    if (it == ks.end()) {
+        static const std::map<std::pair<int, int>, std::pair<const uint32_t*, size_t>> spvs = {
+            {{4, 1}, {attend_score_4_1_q8_spv, attend_score_4_1_q8_spv_len}},
+            {{8, 2}, {attend_score_8_2_q8_spv, attend_score_8_2_q8_spv_len}},
+            {{4, 2}, {attend_score_4_2_q8_spv, attend_score_4_2_q8_spv_len}},
+            {{4, 4}, {attend_score_4_4_q8_spv, attend_score_4_4_q8_spv_len}},
+        };
+        auto sp = spvs.find({n, steps});
+        if (sp == spvs.end()) throw std::runtime_error("attend: q8 score variant not compiled");
+        char name[40];
+        std::snprintf(name, sizeof name, "attend_score_%d_%d_q8", n, steps);
+        it = ks.emplace(std::make_pair(n, steps),
+                        vk::kernel_load(name, sp->second.first, sp->second.second, 6, 64, 256, false)).first;
+    }
+    return it->second;
+}
 const vk::Kernel& pl_softmax() {
     static const vk::Kernel k = vk::kernel_load("attend_softmax", attend_softmax_spv, attend_softmax_spv_len,
                                                 3, 64, 256, false);
     return k;
 }
-const vk::Kernel& pl_value(int tiles) {
+const vk::Kernel& pl_value(int tiles, bool q8 = false) {
+    if (q8) {
+        if (tiles == 2) {
+            static const vk::Kernel k = vk::kernel_load("attend_value_t2_q8", attend_value_t2_q8_spv,
+                                                        attend_value_t2_q8_spv_len, 6, 64, 1024, false);
+            return k;
+        }
+        if (tiles == 1) {
+            static const vk::Kernel k = vk::kernel_load("attend_value_t1_q8", attend_value_t1_q8_spv,
+                                                        attend_value_t1_q8_spv_len, 6, 64, 1024, false);
+            return k;
+        }
+        static const vk::Kernel k = vk::kernel_load("attend_value_plain_q8", attend_value_plain_q8_spv,
+                                                    attend_value_plain_q8_spv_len, 6, 64, 1024, false);
+        return k;
+    }
     if (tiles == 2) {
         static const vk::Kernel k = vk::kernel_load("attend_value_t2", attend_value_t2_spv,
                                                     attend_value_t2_spv_len, 4, 64, 1024, false);
@@ -105,7 +148,8 @@ void attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, int6
             int chunk, float* out, int dim, int n_head, int kv_heads, float scale, void* stream, int window,
             int ring, bool whole, const long long* at, int room, size_t score_floats, Kvq8 kq8, Kvq8 vq8) {
     if (at && (whole || room < 1)) throw std::invalid_argument("attend: a position on the card needs its room");
-    if (dim % 4 || uintptr_t(q) % 16 || uintptr_t(kcache) % 8)
+    if (dim % 4 || uintptr_t(q) % 16 || (kcache && uintptr_t(kcache) % 8) ||
+        (!kq8.codes && !kcache) || (!vq8.codes && !vcache))
         throw std::invalid_argument("attend: queries and keys are read four values at a time");
     if (std::getenv("STRATA_VK_TRACE_ATTEND"))
         std::fprintf(stderr, "vk attend: pos=%lld rows=%d chunk=%d dim=%d n_head=%d kv_heads=%d scale=%.9g "
@@ -117,7 +161,12 @@ void attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, int6
     const bool kq = kq8.codes != nullptr, vq = vq8.codes != nullptr;
     const int per = n_head / kv_heads;
     // Arms this backend does not carry yet, named with the config that would run them.
-    if (kq || vq) throw std::invalid_argument("attend: kq8/vq8 quantized-KV arm");
+    // The fused q8 read arms (kvq8 decode; the workspace arm is attend_batch's): the CUDA
+    // reg/value templates instantiated with Q8=true. Layout law kernels.cu:48 and store_q8's:
+    // width = kv_heads*dim must be a multiple of 32 (scales every 32 values), even nb pairing
+    // holds for these reads (word-indexed directly).
+    if ((kq || vq) && (kv_heads * dim) % 32)
+        throw std::invalid_argument("attend: the q8 arm needs n_kv*head_dim a multiple of 32");
     // CUDA 2460's split/join gate, kept exact so the trap says which shape it is.
     const long long most = gridll(at ? room : pos + rows, 64);   // SPLIT_KEYS
     if (dim == 64 && per == 4 && window == 0 && ring == 0 && !whole &&
@@ -141,8 +190,12 @@ void attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, int6
 
     const long long last = whole ? pos + rows - 1 : -1;
     const uint32_t posw = uint32_t(uint64_t(pos) & 0xFFFFFFFFull), lastw = uint32_t(uint64_t(last) & 0xFFFFFFFFull);
-    const uint64_t qo = strata_vk_compat::off(q), ko = strata_vk_compat::off(kcache),
-                   vo = strata_vk_compat::off(vcache), so = strata_vk_compat::off(score),
+    // q8 mode passes NULL f16 caches (qwen35.cpp:395/404, like CUDA): the unused cache binding
+    // gets the score buffer as a harmless dummy; off(null) would be a negative garbage offset.
+    const uint64_t qo = strata_vk_compat::off(q),
+                   ko = kcache ? strata_vk_compat::off(kcache) : 0,   // q8 arms rebind the unused slot to a live buffer
+                   vo = vcache ? strata_vk_compat::off(vcache) : 0,
+                   so = strata_vk_compat::off(score),
                    oo = strata_vk_compat::off(out), ayo = at ? strata_vk_compat::off(at) : 0;
     const uint64_t qsz = size_t(rows) * n_head * dim * 4, osz = size_t(rows) * n_head * dim * 4;
     // rows of the cache the kernels can walk: absolute index < pos + rows (window=0), or the
@@ -151,6 +204,12 @@ void attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, int6
     // +8: a lane reading the cache's LAST element (odd) also touches the following u32 word,
     // exactly like the CUDA u64 read of two halves.
     const uint64_t kcsz = cache_rows * kv_heads * dim * 2 + 8, vcsz = kcsz;
+    // q8 spans: codes element e -> word e>>2, scales -> word e>>6: with width a multiple of 32
+    // (enforced above) NO read ever straddles its row's end, so unlike the f16 cache's u64 law
+    // there is no +8 word slack (the slack would cross the arena-piece boundary: the engine's
+    // per-block cache allocations sit exactly adjacent).
+    const uint64_t kcodesz = cache_rows * uint64_t(kv_heads * dim);
+    const uint64_t kscalesz = cache_rows * uint64_t(kv_heads * dim / 16);
 
     for (int first = 0; first < rows; first += chunk) {
         const int c = std::min(chunk, rows - first);
@@ -173,12 +232,19 @@ void attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, int6
             const long long units = gridll(keys, 8) * kv_heads;
             const long long blocks = gridll(units, 8);
             if (blocks > 0x7FFFFFFFll) throw std::runtime_error("attend: score grid overflows");
-            const uint64_t bufs[4] = {qo, ko, so, at ? ayo : so};
-            const uint64_t sizes[4] = {qsz, kcsz, scsz, at ? 8ull : scsz};
             const uint32_t pc[16] = {uint32_t(keys), uint32_t(n_head), uint32_t(kv_heads), posw,
                                      uint32_t(first), uint32_t(c), sb, uint32_t(window), uint32_t(ring),
                                      lastw, at ? 1u : 0u, 0, 0, 0, 0, 0};
-            vk::kernel_launch_sized(pl_score(sn, ss), int(blocks), bufs, sizes, 4, pc);
+            if (kq) {
+                const uint64_t bufs[6] = {qo, qo, so, at ? ayo : so,          // binding 1 unused under Q8: a real span
+                                          strata_vk_compat::off(kq8.codes), strata_vk_compat::off(kq8.scales)};
+                const uint64_t sizes[6] = {qsz, qsz, scsz, at ? 8ull : scsz, kcodesz, kscalesz};
+                vk::kernel_launch_sized(pl_score_q8(sn, ss), int(blocks), bufs, sizes, 6, pc);
+            } else {
+                const uint64_t bufs[4] = {qo, ko, so, at ? ayo : so};
+                const uint64_t sizes[4] = {qsz, kcsz, scsz, at ? 8ull : scsz};
+                vk::kernel_launch_sized(pl_score(sn, ss), int(blocks), bufs, sizes, 4, pc);
+            }
         }
 
         // ---- softmax: n_head * c blocks of 256
@@ -202,12 +268,20 @@ void attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, int6
         {
             const long long n = gxdim * gy;
             if (n > 0x7FFFFFFFll) throw std::runtime_error("attend: value grid overflows");
-            const uint64_t bufs[4] = {wt ? so + scsz : so, vo, oo, at ? ayo : oo};
-            const uint64_t sizes[4] = {wt ? wt_floats * 4 : scsz, vcsz, osz, at ? 8ull : osz};
             const uint32_t pc[16] = {uint32_t(keys), uint32_t(dim), uint32_t(n_head), uint32_t(kv_heads),
                                      posw, uint32_t(first), uint32_t(c), uint32_t(window), uint32_t(ring),
                                      lastw, at ? 1u : 0u, uint32_t(gxdim), wt ? 1u : 0u, 0, 0, 0};
-            vk::kernel_launch_sized(pl_value(tiles), int(n), bufs, sizes, 4, pc);
+            if (vq) {
+                const uint64_t bufs[6] = {wt ? so + scsz : so, oo, oo, at ? ayo : oo,  // binding 1 unused under Q8
+                                          strata_vk_compat::off(vq8.codes), strata_vk_compat::off(vq8.scales)};
+                const uint64_t sizes[6] = {wt ? wt_floats * 4 : scsz, osz, osz, at ? 8ull : osz,
+                                           kcodesz, kscalesz};
+                vk::kernel_launch_sized(pl_value(tiles, true), int(n), bufs, sizes, 6, pc);
+            } else {
+                const uint64_t bufs[4] = {wt ? so + scsz : so, vo, oo, at ? ayo : oo};
+                const uint64_t sizes[4] = {wt ? wt_floats * 4 : scsz, vcsz, osz, at ? 8ull : osz};
+                vk::kernel_launch_sized(pl_value(tiles), int(n), bufs, sizes, 4, pc);
+            }
         }
     }
     (void) stream;   // like every launcher here: the runtime's queue keeps call order

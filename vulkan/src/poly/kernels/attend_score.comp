@@ -20,6 +20,14 @@
 // xor never crosses a 32-lane aligned block on a wave64 gfx1013 (the head_norm_rope/rms_norm law).
 // No barrier in this kernel: the k0 >= span early-out is uniform per warp (whole units retire).
 //
+// Q8 arm (ATT_Q8=1, the kvq8 decode path): the key reads become the CUDA template's
+// attn_score_reg_kernel<N,STEPS,true> lines (kernels.cu:1189-1192): the codes use the fp16
+// cache's element index (4 int8 a uint word, store_q8's layout), the scale one f16 per
+// 32-value block (two f16 a word), x[j] = float(code) * d as an f32 product — NO intermediate
+// f16 rounding (that is what makes this differ from the attend_batch workspace arm, as CUDA's
+// does). Bindings 4 (codes) / 5 (scales) join; the f16 cache binding goes unused (the launcher
+// binds a dummy).
+//
 // The fp16 cache decode is BIT-EXACT by construction: the u64 read CUDA does (:1195) is a pair
 // of u32 words here, x[j] the j-th half, expanded through the IEEE half->float bit build
 // (subnormal normalize loop; half -> float is exact in BOTH directions, no truncation).
@@ -36,6 +44,9 @@
 #ifndef ATT_STEPS
 #define ATT_STEPS 1
 #endif
+#ifndef ATT_Q8
+#define ATT_Q8 0
+#endif
 #define ATT_DIM (4 * 32 * ATT_STEPS)
 
 layout(local_size_x = 256) in;   // SCORE_WARPS * WARP
@@ -44,6 +55,10 @@ layout(std430, binding = 0) readonly buffer Q  { float v[]; } bq;    // n_head *
 layout(std430, binding = 1) readonly buffer KC { uint v[]; } bkc;    // fp16 cache: element e -> word e>>1
 layout(std430, binding = 2)           buffer SC { float v[]; } bsc;  // score[token][head][key]
 layout(std430, binding = 3) readonly buffer AT { uint v[]; } bat;    // on-card pos (two u32, low first); bound to Q when null
+#if ATT_Q8
+layout(std430, binding = 4) readonly buffer KC8 { uint v[]; } bkc8;  // codes: 4 int8 a word (LE lanes)
+layout(std430, binding = 5) readonly buffer KS8 { uint v[]; } bks8;  // scales: 2 f16 a word
+#endif
 
 layout(push_constant) uniform PC {
     uint n_keys, n_head, kv_heads, pos, first, tokens, scale_bits,
@@ -105,12 +120,26 @@ void main() {
             // CUDA 1181-1198: the row's key of this group, 4 halves a lane per step
             const uint base = (uint(row) * pc.kv_heads + uint(g)) * uint(ATT_DIM);
             float x[ATT_STEPS][4];
+#if ATT_Q8
+            for (int s = 0; s < ATT_STEPS; ++s) {
+                const uint e = base + 4u * lane + 128u * uint(s);        // CUDA 1189's index
+                const uint cw = bkc8.v[e >> 2u];
+                const uint si = e >> 5u;                                  // the 32-value block
+                const uint sw = bks8.v[si >> 1u];
+                const float d = f16_to_float((si & 1u) == 0u ? (sw & 0xFFFFu) : (sw >> 16u));
+                for (int j = 0; j < 4; ++j) {
+                    const uint b = (cw >> (8u * uint(j))) & 0xFFu;
+                    x[s][j] = float(int(b | ((b & 0x80u) != 0u ? 0xFFFFFF00u : 0u))) * d;   // f32 product, CUDA-faithful
+                }
+            }
+#else
             for (int s = 0; s < ATT_STEPS; ++s) {
                 const uint w = (base + 4u * lane + 128u * uint(s)) >> 1u;
                 const uint wa = bkc.v[w], wb = bkc.v[w + 1u];     // the CUDA u64 as two words
                 x[s][0] = f16_to_float(wa & 0xFFFFu); x[s][1] = f16_to_float(wa >> 16u);
                 x[s][2] = f16_to_float(wb & 0xFFFFu); x[s][3] = f16_to_float(wb >> 16u);
             }
+#endif
             // CUDA 1183-1206: N accumulators, each 4 products a step, left to right
             // (nvcc -fmad fuses the += mul into fma; glslc/RADV contracts the same - law 6,
             // the host reference spells std::fma)

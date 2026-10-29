@@ -112,8 +112,9 @@ float ref_block_reduce(const std::vector<float>& terms, int n_threads, bool max)
     return acc;
 }
 
-// One case: the model's arm, window=0, ring=0, whole=false, at=null.
-struct Case { long long pos; int rows, chunk; int n_head, kv_heads, dim; const char* what; };
+// One case: the model's arm, window=0, ring=0, whole=false, at=null. q8: the fused decode read
+// (kvq8's attend arm; the store is the same store_q8 the batch test pins).
+struct Case { long long pos; int rows, chunk; int n_head, kv_heads, dim; const char* what; bool q8 = false; };
 
 void run(const Case& cs) {
     const int per = cs.n_head / cs.kv_heads;
@@ -137,6 +138,42 @@ void run(const Case& cs) {
         else if (r == 1) vc[i] = uint16_t(rng() % 0x400u);
         else vc[i] = f16_rn(frandom(rng) * 0.7f);
     }
+
+    // q8 prelude: quantize the caches through store_q8 (device) and read the codes/scales back;
+    // the references then read kv8()/vv8() = float(code)*f32(scale) exactly as the fused arm
+    // multiplies (kernels.cu:1192,1531) — NO intermediate f16 like the batch workspace arm's.
+    const int widthc = cs.kv_heads * cs.dim;
+    std::vector<int8_t> kcode, vcode; std::vector<uint16_t> kscale, vscale;
+    uint64_t ack = 0, avc = 0, aks = 0, avs = 0;
+    if (cs.q8) {
+        vk::Arena& a0 = vk::Arena::instance();
+        kcode.assign(size_t(nrows) * widthc, 0); vcode = kcode;
+        kscale.assign(size_t(nrows) * widthc / 32, 0); vscale = kscale;
+        std::vector<float> kx(kc.size()), vx(vc.size());
+        for (size_t i = 0; i < kc.size(); ++i) kx[i] = f16_to_float(kc[i]);
+        for (size_t i = 0; i < vc.size(); ++i) vx[i] = f16_to_float(vc[i]);
+        ack = a0.alloc(kcode.size()); avc = a0.alloc(vcode.size());
+        aks = a0.alloc(kscale.size() * 2); avs = a0.alloc(vscale.size() * 2);
+        const uint64_t akx = a0.alloc(kx.size() * 4), avx = a0.alloc(vx.size() * 4);
+        vk::copy_h2d((void*)akx, kx.data(), kx.size() * 4, nullptr);
+        vk::copy_h2d((void*)avx, vx.data(), vx.size() * 4, nullptr);
+        poly::store_q8((const float*)strata_vk_compat::wrap(akx), (int8_t*)strata_vk_compat::wrap(ack),
+                       (uint16_t*)strata_vk_compat::wrap(aks), widthc, 0, (int)nrows, nullptr);
+        poly::store_q8((const float*)strata_vk_compat::wrap(avx), (int8_t*)strata_vk_compat::wrap(avc),
+                       (uint16_t*)strata_vk_compat::wrap(avs), widthc, 0, (int)nrows, nullptr);
+        vk::copy_d2h(kcode.data(), (void*)ack, kcode.size(), nullptr);
+        vk::copy_d2h(vcode.data(), (void*)avc, vcode.size(), nullptr);
+        vk::copy_d2h(kscale.data(), (void*)aks, kscale.size() * 2, nullptr);
+        vk::copy_d2h(vscale.data(), (void*)avs, vscale.size() * 2, nullptr);
+    }
+    // code * scale as an f32 product (the CUDA fused arm; int8 sign-extends, no f16 step)
+    auto q8read = [&](const std::vector<int8_t>& codes, const std::vector<uint16_t>& scales,
+                      size_t r, int g, int d) {
+        const size_t e = (r * cs.kv_heads + size_t(g)) * cs.dim + size_t(d);
+        return float(codes[e]) * f16_to_float(scales[e / 32]);   // host scales: one f16 per 32-value block
+    };
+    auto kv8 = [&](size_t r, int g, int d) { return q8read(kcode, kscale, r, g, d); };
+    auto vv8 = [&](size_t r, int g, int d) { return q8read(vcode, vscale, r, g, d); };
 
     // ---- ORDER reference: the three kernels' exact partitions (window=0, ring=0, at=null),
     // replaying the launcher's chunk loop: each launch's score rows lie `keys` apart.
@@ -168,7 +205,8 @@ void run(const Case& cs) {
                             for (int st = 0; st < STEPS; ++st)
                                 for (int j = 0; j < 4; ++j) {
                                     const int i = 128 * st + 4 * l + j;
-                                    a = std::fma(qq[hh * cs.dim + i], f16_to_float(kr[i]), a);
+                                    a = std::fma(qq[hh * cs.dim + i],
+                                                 cs.q8 ? kv8(size_t(k0 + r), g, i) : f16_to_float(kr[i]), a);
                                 }
                             acc[l][hh] = a;
                         }
@@ -240,7 +278,8 @@ void run(const Case& cs) {
                 float acc[32] = {};
                 for (int s = 0; s < 32; ++s)
                     for (int j = s; j < span; j += 32) {
-                        const float xv = f16_to_float(vc[(size_t(j) * cs.kv_heads + g) * cs.dim + d]);
+                        const float xv = cs.q8 ? vv8(size_t(j), g, d)
+                                              : f16_to_float(vc[(size_t(j) * cs.kv_heads + g) * cs.dim + d]);
                         acc[s] = std::fma(wrow[j], xv, acc[s]);
                     }
                 // rotation: own=0 for window=0, so bucket index (s + 32 - 0) % 32 = s: k=0..31 order
@@ -260,7 +299,8 @@ void run(const Case& cs) {
             for (int r = 0; r < n; ++r) {
                 float s = 0.f;
                 for (int d = 0; d < cs.dim; ++d)
-                    s += q[(size_t(t) * cs.n_head + h) * cs.dim + d] * f16_to_float(kc[(size_t(r) * cs.kv_heads + g) * cs.dim + d]);
+                    s += q[(size_t(t) * cs.n_head + h) * cs.dim + d] *
+                         (cs.q8 ? kv8(size_t(r), g, d) : f16_to_float(kc[(size_t(r) * cs.kv_heads + g) * cs.dim + d]));
                 sc[r] = s * scale;
                 mx = std::fmax(mx, sc[r]);
             }
@@ -270,7 +310,8 @@ void run(const Case& cs) {
             for (int d = 0; d < cs.dim; ++d) {
                 float o = 0.f;
                 for (int r = 0; r < n; ++r)
-                    o += sc[r] * 0 + float(std::exp(sc[r] - mx)) * inv * f16_to_float(vc[(size_t(r) * cs.kv_heads + g) * cs.dim + d]);
+                    o += sc[r] * 0 + float(std::exp(sc[r] - mx)) * inv *
+                         (cs.q8 ? vv8(size_t(r), g, d) : f16_to_float(vc[(size_t(r) * cs.kv_heads + g) * cs.dim + d]));
                 naive[(size_t(t) * cs.n_head + h) * cs.dim + d] = o;
             }
         }
@@ -291,10 +332,18 @@ void run(const Case& cs) {
     vk::fill_d((void*)ao, 0, size_t(cs.rows) * cs.n_head * cs.dim * 4, nullptr);
     std::vector<float> got(size_t(cs.rows) * cs.n_head * cs.dim, 0.f);
     try {
-        poly::attend((float*)strata_vk_compat::wrap(aq), (uint16_t*)strata_vk_compat::wrap(ak),
-                     (uint16_t*)strata_vk_compat::wrap(av), cs.pos, cs.rows,
-                     (float*)strata_vk_compat::wrap(as), cs.chunk,
-                     (float*)strata_vk_compat::wrap(ao), cs.dim, cs.n_head, cs.kv_heads, scale, nullptr);
+        if (cs.q8)
+            poly::attend((float*)strata_vk_compat::wrap(aq), nullptr, nullptr, cs.pos, cs.rows,
+                         (float*)strata_vk_compat::wrap(as), cs.chunk,
+                         (float*)strata_vk_compat::wrap(ao), cs.dim, cs.n_head, cs.kv_heads, scale, nullptr,
+                         0, 0, false, nullptr, 0, 0,
+                         poly::Kvq8{(int8_t*)strata_vk_compat::wrap(ack), (uint16_t*)strata_vk_compat::wrap(aks)},
+                         poly::Kvq8{(int8_t*)strata_vk_compat::wrap(avc), (uint16_t*)strata_vk_compat::wrap(avs)});
+        else
+            poly::attend((float*)strata_vk_compat::wrap(aq), (uint16_t*)strata_vk_compat::wrap(ak),
+                         (uint16_t*)strata_vk_compat::wrap(av), cs.pos, cs.rows,
+                         (float*)strata_vk_compat::wrap(as), cs.chunk,
+                         (float*)strata_vk_compat::wrap(ao), cs.dim, cs.n_head, cs.kv_heads, scale, nullptr);
         vk::copy_d2h(got.data(), (void*)ao, got.size() * 4, nullptr);
     } catch (const std::exception& e) {
         std::printf("  FAIL %s: launcher threw: %s\n", cs.what, e.what());
@@ -559,6 +608,9 @@ int main() {
         {63, 1, 1, 16, 2, 256, "MODEL dim256 per8 rows=1 chunk=1 (plain value arm)"},
         {40, 1, 4, 16, 2, 256, "MODEL dim256 rows=1 chunk=4 (wt arm, attn_value_t<1>)"},
         {33, 3, 8, 16, 2, 256, "MODEL dim256 chunked rows=3 chunk=8"},
+        {63, 1, 1, 16, 2, 256, "MODEL q8 dim256 per8 rows=1 (fused read, plain value arm)", true},
+        {40, 1, 4, 16, 2, 256, "MODEL q8 dim256 rows=1 chunk=4 (wt arm)", true},
+        {24, 5, 8, 16, 2, 128, "q8 dim128 chunked rows=5 (N=4 arm)", true},
     };
     for (const auto& cs : cases) run(cs);
     const BatchCase bcases[] = {

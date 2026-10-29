@@ -345,6 +345,19 @@ foreach(_ns 4_1 8_2 4_2 4_4)
     COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} attend_score_${_ns}
     DEPENDS ${_spv})
   list(APPEND _att_spvs ${_inc})
+  # the fused q8 score arm of the SAME variant (the kvq8 decode read; law 11's unlock)
+  set(_spvq ${CMAKE_CURRENT_BINARY_DIR}/spv/attend_score_${_ns}_q8.spv)
+  add_custom_command(OUTPUT ${_spvq}
+    COMMAND ${CMAKE_COMMAND} -E env VK_GLSLC_MODE=${GLSLC_MODE} VK_GLSLC_TOOL=${GLSLC_TOOL}
+            ${VK_GLSLC} --target-env=vulkan1.3 -O -DATT_N=${_n} -DATT_STEPS=${_st} -DATT_Q8=1
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels/attend_score.comp -o ${_spvq}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels/attend_score.comp ${VK_GLSLC}
+    COMMENT "vk-glslc attend_score.comp ATT_N=${_n} ATT_STEPS=${_st} Q8")
+  set(_incq ${CMAKE_CURRENT_BINARY_DIR}/spv/attend_score_${_ns}_q8.spv.h)
+  add_custom_command(OUTPUT ${_incq}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spvq} ${_incq} attend_score_${_ns}_q8
+    DEPENDS ${_spvq})
+  list(APPEND _att_spvs ${_incq})
 endforeach()
 foreach(_n t1 t2 plain)
   if(_n STREQUAL "t1")
@@ -366,6 +379,18 @@ foreach(_n t1 t2 plain)
     COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} attend_value_${_n}
     DEPENDS ${_spv})
   list(APPEND _att_spvs ${_inc})
+  set(_spvq ${CMAKE_CURRENT_BINARY_DIR}/spv/attend_value_${_n}_q8.spv)
+  add_custom_command(OUTPUT ${_spvq}
+    COMMAND ${CMAKE_COMMAND} -E env VK_GLSLC_MODE=${GLSLC_MODE} VK_GLSLC_TOOL=${GLSLC_TOOL}
+            ${VK_GLSLC} --target-env=vulkan1.3 -O -DATT_VARIANT=${_var} -DATT_Q8=1
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels/attend_value.comp -o ${_spvq}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels/attend_value.comp ${VK_GLSLC}
+    COMMENT "vk-glslc attend_value.comp ATT_VARIANT=${_var} Q8")
+  set(_incq ${CMAKE_CURRENT_BINARY_DIR}/spv/attend_value_${_n}_q8.spv.h)
+  add_custom_command(OUTPUT ${_incq}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spvq} ${_incq} attend_value_${_n}_q8
+    DEPENDS ${_spvq})
+  list(APPEND _att_spvs ${_incq})
 endforeach()
 add_library(strata_vk_kernel_attend STATIC src/poly/kernels/attend_vk.cpp ${_att_spvs})
 target_include_directories(strata_vk_kernel_attend PUBLIC ${STRATA_ROOT}/include ${STRATA_ROOT}/src/poly ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
@@ -706,7 +731,7 @@ add_test(NAME poly_gdn_vk_parity COMMAND poly_gdn_vk_parity)
 # Task 2.11: poly attend parity - the general fp16-KV chain (score reg<4,1> / softmax / value).
 add_executable(poly_attend_vk_parity src/tests/poly_attend_vk_parity.cpp)
 target_include_directories(poly_attend_vk_parity PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
-target_link_libraries(poly_attend_vk_parity PRIVATE strata_vk_kernel_attend strata_vk_kernel_attend_batch strata_vk_kernel_store_q8 strata_vk_blas strata_vk_poly_kernels strata_vk_runtime strata_vk_compat strata_vk_stubs)
+target_link_libraries(poly_attend_vk_parity PRIVATE strata_vk_kernel_attend strata_vk_kernel_attend_batch strata_vk_kernel_store_q8 strata_vk_kernel_store_q8 strata_vk_blas strata_vk_poly_kernels strata_vk_runtime strata_vk_compat strata_vk_stubs)
 add_test(NAME poly_attend_vk_parity COMMAND poly_attend_vk_parity)
 
 # Phase 3 (attempt 2): the GPU tiled GEMM's micro-parity gate - GPU arm vs the ordered-fp32 CPU
