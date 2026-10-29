@@ -850,3 +850,30 @@ Reference-leg survival notes (all recorded as PORT-NOTES laws 10/11): GPU legs p
 TTM (both device tiers), the dump tool needed STRATA_DUMP_MMAP=1 (llama.cpp's AUTO loader copies
 the whole GGUF to anon RAM on iGPUs), and every leg runs under choom -n 900 so the leg, never the
 desktop, takes the OOM bullet. Three session deaths preceded those laws.
+
+
+## Phase 4.2 — captured graphs (2026-10-29): GREEN, and the engine now runs with graphs BY DEFAULT
+
+The eager per-launch + per-token-sync path was the last speed wall (PORT-STATUS Phase 4.1:
+flush_wait stalls ~11.9s / 31.6k drains). What shipped:
+* the runtime's capture layer: BeginCapture opens ONE multi-submit CB; launches record with the
+  EAGER full-RW barrier law inside (bit-safe by construction); EndCapture closes; GraphLaunch is
+  one vkQueueSubmit whose fence serializes replays AND serves the replay's staged D2H copies;
+  chained 128-set pools per graph (1,600 layer graphs, no descriptor bloat).
+* cudaMemcpy sites inside a capture become transfer NODES: h2d freezes the host bytes at capture
+  time (CUDA memcpy-node semantics — the engine's replay pass writes token positions OUTSIDE any
+  graph, so frozen bytes never carry per-token data); d2h lands in per-graph mapped staging and
+  is delivered to the host at the next fence drain (the engine reads D2H results only past its
+  event/stream syncs); d2d/fill record directly. A capture-body SYNC still aborts loudly.
+* vk_graph_capture pins the layer alone (record/replay bits == eager x3, frozen-byte + drain
+  semantics, destroy semantics, node counts honest).
+* the model gate: hybrid 16-token canary BITWISE identical with graphs on (the fork's law:
+  graphs generation-inert), 48-token A/B awaiting; decode 18.5-19 -> 20.9 tok/s (f16 KV, graphs)
+  and 21.9 tok/s (q8_0 KV + graphs); 64K ctx + q8_0 + graphs runs at ~100% VRAM experts.
+  --no-graphs remains for A/B; graphs are now the engine default on Vulkan.
+Pitfalls this leg caught (kept in PORT-NOTES law 12): (a) the D2H capture-time SPEC serviced
+before the first replay copies never-written staging — d2h_def/d2h_run split; (b) record_*
+helpers re-locking g_m under their callers self-DEADLOCKED (lock law: callers hold g_m, g_pm is
+the leaf); (c) engine.cpp's copy2 host-pair classification already routes the router readback
+through copy_d2h — the capture branch had to be in copy_h2d/copy_d2h, not only in the compat
+strata_memcpy (a compat-only fix leaves the poly launcher path eager-draining mid-capture).

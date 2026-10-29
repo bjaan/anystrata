@@ -247,3 +247,14 @@ reach them (they are in the .cu files, which stay uncompiled); dim3/vector types
    (kv_append_q8_step / kv_gather_q8_step, PORT-STATUS todo) must be ported first — that, plus the
    vmm grow-never arena's 'cost the max context at startup' fallback, is the honest path to 64K.
    Do not raise --max-context past 32768 before those kernels are green.
+
+12. **Graph capture laws (Phase 4.2, measured 2026-10-29).** (a) A captured graph's H2D nodes
+   carry the bytes frozen AT CAPTURE — the engine only replays graphs whose inputs are written
+   outside the graph (h_at_ eager copy2); never capture a host-dependent per-token value.
+   (b) D2H in a graph = node -> per-graph mapped staging, delivered at the fence drain; the
+   capture-time spec (d2h_def) must NOT be serviced before a replay ran (staging unwritten).
+   (c) Lock law inside the runtime: g_m (pieces) then g_pm (leaf) — a helper re-taking g_m under
+   a caller that holds it self-deadlocks (non-recursive mutex, silent hang). (d) The engine's
+   copy sites route through strata::vk::copy_h2d/copy_d2h DIRECTLY (poly copy2 launcher), not
+   only the compat strata_memcpy: capture-awareness must live at BOTH levels or the capture body
+   drains mid-record (flush_wait-in-capture abort, which is the LOUD refusal working).
