@@ -144,12 +144,12 @@ build-vk/bin/omnistrata --engine build-vk/bin/omnistrata-gguf-vk \
   -- --model /models/Qwen3.6-35B-A3B-GSQ-hybrid.gguf --no-graphs --max-context 16384
 ```
 
-`--max-context` on this APU: **16K and 32K are proven stable; 64K needs `--kv q8_0`** (the
-q8_0 KV cache halves the cache to 544 bytes a row and is the unlock for a large window on a
-15 GB unified box — the write kernel is ported and parity-green, the prefill read arm is wired,
-and until the decode-side kernels land it is a named trap rather than a wrong answer). 128K does
-not fit this card with this model; it is a machine for the larger pods, same as upstream's
-long-context records. The law and the measurements are in `vulkan/PORT-NOTES.md` (rules 10-11).
+`--max-context` on this APU: **16K / 32K with the fp16 cache, and 64K with `--kv q8_0`** — the
+q8_0 KV cache (int8 codes, one fp16 scale per 32 values: 544 bytes a row where fp16 costs 1,024)
+halves the cache and is what makes the 64K window fit this box's pinned arena; its store,
+prefill-read and fused decode-read kernels are all ported and parity-tested. 128K does not fit
+this card with this model; it is a machine for the larger pods, same as upstream's long-context
+records. The law and the measurements are in `vulkan/PORT-NOTES.md` (rules 10-11).
 
 CUDA, the reference path — Qwen3.6-35B-A3B from an Unsloth GGUF:
 
@@ -185,8 +185,8 @@ the files actually served, with sizes and SHA-256, are listed in [docs/MODEL-FIL
 | `omnistrata-gguf-dsv41` | `deepseek41` | DeepSeek-V4.1-Flash-1017 (Strata v0.2.4's engine: the four shards, Engram table, DSpark drafter; IQ1_M / IQ2_XXS / IQ2_XS GSQ-RCO) | ✓ | – | – | – | not ported |
 
 The Vulkan column reports what has run end-to-end on a Vulkan device (the BC-250 gate: `qwen35moe` files, all
-expert and dense quant formats held bitwise against the CUDA tree, the q8_0 KV cache's store kernel
-parity-green on the way to a 64K window — see `vulkan/PORT-STATUS.md`); the other
+expert and dense quant formats held bitwise against the CUDA tree, the q8_0 KV cache — store, prefill
+read and fused decode read all ported, making a 64K serve fit this box — see `vulkan/PORT-STATUS.md`); the other
 families build against the same shim but wait for their own bring-up gate. Anything the Vulkan port has not
 carried yet refuses loudly, by name, and never answers with a wrong kernel.
 
