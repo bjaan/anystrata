@@ -718,9 +718,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(tune_rocblas PRIVATE hip::host roc::rocblas)
   endif()
 
-  add_executable(omnistrata-pack src/program/generate.cpp)
-  target_include_directories(omnistrata-pack PRIVATE ${_strata_gpu_include_directories})
-  target_link_libraries(omnistrata-pack PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+  add_executable(anystrata-pack src/program/generate.cpp)
+  target_include_directories(anystrata-pack PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(anystrata-pack PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
 
   # NEW-MODELS-PLAN.md T1: Qwen3.6-35B-A3B's reference path (one GPU, the model resident, plain kernels), checked
   # against llama.cpp by tools/qwen35/; the engine itself does not run the family yet
@@ -740,8 +740,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   endif()
   add_executable(strata-q36 src/qwen35/q36_main.cpp)
   target_link_libraries(strata-q36 PRIVATE strata_qwen35 ${_strata_gpu_runtime_target})
-  target_link_libraries(omnistrata-pack PRIVATE strata_qwen35)
-  target_compile_definitions(omnistrata-pack PRIVATE STRATA_HAVE_QWEN35=1)
+  target_link_libraries(anystrata-pack PRIVATE strata_qwen35)
+  target_compile_definitions(anystrata-pack PRIVATE STRATA_HAVE_QWEN35=1)
 
   if(STRATA_ENABLE_HIP)
     enable_testing()
@@ -2001,7 +2001,7 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME aux_cpus_test COMMAND aux_cpus_test)
 endif()
 
-# ---- omnistrata-gguf: GLM 5.3 Flash (llama.cpp's glm5-next), read from its GGUF ----
+# ---- anystrata-gguf: GLM 5.3 Flash (llama.cpp's glm5-next), read from its GGUF ----
 #
 # A second engine beside `strata`.  It shares the quantized matvec kernels and the GGUF reader, and takes the
 # CPU experts' dot products from ggml-cpu.  On HIP it is the same CUDA-shaped code through the hip_compat headers
@@ -2063,10 +2063,10 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
     target_link_libraries(strata_poly_mmq PUBLIC ggml-base ${_strata_gpu_runtime_target})
   endif()
 
-  add_executable(omnistrata-gguf src/poly/main.cpp src/poly/engine.cpp src/poly/glm5next.cpp src/poly/qwen35.cpp
+  add_executable(anystrata-gguf src/poly/main.cpp src/poly/engine.cpp src/poly/glm5next.cpp src/poly/qwen35.cpp
                             src/poly/gemma4.cpp src/poly/deepseek4.cpp src/poly/lfm2moe.cpp src/poly/cpu_experts.cpp
                             src/poly/kernels.cu src/poly/kernels_dsv4.cu src/core/conversation_memory.cpp)
-  target_include_directories(omnistrata-gguf PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+  target_include_directories(anystrata-gguf PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   # the driver's virtual memory calls: the attention caches grow with the conversation; on HIP they are HIP's
   # memory management calls, which the HIP runtime itself provides (hip_compat/cuda.h)
   if(STRATA_ENABLE_HIP)
@@ -2074,7 +2074,7 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   else()
     set(_strata_poly_driver CUDA::cuda_driver)
   endif()
-  target_link_libraries(omnistrata-gguf PRIVATE strata_poly_mmq strata_kernels strata_spec ggml-cpu ggml-base
+  target_link_libraries(anystrata-gguf PRIVATE strata_poly_mmq strata_kernels strata_spec ggml-cpu ggml-base
                                            ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target}
                                            ${_strata_poly_driver}
                                            Threads::Threads)
@@ -2148,14 +2148,14 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   endif()
 endif()
 
-# ---- omnistrata-gguf-dsv41: DeepSeek-V4.1-Flash, from Strata v0.2.4 (UPSTREAM.md "DeepSeek-V4.1 engine") ----------------
+# ---- anystrata-gguf-dsv41: DeepSeek-V4.1-Flash, from Strata v0.2.4 (UPSTREAM.md "DeepSeek-V4.1 engine") ----------------
 #
 # The third engine.  Imported from Niko1221/Strata v0.2.4 (src/dsv41, include/strata/dsv41, tests/dsv41, tools/dsv41,
 # data/dsv41; itself a port of Project Maya's maya-ds4, MIT, third_party/project-maya/NOTICE.md).  Upstream's target
 # block as it is, but for: no FetchContent (ggml.h / ggml-cpu.h come through strata_kernels_cpu's ggml-cpu link from the
 # submodule), and no STRATA_BUILD_DSV41 default of OFF - the Makefile turns it on, it is one of the engines this fork
 # builds.  The vendored kernels live in strata::dsv41k, so no symbol is shared with strata_kernels.
-option(STRATA_BUILD_DSV41 "Build the DeepSeek-V4.1 engine path (omnistrata-gguf-dsv41)" OFF)
+option(STRATA_BUILD_DSV41 "Build the DeepSeek-V4.1 engine path (anystrata-gguf-dsv41)" OFF)
 if(STRATA_BUILD_DSV41 AND STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT STRATA_HIP_GFX906)
   add_library(strata_dsv41_kernels STATIC src/dsv41/vendor/exl3.cu src/dsv41/vendor/sampler.cu src/dsv41/vendor/moe_win.cu
               src/dsv41/vendor/exl3_cpu.cpp)
@@ -2164,7 +2164,7 @@ if(STRATA_BUILD_DSV41 AND STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRAT
   endif()
   target_include_directories(strata_dsv41_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(strata_dsv41_kernels PUBLIC ${_strata_gpu_runtime_target})
-  add_executable(omnistrata-gguf-dsv41 src/dsv41/ds4_main.cpp src/dsv41/ds4_model.cu src/dsv41/ds4_kernels.cu src/dsv41/ds4_vision.cu
+  add_executable(anystrata-gguf-dsv41 src/dsv41/ds4_main.cpp src/dsv41/ds4_model.cu src/dsv41/ds4_kernels.cu src/dsv41/ds4_vision.cu
                  src/dsv41/ds4_gguf.cu src/dsv41/ds4_gguf_cpu.cpp src/dsv41/ds4_iq.cu src/dsv41/ds4_iq_cpu.cpp
                  src/dsv41/ds4_tq.cu src/dsv41/ds4_tq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp src/dsv41/ds4_packinfo.cpp)
   # the commit the binary was built from, readable with --version (set -DSTRATA_BUILD_ID=... for a tree without .git)
@@ -2179,18 +2179,18 @@ if(STRATA_BUILD_DSV41 AND STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRAT
     set(STRATA_BUILD_ID unknown)
   endif()
   set_source_files_properties(src/dsv41/ds4_main.cpp PROPERTIES COMPILE_DEFINITIONS "DS4_BUILD_ID=\"${STRATA_BUILD_ID}\"")
-  target_include_directories(omnistrata-gguf-dsv41 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories}
+  target_include_directories(anystrata-gguf-dsv41 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories}
                              ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
-  target_link_libraries(omnistrata-gguf-dsv41 PRIVATE strata_dsv41_kernels ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
+  target_link_libraries(anystrata-gguf-dsv41 PRIVATE strata_dsv41_kernels ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
   find_package(Threads REQUIRED)
-  target_link_libraries(omnistrata-gguf-dsv41 PRIVATE Threads::Threads)
+  target_link_libraries(anystrata-gguf-dsv41 PRIVATE Threads::Threads)
   if(WIN32 AND STRATA_ENABLE_HIP)
-    target_link_libraries(omnistrata-gguf-dsv41 PRIVATE strata_core)
+    target_link_libraries(anystrata-gguf-dsv41 PRIVATE strata_core)
   endif()
   # Strata's CPU kernels: the ggml-cpu lane for the GGUF i-quant experts (ds4_gg_cpu.cpp: iq256x_rows / iq512x_rows) and the
   # trellis lane (tq_cpu.hpp) - the lane the IST-DAS sets' experts beyond VRAM are computed on
-  target_link_libraries(omnistrata-gguf-dsv41 PRIVATE strata_kernels_cpu)
-  target_compile_definitions(omnistrata-gguf-dsv41 PRIVATE STRATA_DSV41_TQ_CPU=1)
+  target_link_libraries(anystrata-gguf-dsv41 PRIVATE strata_kernels_cpu)
+  target_compile_definitions(anystrata-gguf-dsv41 PRIVATE STRATA_DSV41_TQ_CPU=1)
   # the CPU lane's ggml-type rows: ggml-cpu's dots against Strata's AVX2 i-quant rows (bits and GB/s); no GPU, no model
   add_executable(ds4_gg_bench tests/dsv41/gg_dot_bench.cpp src/dsv41/ds4_gg_cpu.cpp)
   target_include_directories(ds4_gg_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41
@@ -2224,7 +2224,7 @@ if(STRATA_BUILD_DSV41 AND STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRAT
   target_include_directories(ds4_slot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
   target_compile_features(ds4_slot_test PRIVATE cxx_std_17)
   if(STRATA_ENABLE_HIP)
-    foreach(_t strata_dsv41_kernels omnistrata-gguf-dsv41 ds4_tq_test ds4_iq_test)
+    foreach(_t strata_dsv41_kernels anystrata-gguf-dsv41 ds4_tq_test ds4_iq_test)
       target_compile_options(${_t} PRIVATE "$<$<COMPILE_LANGUAGE:HIP,CXX>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/dsv41/hip_extra.h>")
     endforeach()
   endif()
@@ -2235,7 +2235,7 @@ endif()
 # cpp-httplib) and its image encoder (mtmd) from the same pinned checkout that ggml comes from.  ggml is configured
 # above, so llama.cpp's build reuses those targets.  Nothing here downloads: LLAMA_USE_PREBUILT_UI is off and
 # LLAMA_CURL is a no-op at this pin.
-option(STRATA_FRONTEND "Build the C++ front end (omnistrata); needs no CUDA, so it also builds on a laptop" ON)
+option(STRATA_FRONTEND "Build the C++ front end (anystrata); needs no CUDA, so it also builds on a laptop" ON)
 if(STRATA_FRONTEND AND STRATA_NATIVE_EXPERTS)
   set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
   set(LLAMA_BUILD_MTMD ON CACHE BOOL "" FORCE)
@@ -2262,10 +2262,10 @@ if(STRATA_FRONTEND AND STRATA_NATIVE_EXPERTS)
   target_link_libraries(strata_llama_server PUBLIC llama-common llama mtmd cpp-httplib Threads::Threads)
   target_compile_features(strata_llama_server PUBLIC cxx_std_17)
 
-  add_executable(omnistrata frontend/main.cpp frontend/strata_context.cpp)
-  target_include_directories(omnistrata PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/frontend)
-  target_link_libraries(omnistrata PRIVATE strata_llama_server)
-  target_compile_features(omnistrata PRIVATE cxx_std_20)
+  add_executable(anystrata frontend/main.cpp frontend/strata_context.cpp)
+  target_include_directories(anystrata PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/frontend)
+  target_link_libraries(anystrata PRIVATE strata_llama_server)
+  target_compile_features(anystrata PRIVATE cxx_std_20)
 
   # The engine adapter against the fake engine (frontend/tests/fake-engine.py): no GPU, no model, no llama.cpp.
   # `make test` builds and runs it, then frontend/tests/e2e.sh against the binary above.

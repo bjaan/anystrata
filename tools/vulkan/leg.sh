@@ -4,7 +4,7 @@
 # a model load escaping these rules. Do not run engines or reference dumps directly; run them
 # through this.
 #
-#   tools/vulkan/leg.sh --gate engine  <command...>    # omnistrata-gguf-vk: own arena, ~14.1 GB,
+#   tools/vulkan/leg.sh --gate engine  <command...>    # anystrata-gguf-vk: own arena, ~14.1 GB,
 #                                                      #   safe if it is the ONLY big load
 #   tools/vulkan/leg.sh --gate cpu     <command...>    # llama.cpp --ngl 0 + STRATA_DUMP_MMAP=1:
 #                                                      #   weights as reclaimable page cache

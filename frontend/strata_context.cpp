@@ -521,7 +521,7 @@ struct strata_context_impl {
 
     // the request's pictures file (slot.images_path, unlinked when the slot is released)
     std::FILE * open_pictures_file(std::string & err) {
-        char name[] = "/tmp/omnistrata-pictures-XXXXXX";
+        char name[] = "/tmp/anystrata-pictures-XXXXXX";
         const int fd = ::mkstemp(name);
         if (fd < 0) {
             err = "cannot create the pictures file";
@@ -951,7 +951,7 @@ struct strata_context_impl {
                 {"vocab_type",  llama_vocab_type(vocab)},
                 {"n_vocab",     llama_vocab_n_tokens(vocab)},
                 {"n_ctx",       n_ctx},
-                {"engine",      engine_is_poly ? "omnistrata-gguf" : "omnistrata-pack"},
+                {"engine",      engine_is_poly ? "anystrata-gguf" : "anystrata-pack"},
             }},
         };
     }
@@ -1244,7 +1244,7 @@ bool strata_context::start_engine(const common_params & params, const std::strin
     impl->params      = params;
     impl->engine_exe  = engine_exe;
     impl->engine_args = engine_args;
-    impl->engine_is_poly = engine_exe.find("omnistrata-gguf") != std::string::npos;
+    impl->engine_is_poly = engine_exe.find("anystrata-gguf") != std::string::npos;
 
     std::vector<std::string> argv;
     argv.push_back(engine_exe);
@@ -1400,7 +1400,7 @@ void strata_context::init_routes(server_http_context & http) {
         // llama.cpp's shape ("status") plus the fields upstream PolyStrata clients (tools/strata_bench.py,
         // its is_strata / wait_ready) look for: "service" and "loaded". The engine only serves once loaded.
         res->ok({{"status", "ok"}, {"busy", I->slot.active()},
-                 {"service", "omnistrata"}, {"loaded", true},
+                 {"service", "anystrata"}, {"loaded", true},
                  {"model", I->model_name}, {"max_context", I->n_ctx}});
         return res;
     };
@@ -1429,7 +1429,7 @@ void strata_context::init_routes(server_http_context & http) {
             {"chat_template", common_chat_templates_source(I->chat_params.tmpls.get())},
             {"chat_template_caps", caps},
             {"build_info", std::string(llama_build_info())},
-            {"engine", I->engine_is_poly ? "omnistrata-gguf" : "omnistrata-pack"},
+            {"engine", I->engine_is_poly ? "anystrata-gguf" : "anystrata-pack"},
         });
         return res;
     };

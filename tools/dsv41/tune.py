@@ -1,4 +1,4 @@
-"""A short tune for DeepSeek-V4.1-Flash (omnistrata-gguf-dsv41): the few settings the engine has, measured on this computer.
+"""A short tune for DeepSeek-V4.1-Flash (anystrata-gguf-dsv41): the few settings the engine has, measured on this computer.
 
     python tools/dsv41/tune.py --config <launch config .json> [--mode quick|thorough] [--runs N]
 

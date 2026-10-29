@@ -5,7 +5,7 @@ rest, Q = the engine's printed top 20 (+ rest = 1 - sum). The floor on the same 
 vocabulary and, for a like-for-like figure, over the same top-20 + rest bucket.
 
 score.py floor <gpu.full> <cpu.full>                              -> one line of JSON
-score.py omni  <gpu.full> <cpu.full> <top.txt>  [out.tsv]         -> per-step TSV (stdout or file) + summary JSON on stderr
+score.py any   <gpu.full> <cpu.full> <top.txt>  [out.tsv]         -> per-step TSV (stdout or file) + summary JSON on stderr
 score.py strata <gpu.full> <cpu.full> <pos.tsv> <first_pos> [out.tsv]  (pos.tsv rows whose position >= first_pos, in order)
 
 Q for an id in P's top 20 that the engine did not print: the engine's rest mass spread evenly over those ids plus
@@ -103,7 +103,7 @@ if __name__ == '__main__':
     mode = sys.argv[1]
     if mode == 'floor':
         print(json.dumps(floor(load_full(sys.argv[2]), load_full(sys.argv[3]))))
-    elif mode in ('omni', 'poly'):
+    elif mode in ('any', 'omni', 'poly'):
         gpu, cpu = load_full(sys.argv[2]), load_full(sys.argv[3]); eng = read_engine('poly', sys.argv[4])
         out = open(sys.argv[5], 'w') if len(sys.argv) > 5 else sys.stdout
         score(gpu, cpu, eng, out, sys.argv[4])

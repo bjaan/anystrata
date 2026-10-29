@@ -1,7 +1,7 @@
 // UnbiasedStrata: the front end's program. Mirrors llama.cpp's tools/server/server.cpp without router mode, MCP,
 // server-side tools, the web UI and model downloads.
 //
-//   omnistrata --engine build/bin/omnistrata-gguf -m model.gguf [llama-server options] -- <engine options>
+//   anystrata --engine build/bin/anystrata-gguf -m model.gguf [llama-server options] -- <engine options>
 //
 // Options before `--` are llama-server's (common_params_parse): -m/--model gives the GGUF the vocabulary and chat
 // template are read from, --host/--port/--api-key/--threads-http the listener, --temp/--top-k/... the sampling
@@ -46,7 +46,7 @@ void signal_handler(int signal) {
 
 void usage() {
     std::fprintf(stderr,
-        "usage: omnistrata --engine <omnistrata-pack|omnistrata-gguf|path> -m <model.gguf> [llama-server options] -- <engine options>\n"
+        "usage: anystrata --engine <anystrata-pack|anystrata-gguf|path> -m <model.gguf> [llama-server options] -- <engine options>\n"
         "\n"
         "  --engine PATH          the engine binary; a bare name is looked up beside this program\n"
         "  -m, --model FILE       the GGUF the vocabulary and chat template are read from (no tensors are loaded)\n"
@@ -61,7 +61,7 @@ void usage() {
         "  --                     everything after it is passed to the engine; --serve is added\n"
         "\n"
         "example (Qwen3.6-35B-A3B from its GGUF):\n"
-        "  omnistrata --engine omnistrata-gguf -m Qwen3.6-35B-A3B-UD-Q3_K_M.gguf --port 8080 \\\n"
+        "  anystrata --engine anystrata-gguf -m Qwen3.6-35B-A3B-UD-Q3_K_M.gguf --port 8080 \\\n"
         "      -- --model Qwen3.6-35B-A3B-UD-Q3_K_M.gguf --max-context 32768\n");
 }
 
@@ -136,7 +136,7 @@ int main(int argc, char ** argv) {
         }
     }
     if (!file_exists(engine_exe)) {
-        std::fprintf(stderr, "omnistrata: engine not found or not executable: %s\n", engine_exe.c_str());
+        std::fprintf(stderr, "anystrata: engine not found or not executable: %s\n", engine_exe.c_str());
         return 2;
     }
 
@@ -151,7 +151,7 @@ int main(int argc, char ** argv) {
     // encoder runs on the CPU unless --mmproj-gpu asks for the card (upstream PolyStrata's choice as well)
     params.mmproj_use_gpu = mmproj_gpu;
     if (params.model.path.empty()) {
-        std::fprintf(stderr, "omnistrata: -m <model.gguf> is required (the vocabulary and chat template come from it)\n");
+        std::fprintf(stderr, "anystrata: -m <model.gguf> is required (the vocabulary and chat template come from it)\n");
         return 2;
     }
     auto model_name = params.model.get_name();

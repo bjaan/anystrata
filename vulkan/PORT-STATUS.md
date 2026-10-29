@@ -756,7 +756,7 @@ short canary ids '220,18,24,16,13,271,48,25,3437,369,220,16,22,2942,220,17' -> g
 STRATA_VK_BATCH=0 eager arm; 735-tok long gate generated ids '271,248068,271,248069,271,1206,
 10724,393,16,22,1088,14695,220,17,18,60439' IDENTICAL to the bdbb0fd reference run.
 NOTE: git diff main..HEAD -- src include is NOT empty by itself: a concurrent session's rename
-commit dd4a161 (omnistrata) moved src/ targets; this pass touched ONLY files under vulkan/
+commit dd4a161 (anystrata) moved src/ targets; this pass touched ONLY files under vulkan/
 (git diff bdbb0fd..HEAD --stat -- src include == 0).
 
 ## q8_0 KV cache — the 64K-context unlock (in progress, 2026-10-27)
@@ -800,8 +800,8 @@ the Vulkan port now carries its write and its prefill-read arm:
 
 The bench/correctness harness (docs/CORRECTNESS-PLAN.md T1/T2) run teacher-forced against
 llama.cpp at the pinned submodule commit (44072a1, Vulkan build, mmap-forced per law 10), model
-**chtisgit Qwen3.6-35B-A3B GSQ-hybrid**, engine `omnistrata-gguf-vk --no-graphs` (wrapper
-omnistrata-gguf-vk-nog), arm **base** (--no-draft --lookup 0 --window 1). 12 legs with both
+**chtisgit Qwen3.6-35B-A3B GSQ-hybrid**, engine `anystrata-gguf-vk --no-graphs` (wrapper
+anystrata-gguf-vk-nog), arm **base** (--no-draft --lookup 0 --window 1). 12 legs with both
 reference arms (short set p00-p09 + code set lru/puzzle), 1,678 scored steps.
 
 | seq | steps | top-1 agree | engine KL (top20, nats) | llama.cpp GPU-vs-CPU floor | T2 ratio | T1 fails |

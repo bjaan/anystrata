@@ -1,7 +1,7 @@
 # Models and backends
 
-(Name map for this fork's copy of the upstream page: `strata` = `omnistrata-pack`, `strata-poly` =
-`omnistrata-gguf`, `strata-dsv41` = `omnistrata-gguf-dsv41`, `unbiased-strata` = `omnistrata`.
+(Name map for this fork's copy of the upstream page: `strata` = `anystrata-pack`, `strata-poly` =
+`anystrata-gguf`, `strata-dsv41` = `anystrata-gguf-dsv41`, `unbiased-strata` = `anystrata`.
 For what the **Vulkan** backend carries of each family, see the README's "Supported models" table and
 [vulkan/PORT-STATUS.md](../vulkan/PORT-STATUS.md).)
 

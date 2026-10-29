@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Configuration B arms (CORRECTNESS-PLAN.md 3.3): a fresh omnistrata-gguf process per sequence, teacher-forced on the
-reference answer, top-20 probabilities per step.  omni-run.py <file-tag> <gguf> <arm> [seq ...]
+"""Configuration B arms (CORRECTNESS-PLAN.md 3.3): a fresh anystrata-gguf process per sequence, teacher-forced on the
+reference answer, top-20 probabilities per step.  anystrata-run.py <file-tag> <gguf> <arm> [seq ...]
 arms: base   = --tail-skip 0 --no-draft --lookup 0 --window 1          (arm 1)
       draft  = --tail-skip 0 (draft block, lookup 3, window 8 defaults) (arm 2; top.txt must equal base's bytes)
       kvq8   = base + --kv q8_0                                          (arm 3)
@@ -9,7 +9,7 @@ Writes poly/<file-tag>/<arm>/<seq>.top.txt, .ids.txt, .log, command.sh."""
 import os, pathlib, subprocess, sys, time
 # US2_CORR_ROOT / US2_POLY: another model's root and engine binary (DeepSeek, GLM: 2026-10-19)
 ROOT = pathlib.Path(os.environ.get('US2_CORR_ROOT', pathlib.Path.home() / 'us2-results/correctness'))
-EXE = pathlib.Path(os.environ.get('US2_POLY', pathlib.Path.home() / 'us2-build/build/bin/omnistrata-gguf'))
+EXE = pathlib.Path(os.environ.get('US2_POLY', pathlib.Path.home() / 'us2-build/build/bin/anystrata-gguf'))
 tag, gguf, arm = sys.argv[1], sys.argv[2], sys.argv[3]; only = set(sys.argv[4:])
 
 def answer_path(p, seq, tag):
@@ -21,7 +21,7 @@ ARMS = {'base': ['--tail-skip', '0', '--no-draft', '--lookup', '0', '--window', 
         'draft': ['--tail-skip', '0'],
         'kvq8': ['--tail-skip', '0', '--no-draft', '--lookup', '0', '--window', '1', '--kv', 'q8_0'],
         'pb512': ['--tail-skip', '0', '--no-draft', '--lookup', '0', '--window', '1', '--prompt-batch', '512']}
-OUT = ROOT / 'omni' / tag / arm; OUT.mkdir(parents=True, exist_ok=True)
+OUT = ROOT / 'any' / tag / arm; OUT.mkdir(parents=True, exist_ok=True)
 env = dict(os.environ, STRATA_FREEZE_EXPERTS='1')
 for p in sorted(ROOT.glob('inputs/*/*.prompt.ids')):
     seq = p.name[:-len('.prompt.ids')]

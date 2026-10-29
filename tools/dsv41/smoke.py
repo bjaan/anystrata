@@ -1,6 +1,6 @@
-"""16 tokens of a fixed prompt through omnistrata-gguf-dsv41 and a check of the TEXT (setup runs this once after the pack is built).
+"""16 tokens of a fixed prompt through anystrata-gguf-dsv41 and a check of the TEXT (setup runs this once after the pack is built).
 
-    python tools/dsv41/smoke.py --exe omnistrata-gguf-dsv41 --pack <pack> [--gpus 0] [--tokens 16]
+    python tools/dsv41/smoke.py --exe anystrata-gguf-dsv41 --pack <pack> [--gpus 0] [--tokens 16]
 
 A pack that loads can still give garbage (a wrong pack recipe does exactly that), so the answer is read, not just the exit code:
 the model is asked for the capital of France and the reply must be words, with "Paris" in it.  Exit 0 and the text on success; exit 1

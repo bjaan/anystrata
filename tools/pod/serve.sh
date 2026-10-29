@@ -1,5 +1,5 @@
 #!/bin/bash
-# serve.sh <case> : fork front end + omnistrata-gguf on the 2x RTX PRO 6000 (96 GB) pod, 2026-10-19.  Engine args as
+# serve.sh <case> : fork front end + anystrata-gguf on the 2x RTX PRO 6000 (96 GB) pod, 2026-10-19.  Engine args as
 # docs/DEEPSEEK.md and docs/GLM.md; the recorded 2x B200 variant is bench/unbiased/2026-10-19-step13-acceptance/servers/.
 #   deepseek      UD-IQ2_XXS, one card, 128K           (91 GB resident on a 96 GB card)
 #   deepseek-q4   UD-Q4_K_XL, both cards, 256K         (155 GB of weights: --layer-split auto, experts beyond VRAM streamed)
@@ -24,4 +24,4 @@ esac
 [ -f "$MODEL" ] || { echo "missing $MODEL"; exit 1; }
 echo "$(date -u +%FT%TZ) start $1 gpu $GPU port $PORT" >> $S/starts.log
 ulimit -l unlimited 2>/dev/null
-exec env CUDA_VISIBLE_DEVICES=$GPU $F/build/bin/omnistrata --engine $F/build/bin/omnistrata-gguf -m $MODEL --host 0.0.0.0 --port $PORT --alias $ALIAS --sse-ping-interval 10 $FE_EXTRA -- $ARGS
+exec env CUDA_VISIBLE_DEVICES=$GPU $F/build/bin/anystrata --engine $F/build/bin/anystrata-gguf -m $MODEL --host 0.0.0.0 --port $PORT --alias $ALIAS --sse-ping-interval 10 $FE_EXTRA -- $ARGS

@@ -9,7 +9,7 @@ Upstream's full credits: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits).
 MIT License ([LICENSE](LICENSE)); some parts and every model have their own licenses
 ([which ones](docs/HOW_IT_WORKS.md#license)).
 
-# omnistrata — Strata for every GPU
+# anystrata — Strata for every GPU
 
 One `make`, no vendor SDK: an inference engine and OpenAI-compatible server for Mixture-of-Experts LLMs, built
 around one idea — **the experts live in VRAM**: each token reads only the few experts it routes to, so a 35B MoE
@@ -19,11 +19,11 @@ Python between a request and a token. The CUDA, HIP, SYCL and Metal backends sta
 CUDA remains the reference everything is measured against.
 
 ```
-git clone <this repo> && cd omnistrata
+git clone <this repo> && cd anystrata
 git submodule update --init      # shallow, third_party/llama.cpp @ robertkarl/llama.cpp (a6de9af3)
-make                             # the Vulkan engine: build-vk/bin/{omnistrata-gguf-vk, omnistrata}
+make                             # the Vulkan engine: build-vk/bin/{anystrata-gguf-vk, anystrata}
 make test                        # the front end against a fake engine; no GPU, no model
-make build                       # the CUDA engine, opt-in: build/bin/{omnistrata-pack, omnistrata-gguf, libstrata_kq.so, omnistrata}
+make build                       # the CUDA engine, opt-in: build/bin/{anystrata-pack, anystrata-gguf, libstrata_kq.so, anystrata}
 ```
 
 ## Why this exists
@@ -57,11 +57,15 @@ The lineage, spelled out because the name changed:
    and the Python middle layer are gone; in their place a C++ front end built from llama.cpp's own server code.
    The human note that opened this README — *"Strata minus the bullshit. clone, rsync to compile and go"* — is
    still the rule.
-4. **omnistrata** — the same project, renamed 2026-10-24 because the Vulkan port made GPU coverage the headline:
-   one engine family, every GPU that speaks a backend. Hence *omni*strata, and the binaries carry it
-   (`omnistrata` the front end, `omnistrata-gguf` the engine, `omnistrata-gguf-vk` the Vulkan build,
-   `omnistrata-pack` the original pack engine). "Poly" and "unbiased" live on in the history and in the credits,
-   not in the names. The GitHub repo keeps its old name until it is pushed elsewhere; the tree is what changed.
+4. **omnistrata** — renamed 2026-10-24 because the Vulkan port made GPU coverage the headline: one engine
+   family, every GPU that speaks a backend.
+5. **anystrata** — the same project once more, renamed 2026-10-29: *omni* turned out to be crowded
+   (OmniStrata, OmniToken, a dozen `omni-*` projects — a search engine finds them, not us). **anystrata**
+   says the identical thing in plainer English — Strata for *any* GPU — and a search finds only this repo.
+   The binaries carry it: `anystrata` the front end, `anystrata-gguf` the engine, `anystrata-gguf-vk` the
+   Vulkan build, `anystrata-pack` the original pack engine. "Poly", "unbiased" and "omni" live on in the
+   history, the credits, and the score harness's accepted mode words — not in the current names. The GitHub
+   repo keeps its old name until it is pushed elsewhere; the tree is what changed.
 
 ```
 Issues with Strata / PolyStrata, from the human who forked it:
@@ -122,7 +126,7 @@ make build CUDA_ARCHS=89                                        # 6m40 on 16 cor
 ## Run
 
 ```
-omnistrata --engine <omnistrata-pack|omnistrata-gguf|omnistrata-gguf-dsv41|path> -m <model.gguf> [llama-server options] -- <engine options>
+anystrata --engine <anystrata-pack|anystrata-gguf|anystrata-gguf-dsv41|path> -m <model.gguf> [llama-server options] -- <engine options>
 ```
 
 `-m` names the GGUF the vocabulary and chat template are read from; no tensors are loaded from it by the front end.
@@ -138,7 +142,7 @@ Vulkan, the default — Qwen3.6-35B-A3B 2-bit GSQ (chtisgit's hybrid conversion 
 all 10,240 routed experts in VRAM) on a Mesa-AMD card, with the Qwen3.6 sampling defaults:
 
 ```
-build-vk/bin/omnistrata --engine build-vk/bin/omnistrata-gguf-vk \
+build-vk/bin/anystrata --engine build-vk/bin/anystrata-gguf-vk \
   -m /models/Qwen3.6-35B-A3B-GSQ-hybrid.gguf --host 127.0.0.1 --port 18090 \
   --alias qwen3.6-35b-a3b-gsq-hybrid --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0 --presence-penalty 1.5 \
   -- --model /models/Qwen3.6-35B-A3B-GSQ-hybrid.gguf --max-context 16384
@@ -157,7 +161,7 @@ records. The law and the measurements are in `vulkan/PORT-NOTES.md` (rules 10-11
 CUDA, the reference path — Qwen3.6-35B-A3B from an Unsloth GGUF:
 
 ```
-build/bin/omnistrata --engine build/bin/omnistrata-gguf \
+build/bin/anystrata --engine build/bin/anystrata-gguf \
   -m /models/Qwen3.6-35B-A3B-UD-Q3_K_M.gguf --host 127.0.0.1 --port 18091 --alias qwen3.6-35b-a3b-ud-q3_k_m \
   -- --model /models/Qwen3.6-35B-A3B-UD-Q3_K_M.gguf --max-context 32768 \
      --expert-profile /models/expert-profile-q3km.txt --tail-skip 6
@@ -166,7 +170,7 @@ build/bin/omnistrata --engine build/bin/omnistrata-gguf \
 With pictures, add `--mmproj /models/mmproj-F16.gguf` (the projector from the same repository) and `--threads N`
 before the `--`; the front end encodes each picture once (picture cache, keyed by its SHA-256) and hands the rows
 to the engine over the `GENI` protocol. A picture is at most 300 rows by default (`--image-max-tokens` changes it).
-The pack engine (`omnistrata-pack`, Qwen3.8-Flash-Next) takes its own BF16 projector and also needs `--vision`
+The pack engine (`anystrata-pack`, Qwen3.8-Flash-Next) takes its own BF16 projector and also needs `--vision`
 after the `--`. Pack preparation (`tools/iq_pack.py`, `tools/mtp_fetch.py`, `tools/mtp_pack.py`, `tools/mtp_rt.py`)
 is unchanged; published packs stay at https://huggingface.co/robertkarl/UnbiasedStrataPacks (name kept for
 continuity). Model files are downloaded on a network box and copied in; the served files with sizes and SHA-256
@@ -179,13 +183,13 @@ the files actually served, with sizes and SHA-256, are listed in [docs/MODEL-FIL
 
 | Engine | Architecture (`general.architecture`) | Models | CUDA | HIP | SYCL | Metal | **Vulkan** |
 | --- | --- | --- | :-: | :-: | :-: | :-: | :-: |
-| `omnistrata-pack` | `qwen4exp` | Qwen3.8-Flash-Next and its fine-tunes (Coder, Swift 1.5) — pack + MTP directories, GSQ-RCO quants | ✓ | – | ✓ | ✓ | not ported |
-| `omnistrata-gguf` | `qwen35moe` | Qwen3.6-35B-A3B, Ornith 1.5, Tiel Coder, MiniCPM-V 4.7 (Unsloth / chtisgit-GSQ / community GGUFs) | ✓ | ✓ | ✓ | ✓ | **✓ end-to-end** (the port's gate model) |
+| `anystrata-pack` | `qwen4exp` | Qwen3.8-Flash-Next and its fine-tunes (Coder, Swift 1.5) — pack + MTP directories, GSQ-RCO quants | ✓ | – | ✓ | ✓ | not ported |
+| `anystrata-gguf` | `qwen35moe` | Qwen3.6-35B-A3B, Ornith 1.5, Tiel Coder, MiniCPM-V 4.7 (Unsloth / chtisgit-GSQ / community GGUFs) | ✓ | ✓ | ✓ | ✓ | **✓ end-to-end** (the port's gate model) |
 | | `glm5-next` | GLM 5.3 Flash (GSQ-RCO, REAP, UD quants) | ✓ | ✓ | – | – | untried |
 | | `gemma4` | Gemma 4 26B-A4B | ✓ | ✓ | – | – | untried |
 | | `deepseek4` | DeepSeek V4 Flash | ✓ | ✓ | – | – | untried |
 | | `lfm2moe` | LFM2.5-24B-A2B | ✓ | – | – | – | untried |
-| `omnistrata-gguf-dsv41` | `deepseek41` | DeepSeek-V4.1-Flash-1017 (Strata v0.2.4's engine: the four shards, Engram table, DSpark drafter; IQ1_M / IQ2_XXS / IQ2_XS GSQ-RCO) | ✓ | – | – | – | not ported |
+| `anystrata-gguf-dsv41` | `deepseek41` | DeepSeek-V4.1-Flash-1017 (Strata v0.2.4's engine: the four shards, Engram table, DSpark drafter; IQ1_M / IQ2_XXS / IQ2_XS GSQ-RCO) | ✓ | – | – | – | not ported |
 
 The Vulkan column reports what has run end-to-end on a Vulkan device (the BC-250 gate: `qwen35moe` files, all
 expert and dense quant formats held bitwise against the CUDA tree, the q8_0 KV cache — store, prefill
@@ -211,7 +215,7 @@ on any backend.
 ### Example lines (the pack and DeepSeek-V4.1 engines, CUDA path)
 
 ```
-build/bin/omnistrata --engine build/bin/omnistrata-pack \
+build/bin/anystrata --engine build/bin/anystrata-pack \
   -m /models/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf \
   --host 127.0.0.1 --port 18090 --alias qwen3.8-flash-next-iq3_xxs --sse-ping-interval 10 \
   -- --pack /models/pack-iq3-xxs \
@@ -223,11 +227,11 @@ build/bin/omnistrata --engine build/bin/omnistrata-pack \
 ```
 
 
-**DeepSeek-V4.1-Flash-1017, ISTA-DASLab IQ2_XXS** (`omnistrata-gguf-dsv41`, Strata v0.2.4's third engine; the four shards,
+**DeepSeek-V4.1-Flash-1017, ISTA-DASLab IQ2_XXS** (`anystrata-gguf-dsv41`, Strata v0.2.4's third engine; the four shards,
 the shared Engram file, Unsloth's DSpark drafter and a pack directory made from them): [docs/DEEPSEEK41.md](docs/DEEPSEEK41.md).
 
 ```
-build/bin/omnistrata --engine build/bin/omnistrata-gguf-dsv41 \
+build/bin/anystrata --engine build/bin/anystrata-gguf-dsv41 \
   -m /models/dsv41/IQ2_XXS/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf \
   --host 127.0.0.1 --port 11434 --alias deepseek-v4.1-flash-1017-ista-iq2_xxs --sse-ping-interval 10 \
   --chat-template-file data/dsv41/chat_template-ista-1017.jinja --temp 1.0 --top-p 1.0 --min-p 0.0 --top-k 64 \
@@ -236,7 +240,7 @@ build/bin/omnistrata --engine build/bin/omnistrata-gguf-dsv41 \
 
 ### Preparing a Flash-Next pack
 
-`omnistrata-gguf` reads a GGUF as it is. `omnistrata-pack` needs a pack directory and an MTP draft directory made once, offline
+`anystrata-gguf` reads a GGUF as it is. `anystrata-pack` needs a pack directory and an MTP draft directory made once, offline
 except for the draft download, with upstream's tools (`tools/requirements.txt`: numpy, regex; `gguf-py` comes from the
 submodule). This is what upstream's installer ran. Re-run in this fork on 2026-10-20 on three hosts; the MTP directory
 came out byte-identical each time, so it is published, with the commands and hashes, at
@@ -288,7 +292,7 @@ time, mmap forced, and an oom-score above the session's.
 
 ## Mascot
 
-**Omni Cyan** — the engine's character sheet: [vulkan/docs/mascot.md](vulkan/docs/mascot.md). An early-twenties
+**Any Cyan** — the engine's character sheet: [vulkan/docs/mascot.md](vulkan/docs/mascot.md). An early-twenties
 engineer in a PCB-teal cardigan; a three-disc hair-tie (the expert cache: cached / warm / cold), a strata-banded
 skirt (the bitwise quant formats), a hairpin engraved **391** — the answer she first computed on the BC-250 — and
 Silly the crate-bird hauling an 18-byte Q2_0 block. She belongs to every card that runs the engine.

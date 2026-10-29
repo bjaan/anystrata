@@ -5,9 +5,9 @@
 #   git submodule update --init
 #   make                            # default: the Vulkan engine — any AMD under Mesa, any APU, any
 #                                   # GPU ROCm abandoned; no CUDA toolkit, no vendor SDK, just the
-#                                   # driver you already have (build-vk/bin/{omnistrata-gguf-vk,omnistrata})
+#                                   # driver you already have (build-vk/bin/{anystrata-gguf-vk,anystrata})
 #   make build                      # the CUDA engine, opt-in: needs a CUDA 12.x toolkit
-#                                   # (build/bin/{omnistrata-pack,omnistrata-gguf,omnistrata-gguf-dsv41,libstrata_kq.so,omnistrata})
+#                                   # (build/bin/{anystrata-pack,anystrata-gguf,anystrata-gguf-dsv41,libstrata_kq.so,anystrata})
 #   make test                       # the front end against a fake engine; no GPU needed
 #
 BUILD_DIR  ?= build
@@ -52,7 +52,7 @@ COMPILER_FLAGS := $(if $(HOSTCXX),-DCMAKE_C_COMPILER=$(HOSTCC) -DCMAKE_CXX_COMPI
 # capped: inside a container nproc reports the host's CPUs, not the container's quota
 JOBS       ?= $(shell n=$$(nproc 2>/dev/null || echo 4); [ $$n -gt 16 ] && n=16; echo $$n)
 # what `make build` produces; upstream's `all` also builds about 70 parity and bench programs
-TARGETS    := omnistrata-pack omnistrata-gguf omnistrata-gguf-dsv41 strata_kq omnistrata
+TARGETS    := anystrata-pack anystrata-gguf anystrata-gguf-dsv41 strata_kq anystrata
 
 .PHONY: build configure clean test
 
@@ -67,7 +67,7 @@ configure:
 
 build: configure
 	cmake --build $(BUILD_DIR) -j $(JOBS) --target $(TARGETS)
-	@echo "built:"; ls -1 $(BUILD_DIR)/bin/omnistrata-pack $(BUILD_DIR)/bin/omnistrata-gguf $(BUILD_DIR)/bin/omnistrata-gguf-dsv41 $(BUILD_DIR)/bin/libstrata_kq.so $(BUILD_DIR)/bin/omnistrata
+	@echo "built:"; ls -1 $(BUILD_DIR)/bin/anystrata-pack $(BUILD_DIR)/bin/anystrata-gguf $(BUILD_DIR)/bin/anystrata-gguf-dsv41 $(BUILD_DIR)/bin/libstrata_kq.so $(BUILD_DIR)/bin/anystrata
 
 # The Vulkan engine (docs/VULKAN.md): the BC-250 backend, its own build tree (sycl/'s shape). Needs a
 # Vulkan loader + headers, glslc and spirv-as; no CUDA, no ROCm.
@@ -85,7 +85,7 @@ vulkan-test: vulkan
 frontend:
 	cmake -S . -B $(BUILD_DIR)-frontend -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_BUILD_TESTS=OFF \
 	      -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=$(abspath $(BUILD_DIR))-frontend/bin $(CMAKE_EXTRA)
-	cmake --build $(BUILD_DIR)-frontend -j $(JOBS) --target omnistrata
+	cmake --build $(BUILD_DIR)-frontend -j $(JOBS) --target anystrata
 
 # The front end's tests, against a fake engine (frontend/tests/fake-engine.py): the adapter's cases (cancel, drain,
 # backpressure, child exit, ERR) and the HTTP surface a coding agent touches (frontend/tests/e2e.sh).  Needs python3
@@ -95,7 +95,7 @@ test: frontend
 	$(BUILD_DIR)-frontend/bin/engine_test frontend/tests/fake-engine.py
 	$(BUILD_DIR)-frontend/bin/literals_test
 	$(BUILD_DIR)-frontend/bin/picture_cache_test
-	frontend/tests/e2e.sh $(BUILD_DIR)-frontend/bin/omnistrata
+	frontend/tests/e2e.sh $(BUILD_DIR)-frontend/bin/anystrata
 
 clean:
 	rm -rf $(BUILD_DIR)
