@@ -29,7 +29,7 @@ make build                       # the CUDA engine, opt-in: build/bin/{anystrata
 ```
 
 <p align="center">
-  <img src="assets/any-cyan.png"
+  <img src="vulkan/docs/any-cyan.png"
        alt="Any Cyan — the anystrata mascot"
        width="350">
 </p>
