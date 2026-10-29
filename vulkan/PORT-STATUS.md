@@ -936,6 +936,10 @@ captured d_slots_/expert bindings predate a swap that happens between capture an
 Narrowing (same day): --no-draft alone still collapses; --window 2 still collapses; --lookup 0
 (window+draft defaults) is CLEAN -> the trigger is the prompt-tail LOOKUP guesser (its verify
 pass is the first multi-token capture whose recorded expert bindings go stale under a swap).
+Lanes ruled out (same combo, each mitigated): STAGED arena copies (NO_MAP_ARENA=1) still
+collapse; BATCH=0 (per-launch eager submit, no pending CB) fails DIFFERENTLY - degenerate
+token-18 repetition, not zeros - so the capture/replay record itself is implicated, not the
+copy lane or the barrier-elision cluster.
 Candidate fix next session: retire per-layer capture keys when a swap moved that layer's slots
 (the slot table is host-visible to the engine; record() lifetime belongs to the engine), or
 replay-gate on all_cached() at launch time and drop to eager when the cache moved - matching
