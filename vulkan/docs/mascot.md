@@ -3,8 +3,8 @@
 ## Identity (fixed canon — never varies)
 - **Name:** **Any Cyan** ("the girl made of layers, for every GPU"). *Any* from the project
   name — one engine, any GPU; *Cyan* from the Vulkan spec's cyan light, "the color of any GPU
-  at night". She was drawn as Strata Cyan, then Omni Cyan as the project renamed twice; the
-  character never changed, only her prefix — now the honest one.
+  at night". She was drawn under an earlier project prefix; the character never changed, only
+  her name — now the settled one.
 - **What she brands:** anystrata as a whole — by default its Vulkan backend: any Vulkan 1.2+
   GPU (Radeon, Intel Arc, APUs, MoltenVK bridges), with CUDA/HIP/SYCL/Metal as opt-in backends
   where they win. Cyan = the Vulkan light, not a vendor color.

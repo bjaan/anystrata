@@ -57,15 +57,11 @@ The lineage, spelled out because the name changed:
    and the Python middle layer are gone; in their place a C++ front end built from llama.cpp's own server code.
    The human note that opened this README — *"Strata minus the bullshit. clone, rsync to compile and go"* — is
    still the rule.
-4. **omnistrata** — renamed 2026-10-24 because the Vulkan port made GPU coverage the headline: one engine
-   family, every GPU that speaks a backend.
-5. **anystrata** — the same project once more, renamed 2026-10-29: *omni* turned out to be crowded
-   (OmniStrata, OmniToken, a dozen `omni-*` projects — a search engine finds them, not us). **anystrata**
-   says the identical thing in plainer English — Strata for *any* GPU — and a search finds only this repo.
-   The binaries carry it: `anystrata` the front end, `anystrata-gguf` the engine, `anystrata-gguf-vk` the
-   Vulkan build, `anystrata-pack` the original pack engine. "Poly", "unbiased" and "omni" live on in the
-   history, the credits, and the score harness's accepted mode words — not in the current names. The GitHub
-   repo keeps its old name until it is pushed elsewhere; the tree is what changed.
+4. **anystrata** — renamed 2026-10-29 because the Vulkan port made GPU coverage the headline, and the
+   name says it in plain English: Strata for *any* GPU — one engine family, every GPU that speaks a
+   backend, and a search finds only this repo. The binaries carry it: `anystrata` the front end,
+   `anystrata-gguf` the engine, `anystrata-gguf-vk` the Vulkan build, `anystrata-pack` the original
+   pack engine. "Poly" and "unbiased" live on in the history and the credits, not in the current names.
 
 ```
 Issues with Strata / PolyStrata, from the human who forked it:
