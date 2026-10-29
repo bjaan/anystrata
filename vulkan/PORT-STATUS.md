@@ -867,8 +867,9 @@ flush_wait stalls ~11.9s / 31.6k drains). What shipped:
   event/stream syncs); d2d/fill record directly. A capture-body SYNC still aborts loudly.
 * vk_graph_capture pins the layer alone (record/replay bits == eager x3, frozen-byte + drain
   semantics, destroy semantics, node counts honest).
-* the model gate: hybrid 16-token canary BITWISE identical with graphs on (the fork's law:
-  graphs generation-inert), 48-token A/B awaiting; decode 18.5-19 -> 20.9 tok/s (f16 KV, graphs)
+* the model gate: hybrid 16-token canary AND the 48-token strict A/B (eager vs graphs,
+  grep-exact id lines, cmp clean): BITWISE IDENTICAL - graphs are generation-inert, the fork's
+  law holds on this backend; decode 18.5-19 -> 20.9 tok/s (f16 KV, graphs)
   and 21.9 tok/s (q8_0 KV + graphs); 64K ctx + q8_0 + graphs runs at ~100% VRAM experts.
   --no-graphs remains for A/B; graphs are now the engine default on Vulkan.
 Pitfalls this leg caught (kept in PORT-NOTES law 12): (a) the D2H capture-time SPEC serviced
