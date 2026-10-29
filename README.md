@@ -14,7 +14,7 @@ MIT License ([LICENSE](LICENSE)); some parts and every model have their own lice
 <table>
   <tr>
     <td width="280" valign="top">
-      <img src="vulkan/docs/any.png" alt="Any Cyan, the anystrata mascot" width="260" />
+      <img src="vulkan/docs/any-cyan.png" alt="Any Cyan, the anystrata mascot" width="260" />
     </td>
     <td valign="top">
       <p>
