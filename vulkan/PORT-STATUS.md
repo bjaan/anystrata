@@ -944,3 +944,59 @@ Candidate fix next session: retire per-layer capture keys when a swap moved that
 (the slot table is host-visible to the engine; record() lifetime belongs to the engine), or
 replay-gate on all_cached() at launch time and drop to eager when the cache moved - matching
 what CUDA's recapture cadence does implicitly via head_key/room growth.
+
+
+## Task 4.2 (plan 2026-10-21): events with REAL GPU timestamps (2026-10-30): GREEN
+
+The graphs half of Phase 4.2 landed 2026-10-29 (record above); the plan's Task 4.2 line —
+"events with real GPU timestamps (timestampComputeAndGraphics proven on this box) so bench
+timings and the engine's per-stage tables become meaningful" — was NOT done: event_record paid
+a full flush_wait per stamp, event_elapsed returned a flat 0 (host-stamp pairs only inside the
+compat header), and docs/VULKAN.md still said "Events time 0". Shipped now:
+
+* vk_device.cpp: the timestamp gate is read BEFORE device create — limits.timestampComputeAndGraphics
+  AND the chosen queue family's timestampValidBits (BC-250: compute family 64 bits, sparse family 0:
+  the per-family check is the gate; the fact is core, NOT a feature bit — enabling nothing is legal,
+  writing the first VkPhysicalDeviceFeatures bit name as if it were one does not compile).
+  DeviceInfo gains gpu_timestamps + timestamp_period_ns (radv BC-250: 10.0 ns/tick).
+* vk_runtime.cpp event layer, two arms:
+  - gpu arm (default on this box): event_record appends vkCmdResetQueryPool +
+    vkCmdWriteTimestamp(COMPUTE) into the PENDING CB — the stamp sits at its exact stream
+    position behind every recorded launch, at ZERO submit cost (the old path paid a full
+    queue drain per record: --stage-timing's 512 pairs/token would have re-made the Phase-4.1
+    stall wall). event_elapsed drains once and reads both 64-bit ticks; ms = (to-from) *
+    timestampPeriod / 1e6. event_synchronize submits/drains the CB carrying the stamp.
+    cudaEventDisableTiming events (poly's 16 staging-sync sites: engine.cpp's router readback,
+    expert staging) create NO query pool and record NO node — a pure marker, and
+    cudaEventCreateWithFlags now honours the flag instead of ignoring it.
+  - host arm (kept honest as the fallback for cards without the fact, forced by
+    STRATA_VK_NO_GPU_EVENTS=1 for A/B): the old drain+steady_clock behaviour, never a fake
+    driver timestamp. A pair mixing arms falls back to the host interval (every record stamps
+    steady_clock too), so a foreign-capture eager arm can never yield epoch junk.
+  Law 14 respected: while ANOTHER thread captures, this thread records the host arm (never
+  batches a timestamp into the shared pending CB beside a foreign capture); a record inside
+  one's OWN capture keeps the capture-body sync law and refuses loudly.
+* Pinned by execution (the port's law — capability by running, not by listing): ctest
+  vk_event_timing (gpu arm) + vk_event_timing_host_arm (env-forced), around a real 256K-store
+  dispatch: elapsed > 0 (the pre-4.2 layer was a flat 0), plausible (<10 ms), and <= the
+  host-wall interval that wrapped the same span. BC-250 measurement: gpu 0.095 ms vs wall
+  0.183 ms for the pair (the driver's ticks cut the submit overhead the host stamp includes).
+* Model gate with the new layer in the engine: hybrid canary (the 24-token ChatML prompt,
+  re-tokenized from the hybrid file — the old /tmp/qids.txt is gone), graphs vs --no-graphs,
+  full residency: ids '248068,271,248069,271,18,24,16,248046' BITWISE IDENTICAL both arms,
+  generation unaffected by the timing change (the poly path only ever used DisableTiming
+  events; those now skip pools — cheaper, same order). leg.sh engine gate honoured (20 s
+  cooldown between legs).
+* Task 4.3's unfinished half CLOSED the same day: poly_draft_race_test ported as
+  poly_draft_race_test_vk (CUDA's src/poly/draft_race_test.cpp UNCHANGED + the same engine
+  sources, a shared VK_POLY_ENGINE_SRC/LIBS set in vulkan/CMakeLists.txt; the port rule holds —
+  git diff -- src include == 0). Model gate (hybrid file, RUNS=4, leg.sh engine gate): SKIP rc=3
+  with the tree's own honest reason — 'the read gave the draft block 0 call(s) on the layer-major
+  path; the race needs two or more (every expert cached...)' — the hybrid model keeps 100% of
+  experts resident, exactly the regime where the test declines; the CUDA build's own header says
+  SKIP is the correct outcome there. The binary builds and runs end-to-end against the card.
+* Honest scope: --stage-timing's per-stage TABLES live in src/program/generate.cpp, which this
+  box's vk build does not link (the pack/core engine is not ported to Vulkan); poly has no
+  stage-timing CLI. What Task 4.2 owed — a compat event surface returning real device time for
+  every consumer in the tree (bench harnesses, session sweep, STRATA_COMMIT_TIMING when a core
+  engine runs on Vulkan) — is what landed and is pinned. ctest 17/17.

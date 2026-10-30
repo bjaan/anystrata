@@ -297,3 +297,20 @@ reach them (they are in the .cu files, which stay uncompiled); dim3/vector types
    counters show which path ran). The graph-node host IMPORT (law 14, external_memory_host) is
    SEPARATE, needed for correctness, and stays. Lesson for every future "obviously redundant"
    copy on UMA: measure the lane, not the theory.
+
+15. **GPU-timestamp laws (Task 4.2, measured 2026-10-30).** (a) timestampComputeAndGraphics is a
+    LIMITS fact, not a feature bit: writing it into VkPhysicalDeviceFeatures does not compile
+    (checked against the distro's Vulkan headers). The real per-device gate is the QUEUE FAMILY's
+    timestampValidBits — this box: compute family 64 bits, sparse family 0; a query pool on the
+    wrong family would read garbage, not fail. (b) vkCmdWriteTimestamp rides the PENDING command
+    buffer (reset + write, COMPUTE stage): position-exact with zero submits — an event pair that
+    drains per record re-makes the Phase-4.1 flush_wait wall the moment --stage-timing-style
+    consumers run (512 pairs per token). (c) One query pool per event, results cached after the
+    first read (re-reading a pool without resetting is UB); a re-recorded pair RESETS its own
+    query inside the new CB, so CUDA's re-record semantics fall out. (d) While another thread
+    captures (law 14's ThreadLocal rule), a foreign thread's record takes the host arm — never
+    batch a timestamp node into the shared pending CB beside a foreign capture. (e) The host arm
+    stays (cards without the fact; STRATA_VK_NO_GPU_EVENTS=1 A/B): drain + steady_clock, an
+    honest end-to-end interval, never a fake driver timestamp; every record stamps the host clock
+    too, so a pair mixing arms reports the host interval, never epoch junk. Both arms pinned by
+    the vk_event_timing ctest pair (>0, plausible, <= wrapped host-wall).
