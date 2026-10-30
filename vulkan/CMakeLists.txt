@@ -51,7 +51,7 @@ elseif(GLSLC)
   set(GLSLC_MODE glslc)
   message(STATUS "vk kernel compiler: system glslc ${GLSLC}")
 else()
-  message(FATAL_ERROR "neither a vendored glslangValidator nor glslc (spirv-tools package) found; the .comp kernels cannot be built")
+  message(FATAL_ERROR "no kernel compiler found: install glslc (Debian/Ubuntu/Mint: apt install glslc, from the shaderc source; universe on Ubuntu/Mint) or build glslang, and the .comp kernels can be built")
 endif()
 set(VK_GLSLC ${CMAKE_CURRENT_SOURCE_DIR}/tools/vk-glslc.sh)
 

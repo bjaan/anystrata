@@ -93,6 +93,40 @@ Use at your own risk. Works on my machine — and now, on yours.
 
 ## Box setup — CliffsNotes
 
+**AMD GPU or APU under Mesa — the Vulkan path, no CUDA, no ROCm, no vendor SDK.** Debian, Ubuntu and
+Linux Mint (22.x = Ubuntu 24.04: all ship `glslc`); the build needs only CMake ≥ 3.24, a C++20
+compiler, the Vulkan loader/headers, and `glslc` to compile the compute kernels:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends \
+    git cmake build-essential python3 libvulkan-dev glslc
+# glslc is in universe on Ubuntu/Mint: add it with `add-apt-repository universe` if prompted.
+
+git clone https://github.com/bjaan/anystrata && cd anystrata
+git submodule update --init                    # third_party/llama.cpp (pinned), shallow, no downloads at build
+make -j$(nproc)                                # the default target: the Vulkan engine
+ctest --test-dir build-vk --output-on-failure  # the whole parity suite on your card (tests skip cleanly without one)
+
+# check the card speaks the two load-bearing capabilities the runtime demands:
+apt install -y vulkan-tools && vulkaninfo --summary
+#   needs: Vulkan >= 1.2, VK_KHR_shader_integer_dot_product, VK_EXT_subgroup_size_control
+#   (RDNA1/2/3, GCN5+ under RADV all qualify; the engine refuses a card without them, by name)
+```
+
+Run it (models are downloaded on another machine and copied over; the engine fetches nothing):
+
+```bash
+build-vk/bin/anystrata --engine build-vk/bin/anystrata-gguf-vk \
+  -m /path/to/Qwen3.6-35B-A3B.gguf --host 127.0.0.1 --port 18090 \
+  -- --model /path/to/Qwen3.6-35B-A3B.gguf --max-context 8192
+```
+
+Context sizes on a unified-memory APU (shared RAM+VRAM): 16K/32K are safe with ≥ 1.5x the model
+size in total RAM; 64K needs `--kv q8_0` (docs/VULKAN.md, "Context sizes on a unified-memory
+APU"). On a discrete card there is more slack. `make build` (the CUDA path) needs the NVIDIA
+toolkit instead and is the section below.
+
 Guest, both cards:
 
 ```bash
@@ -114,7 +148,7 @@ Pascal — GTX 1080 Ti, compute 6.1:
 ```bash
 nvcc --list-gpu-arch | grep -q compute_61                       # CUDA 13 has no sm_61; stay on 12.4
 nvidia-smi --query-gpu=driver_version --format=csv,noheader     # 550 is below CUDA 13's requirement (>= 580)
-git clone https://github.com/robertkarl/UnbiasedStrata && cd UnbiasedStrata   # the repo directory keeps the old name until it is renamed upstream
+git clone https://github.com/bjaan/anystrata && cd anystrata
 JOBS=4 make test                                                # no GPU, no model
 JOBS=4 make build CUDA_ARCHS=61                                 # -DSTRATA_EXPERIMENTAL_SM60=ON, -ccbin /usr/bin/g++-13; 15 min, 398 MB, 53 warnings
 ```
@@ -122,7 +156,7 @@ JOBS=4 make build CUDA_ARCHS=61                                 # -DSTRATA_EXPER
 Ada — RTX 4090, compute 8.9:
 
 ```bash
-git clone https://github.com/robertkarl/UnbiasedStrata && cd UnbiasedStrata   # the repo directory keeps the old name until it is renamed upstream
+git clone https://github.com/bjaan/anystrata && cd anystrata
 make test
 make build CUDA_ARCHS=89                                        # 6m40 on 16 cores, 557 MB, 0 warnings
 ```
