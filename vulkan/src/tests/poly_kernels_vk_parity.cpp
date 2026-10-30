@@ -879,7 +879,7 @@ int main() {
             for (int t = 0; t < 1024; ++t)
                 for (int i = t; i < n; i += 1024) {
                     if (x[i] == m) at = std::min(at, i);
-                    if (x[i] > m - 20.0f) sums[t] += std::expf(x[i] - m);
+                    if (x[i] > m - 20.0f) sums[t] += std::exp(x[i] - m);
                 }
             // warp butterfly again (float +=, all lanes per round), part = lane 0 of each warp,
             // then block_sum's fold s = 0; s += part[k] for k = 0..31 IN ORDER (:46-47).
