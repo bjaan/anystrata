@@ -740,7 +740,7 @@ sh staging + xor-tree reduction per slot. Parity: 3 new cases (3x2048x1024, 8x20
 2x512x7) vs the single-launch kernel BITWISE (3072+16384+14 outputs, 0 differ); the engine's
 per-column fallback and this path answer identically, so the fusion is numerics-free.
 RESULT TABLE (same box, same binary family, 735-tok prompt / decode tok/s):
-  baseline (bdbb0fd)        prefill 32.1 (measured 31.7), 789k launches, 0 elided
+  baseline (2a33f51)        prefill 32.1 (measured 31.7), 789k launches, 0 elided
   +q2_0 slots (elide off)   35.2, 378k launches (508k mmvq -> 59k slots + 23k q8_0)
   +barrier elide            36.0-36.3, 82k barriers elided/run
   485-tok ctx-16384 gate    33.3 tok/s (was ~32); pi 1596-tok system prompt 31.7 -> re-measure:
@@ -754,10 +754,10 @@ GATES: ctest 14/14 (native_mmvq_vk_parity 74k outputs incl. the new q2_0 slots s
 short canary ids '220,18,24,16,13,271,48,25,3437,369,220,16,22,2942,220,17' -> generated
 '18,30,198,32,25,220,18,24,16,13,271,48,25,3437,369,220' IDENTICAL to NO_ELIDE and to the
 STRATA_VK_BATCH=0 eager arm; 735-tok long gate generated ids '271,248068,271,248069,271,1206,
-10724,393,16,22,1088,14695,220,17,18,60439' IDENTICAL to the bdbb0fd reference run.
+10724,393,16,22,1088,14695,220,17,18,60439' IDENTICAL to the 2a33f51 reference run.
 NOTE: git diff main..HEAD -- src include is NOT empty by itself: a concurrent session's rename
-commit dd4a161 (anystrata) moved src/ targets; this pass touched ONLY files under vulkan/
-(git diff bdbb0fd..HEAD --stat -- src include == 0).
+commit 23615f4 (anystrata) moved src/ targets; this pass touched ONLY files under vulkan/
+(git diff 2a33f51..HEAD --stat -- src include == 0).
 
 ## q8_0 KV cache — the 64K-context unlock (in progress, 2026-10-27)
 
@@ -779,7 +779,7 @@ the Vulkan port now carries its write and its prefill-read arm:
   dequantization of m rows into kwork/vwork, the fp16 GEMMs unchanged; 1D-grid flattening per
   the runtime law; pairs written by even lanes (no word RMW race). A parity case for the arm is
   the next step (run_batch gains a q8 variant: same order reference, f16-rounded codes as input).
-* `attend` fused q8 read (2026-10-28, e7e42f9): ATT_Q8=1 variants of ALL four score reg arms
+* `attend` fused q8 read (2026-10-28, af24cad): ATT_Q8=1 variants of ALL four score reg arms
   and all three value arms, bound at 4/5 (codes: 4 int8 a word, scales: one f16 per 32 values,
   x = float(code)*d as f32 — CUDA-faithful, no f16 step unlike the workspace arm). Parity:
   three q8 cases rel_l1 ~1e-7 vs the order reference AND the naive reference. Span law: exact
@@ -843,7 +843,7 @@ as machine-limited like the fork's per-machine gaps.
 
 kvq8 arm at the model level: p00-p02 produced their prompt-path steps through the new
 attend_batch q8 dequant arm and halted at attend()'s fused q8 decode read; once that read
-landed (e7e42f9), the FULL arm re-ran clean (2026-10-29, --no-graphs so the delta is ONLY
+landed (af24cad), the FULL arm re-ran clean (2026-10-29, --no-graphs so the delta is ONLY
 the q8 cache): all 10 short legs, 1,096 steps:
 
 p00 128 top-1 .992 kl .0054 2.76x | p01 128 .992 .0010 1.59x | p02 128 1.000 .0002 0.97x
@@ -859,7 +859,7 @@ reads are all bitwise-verified against the CUDA tree. 64K serve runs (law 11's u
 carry this documented trade.
 
 Graphs A/B (Phase 4.2 law): 48-token canary generation, --no-graphs vs graphs: BITWISE
-IDENTICAL ids (cmp clean). Graphs are the Vulkan default from 85a87a1.
+IDENTICAL ids (cmp clean). Graphs are the Vulkan default from b6af60d.
 
 Reference-leg survival notes (all recorded as PORT-NOTES laws 10/11): GPU legs pin 12.2 GB via
 TTM (both device tiers), the dump tool needed STRATA_DUMP_MMAP=1 (llama.cpp's AUTO loader copies
@@ -916,7 +916,7 @@ Isolation matrix (hybrid, canary ids, 4096 ctx, max-new 32; `--vram-reserve-mib 
 
 | graphs | cache | speculation | result |
 | --- | --- | --- | --- |
-| on | full (10,240) | on  | OK — bitwise == eager (the 48-id A/B, f0d1f9e) |
+| on | full (10,240) | on  | OK — bitwise == eager (the 48-id A/B, 132ffc9) |
 | off | swap | on  | OK (5.18 tok/s, 20/21 guesses) |
 | on  | swap | off | OK (correct ids, run A) |
 | off | swap | off | OK, == run A |
