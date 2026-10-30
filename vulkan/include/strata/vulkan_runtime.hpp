@@ -30,6 +30,14 @@ struct DeviceInfo {
     bool subgroup_size_control = false;
     bool buffer_device_address = false;
     bool unified_memory = false;
+    // Task 4.2: GPU timestamps. gpu_timestamps is set only when the device LIMITS say
+    // timestampComputeAndGraphics AND the chosen queue family's timestampValidBits >= 32 AND
+    // vkCmdWriteTimestamp proves itself by execution (the vk_event_timing ctest pins it).
+    // timestamp_period_ns is VkPhysicalDeviceLimits::timestampPeriod (ns per tick; radv
+    // BC-250: 10.0, 64 valid bits). Events fall back to host-clock stamps when this is false
+    // or STRATA_VK_NO_GPU_EVENTS=1.
+    bool gpu_timestamps = false;
+    double timestamp_period_ns = 0.0;
     std::string driver;
     // Task 1.3 (step 5): the facts cudaDeviceProp exposes that vk_device.cpp did not carry.
     // multi_processor_count comes from VK_AMD_shader_core_properties when the driver answers it
@@ -79,11 +87,12 @@ void* stream_create();                                   // opaque VkStream*
 void  stream_destroy(void* s);
 void  stream_sync(void* s);
 void  device_sync();
-void* event_create();
+void* event_create(bool timing = true);                // timing=false: cudaEventDisableTiming, a sync marker
 void  event_destroy(void* e);
-void  event_record(void* e, void* s);
+void  event_record(void* e, void* s);                    // Task 4.2: a GPU-timestamp node in the stream
 void  event_wait(void* e, void* s);                      // stream waits on event
-float event_elapsed(void* from, void* to);
+void  event_synchronize(void* e);                        // block until the record's stamp retired
+float event_elapsed(void* from, void* to);               // GPU-queue interval (host-clock fallback)
 
 // ---- copies between the arena and host memory (pinned or ordinary; the loader handles staging).
 // ---- Phase 4.2: graph capture (compat cudaGraph* family drives these).

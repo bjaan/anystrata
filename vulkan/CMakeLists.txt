@@ -792,6 +792,15 @@ target_include_directories(vk_graph_capture PRIVATE ${STRATA_ROOT}/include ${STR
 target_link_libraries(vk_graph_capture PRIVATE strata_vk_kernel_store_f16 strata_vk_runtime strata_vk_compat)
 add_test(NAME vk_graph_capture COMMAND vk_graph_capture)
 
+# Task 4.2: events with real GPU timestamps, pinned by execution on BOTH arms (gpu-timestamp
+# node vs the host-clock fallback) — elapsed() must be >0, plausible and never fake-negative.
+add_executable(vk_event_timing src/tests/vk_event_timing.cpp)
+target_include_directories(vk_event_timing PRIVATE ${STRATA_ROOT}/include ${STRATA_ROOT}/src/poly ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
+target_link_libraries(vk_event_timing PRIVATE strata_vk_kernel_store_f16 strata_vk_runtime strata_vk_compat)
+add_test(NAME vk_event_timing COMMAND vk_event_timing)
+add_test(NAME vk_event_timing_host_arm COMMAND vk_event_timing)
+set_tests_properties(vk_event_timing_host_arm PROPERTIES ENVIRONMENT "STRATA_VK_NO_GPU_EVENTS=1")
+
 add_executable(vk_core_smoke src/tests/vk_core_smoke.cpp ${STRATA_ROOT}/src/platform/memory.cpp)
 target_include_directories(vk_core_smoke PRIVATE ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(vk_core_smoke PRIVATE strata_vk_core)
@@ -847,8 +856,10 @@ target_include_directories(strata_vk_poly_kernels PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/vulkan_compat)
 target_link_libraries(strata_vk_poly_kernels PUBLIC strata_vk_runtime)
 
-add_executable(anystrata-gguf-vk
-  ${STRATA_ROOT}/src/poly/main.cpp
+# The poly engine's source set and link order (real launchers FIRST, stubs last: the link-order
+# rule above), shared by the two engines AND the Task-4.3 port of poly_draft_race_test (same
+# sources, same libs, run by hand with a model file — the CUDA build's convention).
+set(VK_POLY_ENGINE_SRC
   ${STRATA_ROOT}/src/poly/engine.cpp
   ${STRATA_ROOT}/src/poly/glm5next.cpp
   ${STRATA_ROOT}/src/poly/qwen35.cpp
@@ -865,8 +876,7 @@ add_executable(anystrata-gguf-vk
   ${STRATA_ROOT}/src/spec/controller.cpp
   ${STRATA_ROOT}/src/spec/draft_policy.cpp
   ${STRATA_ROOT}/src/spec/draft_source.cpp)
-target_include_directories(anystrata-gguf-vk PRIVATE ${STRATA_ROOT}/include ${STRATA_VK_GGML_DIR}/include)
-target_link_libraries(anystrata-gguf-vk PRIVATE
+set(VK_POLY_ENGINE_LIBS
   strata_vk_kernel_s2_gemv strata_vk_kernel_dequant_s2   # real launchers FIRST (link-order rule above)
   strata_vk_kernel_copy2 strata_vk_kernel_rms_norm strata_vk_kernel_native_quantize_q8_1
   strata_vk_kernel_native_mmvq
@@ -874,6 +884,27 @@ target_link_libraries(anystrata-gguf-vk PRIVATE
   strata_vk_kernel_head_norm_rope strata_vk_kernel_store_f16 strata_vk_kernel_store_q8 strata_vk_kernel_store_f16_at strata_vk_kernel_store_q8_at strata_vk_kernel_attend strata_vk_kernel_attend_batch strata_vk_kernel_likeliest
   strata_vk_kernel_bf16_to_f32 strata_vk_kernel_gemm_f32
   strata_vk_poly_kernels strata_vk_core
-  ggml-cpu ggml-base
+  ggml-cpu ggml-base)
+
+add_executable(anystrata-gguf-vk
+  ${STRATA_ROOT}/src/poly/main.cpp
+  ${VK_POLY_ENGINE_SRC})
+target_include_directories(anystrata-gguf-vk PRIVATE ${STRATA_ROOT}/include ${STRATA_VK_GGML_DIR}/include)
+target_link_libraries(anystrata-gguf-vk PRIVATE
+  ${VK_POLY_ENGINE_LIBS}
   strata_vk_compat strata_vk_stubs                      # stubs last: they only let the link complete
+  Threads::Threads)
+
+# Task 4.3's other half: poly_draft_race_test ported (CUDA's own src/poly/draft_race_test.cpp,
+# UNCHANGED, linked against the Vulkan engine set). "Does a read with the draft block repeat bit
+# for bit?" — the graphs-default law this task asked for, run by hand with a model file like the
+# CUDA build's: poly_draft_race_test VK-ENGINE-MODEL.gguf [RUNS]. Exit 0 every run matched the
+# first; 3 SKIP when the read gave the draft block too few calls to show the race.
+add_executable(poly_draft_race_test_vk
+  ${STRATA_ROOT}/src/poly/draft_race_test.cpp
+  ${VK_POLY_ENGINE_SRC})
+target_include_directories(poly_draft_race_test_vk PRIVATE ${STRATA_ROOT}/include ${STRATA_VK_GGML_DIR}/include)
+target_link_libraries(poly_draft_race_test_vk PRIVATE
+  ${VK_POLY_ENGINE_LIBS}
+  strata_vk_compat strata_vk_stubs
   Threads::Threads)

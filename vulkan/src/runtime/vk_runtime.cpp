@@ -743,13 +743,95 @@ void device_sync() { std::lock_guard<std::mutex> plk(g_pm);
                          vkDestroyDescriptorPool(dev, x.dp, nullptr); }
                      g_inflight.clear(); }
 
-struct Ev { };
-void* event_create() { return new Ev{}; }
-void event_destroy(void* e) { delete (Ev*)e; }
-// host-clock timing: the queue must be idle when the event is recorded
-void event_record(void*, void*) { flush_wait_why("event_record"); flush_wait(); }
+struct Ev { VkQueryPool pool = VK_NULL_HANDLE;    // Task 4.2 gpu arm: one TIMESTAMP query, slot 0
+            uint64_t tick = 0; bool have = false; // cached result (a pool may only be re-read after reset)
+            std::chrono::steady_clock::time_point t{}; bool host = true; bool timing = true; };
+void* event_create(bool timing) {
+    Ev* e = new Ev{}; e->timing = timing; return e;
+}
+void event_destroy(void* e) {
+    if (!e) return;
+    Ev* p = (Ev*) e;
+    if (p->pool) vkDestroyQueryPool((VkDevice) vk_handle(), p->pool, nullptr);
+    delete p;
+}
+// ---- Task 4.2: events with real GPU timestamps -------------------------------------------------------
+// The gpu arm: event_record appends vkCmdResetQueryPool + vkCmdWriteTimestamp(COMPUTE) to the
+// PENDING command buffer — the timestamp then sits at that exact point of the stream, behind
+// every launch already recorded and ahead of everything recorded after it, with NO submit and NO
+// drain of its own (the old path paid a full flush_wait per record). If no CB is pending, the
+// stamp gets its own tiny CB: submits on the one queue are FIFO, so it still lands at the right
+// place. event_elapsed drains the queue and reads both 64-bit results: (to - from) *
+// timestampPeriod / 1e6 is the GPU-queue interval in ms — the number --stage-timing's per-stage
+// tables and STRATA_COMMIT_TIMING's commit-graph line want.
+// The host arm (kept for cards without the feature, and forced by STRATA_VK_NO_GPU_EVENTS=1 for
+// A/B): record = queue drain + steady_clock stamp, exactly the old behaviour — an honest
+// end-to-end interval, never a driver timestamp.
+static bool ts_on() {
+    static int v = -1;
+    if (v < 0) v = (!getenv("STRATA_VK_NO_GPU_EVENTS") && device_info().gpu_timestamps
+                    && device_info().timestamp_period_ns > 0.0) ? 1 : 0;
+    return v == 1;
+}
+void event_record(void* ev, void*) {
+    Ev* e = (Ev*) ev;
+    // law 14 (ThreadLocal capture): while ANOTHER thread captures, this thread runs the proven
+    // eager path — drain, never batch into the shared pending CB beside a foreign capture.
+    const bool foreign_cap = g_capturing && !cap_here();
+    if (!ts_on() || foreign_cap) { e->host = true; flush_wait_why("event_record"); flush_wait();
+                    e->t = std::chrono::steady_clock::now(); return; }
+    if (cap_here()) { flush_wait_why("event_record"); flush_wait(); }   // the capture-body sync law: refuses loudly
+    e->host = false; e->have = false;
+    e->t = std::chrono::steady_clock::now();  // also stamped: a pair with one host-arm record (a
+                                              // foreign capture on another thread, law 14) falls
+                                              // back to the honest host interval, never epoch junk
+    if (!e->timing) return;   // cudaEventDisableTiming: a pure sync marker — no query pool, no node
+    if (!e->pool) {
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP; qi.queryCount = 1;
+        RT(vkCreateQueryPool((VkDevice)vk_handle(), &qi, nullptr, &e->pool));
+    }
+    {
+        std::lock_guard<std::mutex> plk(g_pm);
+        if (g_pend.cb) {   // the common arm: the stamp rides the pending CB at its stream position
+            vkCmdResetQueryPool(g_pend.cb, e->pool, 0, 1);
+            vkCmdWriteTimestamp(g_pend.cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, e->pool, 0);
+            return;
+        }
+    }
+    // no pending CB: its own tiny one. begin()/end_submit take g_pm themselves (lock law: g_pm is
+    // the leaf and never re-entered); the queue is idle here, so position is trivially exact.
+    VkCommandBuffer cb = begin();
+    vkCmdResetQueryPool(cb, e->pool, 0, 1);
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, e->pool, 0);
+    end_submit(cb);
+}
+bool event_tick(Ev& e) {       // g_pm held; returns the fetched tick, caching it
+    if (e.have) return true;
+    if (!e.pool) return false;
+    uint64_t t = 0;
+    VkResult r = vkGetQueryPoolResults((VkDevice)vk_handle(), e.pool, 0, 1, sizeof t, &t, sizeof t,
+                                       VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    if (r != VK_SUCCESS) return false;
+    e.tick = t; e.have = true;
+    return true;
+}
 void event_wait(void*, void*) {}
-float event_elapsed(void*, void*) { return 0.f; }
+void event_synchronize(void* ev) {
+    Ev* e = (Ev*) ev;
+    if (e->host) return;                     // host arm: the record already drained
+    flush_wait_why("event_synchronize"); flush_wait();   // pending CB (with the stamp) submitted + drained
+}
+float event_elapsed(void* from, void* to) {
+    Ev* a = (Ev*) from; Ev* b = (Ev*) to;
+    if (a->host || b->host || !a->pool || !b->pool)
+        return std::chrono::duration<float, std::milli>(b->t - a->t).count();   // host/fallback interval
+    std::lock_guard<std::mutex> plk(g_pm);
+    flush_wait_locked();                     // the stamps ride in command buffers: drain them first
+    if (!event_tick(*a) || !event_tick(*b)) return 0.f;
+    double ns = (double)(b->tick - a->tick) * device_info().timestamp_period_ns;
+    return (float)(ns / 1e6);
+}
 
 void copy_h2d(void* dst, const void* src, uint64_t bytes, void*) {
     if (getenv("STRATA_VK_FLUSH_WHY")) {   // (size, offset) histogram of eager h2d copies (probe only)

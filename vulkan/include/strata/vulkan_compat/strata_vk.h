@@ -512,33 +512,46 @@ inline cudaError_t cudaLaunchHostFunc(cudaStream_t, cudaHostFn_t fn, void* ud) {
     return cudaSuccess;
 }
 
-// ---- events (pair-based host-clock timing, per the plan) ------------------------------------------------
-// record = a queue drain (strata::vk::event_record does exactly that) plus a host-clock stamp: on this box
-// every submission already completes before the call returns, so the stamp IS the device completion time.
-// Elapsed timings are therefore honest end-to-end intervals, not driver timestamps; they exist for the
-// engine's PCIe-probe stage tables, which the UMA port skips (STRATA_VK_SKIP_PCIE_PROBE, Task 1.3).
-struct StrataVkEvent { std::chrono::steady_clock::time_point t; };
+// ---- events (Task 4.2: real GPU timestamps, with the host-clock arm as fallback) ----------------------
+// The runtime's gpu arm records a vkCmdWriteTimestamp node INTO the stream (no drain per record)
+// and elapsed() reads the driver's 64-bit ticks scaled by timestampPeriod: those are DEVICE
+// timestamps, what --stage-timing's per-stage tables and STRATA_COMMIT_TIMING ask for. When the
+// card (or STRATA_VK_NO_GPU_EVENTS=1) selects the host arm, record = a queue drain plus a
+// steady_clock stamp — an honest end-to-end interval, never a fake driver timestamp. The compat
+// surface below is identical either way; strata::vk::event_* decides per call.
+struct StrataVkEvent { };
 inline cudaError_t cudaEventCreate(cudaEvent_t* e) {
     if (!e) return cudaErrorInvalidValue;
-    *e = new StrataVkEvent{};
+    *e = strata::vk::event_create();
     return cudaSuccess;
 }
-inline cudaError_t cudaEventCreateWithFlags(cudaEvent_t* e, unsigned) { return cudaEventCreate(e); }
-inline cudaError_t cudaEventDestroy(cudaEvent_t e) { delete (StrataVkEvent*) e; return cudaSuccess; }
+inline cudaError_t cudaEventCreateWithFlags(cudaEvent_t* e, unsigned f) {
+    if (!e) return cudaErrorInvalidValue;
+    *e = strata::vk::event_create((f & cudaEventDisableTiming) == 0);
+    return cudaSuccess;
+}
+inline cudaError_t cudaEventDestroy(cudaEvent_t e) { strata::vk::event_destroy(e); return cudaSuccess; }
 inline cudaError_t cudaEventRecord(cudaEvent_t e, cudaStream_t s = nullptr) {
     if (!e) return cudaErrorInvalidValue;
     STRATA_VK_TRY
-    strata::vk::event_record(e, s);   // queue drain
-    ((StrataVkEvent*) e)->t = std::chrono::steady_clock::now();
+    strata::vk::event_record(e, s);
     return cudaSuccess;
     STRATA_VK_CATCH(cudaErrorUnknown)
 }
-inline cudaError_t cudaEventQuery(cudaEvent_t) { return cudaSuccess; }   // records are synchronous: done
-inline cudaError_t cudaEventSynchronize(cudaEvent_t) { return cudaSuccess; }
+inline cudaError_t cudaEventQuery(cudaEvent_t) { return cudaSuccess; }   // the fetch below waits, so: done
+inline cudaError_t cudaEventSynchronize(cudaEvent_t e) {
+    if (!e) return cudaErrorInvalidValue;
+    STRATA_VK_TRY
+    strata::vk::event_synchronize(e);   // gpu arm: submit/drain the CB carrying the stamp
+    return cudaSuccess;
+    STRATA_VK_CATCH(cudaErrorUnknown)
+}
 inline cudaError_t cudaEventElapsedTime(float* ms, cudaEvent_t from, cudaEvent_t to) {
     if (!ms || !from || !to) return cudaErrorInvalidValue;
-    *ms = std::chrono::duration<float, std::milli>(((StrataVkEvent*) to)->t - ((StrataVkEvent*) from)->t).count();
+    STRATA_VK_TRY
+    *ms = strata::vk::event_elapsed(from, to);
     return cudaSuccess;
+    STRATA_VK_CATCH(cudaErrorUnknown)
 }
 
 // ---- the graph family: Phase 4.2, recorded command buffers ---------------------------------------------

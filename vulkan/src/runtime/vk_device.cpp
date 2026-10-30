@@ -109,6 +109,12 @@ void init() {
     vkGetPhysicalDeviceQueueFamilyProperties(g_phys, &qn, qs.data());
     for (uint32_t i = 0; i < qn; i++) if (qs[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { g_queue_family = i; break; }
     g_vk_qf = g_queue_family;
+    // Task 4.2: the timestamp facts BEFORE the device exists — the feature means little if the
+    // chosen queue family's timestamps aren't valid (BC-250: the compute family reports
+    // timestampValidBits 64; the sparse family 0 — the per-family check is what separates a
+    // working query pool from one that returns garbage).
+    const uint32_t ts_bits = qs[g_queue_family].timestampValidBits;
+    const bool ts_feature = p.limits.timestampComputeAndGraphics != 0;
     float prio = 1.f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = g_queue_family; qci.queueCount = 1; qci.pQueuePriorities = &prio;
@@ -124,6 +130,10 @@ void init() {
     dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = 3; dci.ppEnabledExtensionNames = dext;
     dci.pNext = &idpf;
+    // Task 4.2: nothing to enable for timestamps — VkPhysicalDeviceLimits::
+    // timestampComputeAndGraphics is a fact, not a feature bit (Vulkan 1.0 core), and RADV
+    // writes CS timestamps for every submit. The per-family timestampValidBits check above
+    // is the whole gate.
     VKCK(vkCreateDevice(g_phys, &dci, nullptr, &g_device));
     vkGetDeviceQueue(g_device, g_queue_family, 0, &g_queue);
 
@@ -155,6 +165,11 @@ void init() {
     g_info.integer_dot_product = idp;
     g_info.subgroup_size_control = ssc;
     g_info.buffer_device_address = has("VK_EXT_buffer_device_address");
+    // Task 4.2: the timestamp facts (feature + this queue family's valid bits + the tick period).
+    // The FINAL word is the runtime's: vk_runtime's event layer proves vkCmdWriteTimestamp
+    // returns real ticks with its first event pair (vk_event_timing pins the same by execution).
+    g_info.gpu_timestamps = ts_feature && ts_bits >= 32;
+    g_info.timestamp_period_ns = p.limits.timestampPeriod;
     // ---- CU count (Task 1.3 step 5): VK_AMD_shader_core_properties through the properties2 chain —
     // queryable WITHOUT enabling the device extension (measured on this box: engines 2 x arrays/engine 2
     // x CUs/array 6 = 24). STRATA_VK_CU_OVERRIDE=N rewrites it for occupancy experiments (a BC-250 BIOS
