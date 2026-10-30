@@ -944,7 +944,7 @@ struct strata_context_impl {
             {"id",       model_name},
             {"object",   "model"},
             {"created",  std::time(0)},
-            {"owned_by", "unbiasedstrata"},
+            {"owned_by", "anystrata"},
             {"context_length",   n_ctx},
             {"input_modalities", modalities},
             {"meta", {
