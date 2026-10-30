@@ -27,7 +27,18 @@
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <io.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace {
 
@@ -65,6 +76,33 @@ void usage() {
         "      -- --model Qwen3.6-35B-A3B-UD-Q3_K_M.gguf --max-context 32768\n");
 }
 
+#ifdef _WIN32
+std::string self_dir() {
+    char buf[4096];
+    const DWORD n = ::GetModuleFileNameA(nullptr, buf, sizeof buf);
+    if (n == 0 || n >= sizeof buf) {
+        return ".";
+    }
+    std::string p(buf, n);
+    const size_t slash = p.find_last_of("\\/");
+    return slash == std::string::npos ? "." : p.substr(0, slash);
+}
+
+// no execute bit on Windows: existence is the check, and a bare name gets the .exe it is spelled without
+bool file_exists(const std::string & p) {
+    return ::_access(p.c_str(), 0) == 0;
+}
+
+std::string with_exe(const std::string & p) {
+    const size_t dot = p.find_last_of('.'), sep = p.find_last_of("\\/");
+    const bool has_ext = dot != std::string::npos && (sep == std::string::npos || dot > sep);
+    return has_ext || file_exists(p) ? p : p + ".exe";
+}
+
+bool is_bare_name(const std::string & p) {
+    return p.find_first_of("\\/") == std::string::npos;
+}
+#else
 std::string self_dir() {
     char buf[4096];
     const ssize_t n = ::readlink("/proc/self/exe", buf, sizeof buf - 1);
@@ -80,6 +118,15 @@ std::string self_dir() {
 bool file_exists(const std::string & p) {
     return ::access(p.c_str(), X_OK) == 0;
 }
+
+std::string with_exe(const std::string & p) {
+    return p;
+}
+
+bool is_bare_name(const std::string & p) {
+    return p.find('/') == std::string::npos;
+}
+#endif
 
 } // namespace
 
@@ -129,12 +176,13 @@ int main(int argc, char ** argv) {
         usage();
         return 2;
     }
-    if (engine_exe.find('/') == std::string::npos) {
-        const std::string beside = self_dir() + "/" + engine_exe;
+    if (is_bare_name(engine_exe)) {
+        const std::string beside = with_exe(self_dir() + "/" + engine_exe);
         if (file_exists(beside)) {
             engine_exe = beside;
         }
     }
+    engine_exe = with_exe(engine_exe);
     if (!file_exists(engine_exe)) {
         std::fprintf(stderr, "anystrata: engine not found or not executable: %s\n", engine_exe.c_str());
         return 2;
@@ -208,12 +256,23 @@ int main(int argc, char ** argv) {
     shutdown_handler = [&](int) {
         ctx_server.terminate();
     };
+#ifdef _WIN32
+    // llama-server's spelling: the console's Ctrl+C / Ctrl+Break / close arrive on a handler thread
+    SetConsoleCtrlHandler([](DWORD ctrl_type) -> BOOL {
+        if (ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT || ctrl_type == CTRL_CLOSE_EVENT) {
+            signal_handler(SIGINT);
+            return TRUE;
+        }
+        return FALSE;
+    }, TRUE);
+#else
     struct sigaction sigint_action;
     sigint_action.sa_handler = signal_handler;
     sigemptyset(&sigint_action.sa_mask);
     sigint_action.sa_flags = 0;
     sigaction(SIGINT,  &sigint_action, NULL);
     sigaction(SIGTERM, &sigint_action, NULL);
+#endif
 
     // the engine's exit ends this process too, with a non-zero code, so a unit with Restart=on-failure brings both
     // back. A replacement engine is not forked from this multithreaded process (UnbiasedStrata 1 main.cpp:873).

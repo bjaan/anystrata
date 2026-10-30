@@ -13,6 +13,7 @@
 #include "strata/vulkan_runtime.hpp"
 #include "strata/vulkan_compat/strata_vk.h"
 
+#include <bit>
 #include <cstdint>
 #include <stdexcept>
 
@@ -68,7 +69,7 @@ void conv4_silu(const float* x, float* state, const float* w, float* out, int ch
     // snapshots; Task 2.19, same fix as gdn_step's state-snap arm).
     const uint64_t conv_state = (uint64_t)channels * 3 * 4;
     const uint64_t snap_span = (snap && stride && snaps)
-        ? ((uint64_t)__builtin_popcount(snaps) - 1u) * (uint64_t)stride * 4 + conv_state
+        ? ((uint64_t)std::popcount((uint32_t)snaps) - 1u) * (uint64_t)stride * 4 + conv_state
         : ospan;
     const uint64_t bufs[5] = {xo, so, wo, oo, no};
     const uint64_t sizes[5] = {xspan, (uint64_t)channels * 3 * 4, (uint64_t)channels * 4 * 4,

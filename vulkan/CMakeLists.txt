@@ -32,6 +32,8 @@ endif()
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
 
 find_package(Vulkan REQUIRED)
+# a bare `python3` on Windows is the Microsoft Store alias, not an interpreter
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 # Front-end selection: the kernels' .comp files compile to .spv next to the build tree and are embedded into
 # strata_vk_kernels as a byte array by vulkan/tools/embed_spv.py (no downloads). We prefer a VENDORED glslang
@@ -54,6 +56,13 @@ else()
   message(FATAL_ERROR "neither a vendored glslangValidator nor glslc (spirv-tools package) found; the .comp kernels cannot be built")
 endif()
 set(VK_GLSLC ${CMAKE_CURRENT_SOURCE_DIR}/tools/vk-glslc.sh)
+# Windows cannot exec a .sh; in glslc mode the shim is a pass-through, so call glslc itself
+if(WIN32)
+  if(NOT GLSLC_MODE STREQUAL "glslc")
+    message(FATAL_ERROR "on Windows the .comp kernels need glslc (Vulkan SDK); the glslangValidator shim is POSIX-only")
+  endif()
+  set(VK_GLSLC ${GLSLC_TOOL})
+endif()
 
 # ---- the runtime: device, arena, queue, buffers, the compat headers the ../src host files compile against
 add_library(strata_vk_runtime STATIC
@@ -84,7 +93,7 @@ foreach(_ta 0 1)
       COMMENT "vk-glslc mm_gemm.comp TRANS_A=${_ta} F16AB=${_f16}")
     set(_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/mm_gemm_t${_ta}f${_f16}.spv.h)
     add_custom_command(OUTPUT ${_inc}
-      COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} mm_gemm_t${_ta}f${_f16}
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} mm_gemm_t${_ta}f${_f16}
       DEPENDS ${_spv})
     list(APPEND _mm_spvs ${_inc})
   endforeach()
@@ -124,7 +133,7 @@ function(strata_vk_kernel name)
     COMMENT "vk-glslc(${GLSLC_MODE}) ${name}.comp")
   set(inc ${CMAKE_CURRENT_BINARY_DIR}/spv/${name}.spv.h)
   add_custom_command(OUTPUT ${inc}
-    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${spv} ${inc} ${name}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${spv} ${inc} ${name}
     DEPENDS ${spv}
     COMMENT "embed ${name}.spv")
   add_library(strata_vk_kernel_${name} STATIC ${_launcher} ${inc})
@@ -150,7 +159,7 @@ foreach(_n 128 256 512 1024)
     COMMENT "vk-glslc rms_norm.comp RMS_THREADS=${_n}")
   set(_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/rms_norm_${_n}.spv.h)
   add_custom_command(OUTPUT ${_inc}
-    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} rms_norm_${_n}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} rms_norm_${_n}
     DEPENDS ${_spv})
   list(APPEND _rms_spvs ${_inc})
 endforeach()
@@ -171,7 +180,7 @@ foreach(_n 32 128 256 512 1024)
     COMMENT "vk-glslc gemv.comp GEMV_THREADS=${_n}")
   set(_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/gemv_${_n}.spv.h)
   add_custom_command(OUTPUT ${_inc}
-    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} gemv_${_n}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} gemv_${_n}
     DEPENDS ${_spv})
   list(APPEND _gemv_spvs ${_inc})
 endforeach()
@@ -192,7 +201,7 @@ foreach(_n 32 128 256 512 1024)
     COMMENT "vk-glslc gemv_bf16.comp GEMV_THREADS=${_n}")
   set(_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/gemv_bf16_${_n}.spv.h)
   add_custom_command(OUTPUT ${_inc}
-    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} gemv_bf16_${_n}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} gemv_bf16_${_n}
     DEPENDS ${_spv})
   list(APPEND _gemv_bf16_spvs ${_inc})
 endforeach()
@@ -218,7 +227,7 @@ foreach(_v walk rows)
     COMMENT "vk-glslc conv4_silu.comp CONV_VARIANT=${_cv}")
   set(_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/conv4_${_v}.spv.h)
   add_custom_command(OUTPUT ${_inc}
-    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} conv4_${_v}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} conv4_${_v}
     DEPENDS ${_spv})
   list(APPEND _conv_spvs ${_inc})
 endforeach()
@@ -231,7 +240,7 @@ add_custom_command(OUTPUT ${_conv_state_spv}
   COMMENT "vk-glslc conv4_state.comp")
 set(_conv_state_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/conv4_state.spv.h)
 add_custom_command(OUTPUT ${_conv_state_inc}
-  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_conv_state_spv} ${_conv_state_inc} conv4_state
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_conv_state_spv} ${_conv_state_inc} conv4_state
   DEPENDS ${_conv_state_spv})
 add_library(strata_vk_kernel_conv4_silu STATIC src/poly/kernels/conv4_silu_vk.cpp ${_conv_spvs} ${_conv_state_inc})
 target_include_directories(strata_vk_kernel_conv4_silu PUBLIC ${STRATA_ROOT}/include ${STRATA_ROOT}/src/poly ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/spv)
@@ -259,7 +268,7 @@ foreach(_v axpy swiglu swiglu_rows mul_sigmoid)   # Task 2.8: swiglu_rows = EW_V
     COMMENT "vk-glslc elementwise.comp EW_VARIANT=${_ev}")
   set(_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/elementwise_${_v}.spv.h)
   add_custom_command(OUTPUT ${_inc}
-    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} elementwise_${_v}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} elementwise_${_v}
     DEPENDS ${_spv})
   list(APPEND _ew_spvs ${_inc})
 endforeach()
@@ -280,7 +289,7 @@ foreach(_n 128 256)
     COMMENT "vk-glslc head_norm_rope.comp HNR_THREADS=${_n}")
   set(_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/head_norm_rope_${_n}.spv.h)
   add_custom_command(OUTPUT ${_inc}
-    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} head_norm_rope_${_n}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} head_norm_rope_${_n}
     DEPENDS ${_spv})
   list(APPEND _hnr_spvs ${_inc})
 endforeach()
@@ -329,7 +338,7 @@ add_custom_command(OUTPUT ${_spv}
   COMMENT "vk-glslc attend_softmax.comp")
 set(_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/attend_softmax.spv.h)
 add_custom_command(OUTPUT ${_inc}
-  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} attend_softmax
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} attend_softmax
   DEPENDS ${_spv})
 list(APPEND _att_spvs ${_inc})
 # the four reg<> score variants the CUDA chain instantiates (kernels.cu:2488-2499)
@@ -346,7 +355,7 @@ foreach(_ns 4_1 8_2 4_2 4_4)
     COMMENT "vk-glslc attend_score.comp ATT_N=${_n} ATT_STEPS=${_st}")
   set(_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/attend_score_${_ns}.spv.h)
   add_custom_command(OUTPUT ${_inc}
-    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} attend_score_${_ns}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} attend_score_${_ns}
     DEPENDS ${_spv})
   list(APPEND _att_spvs ${_inc})
   # the fused q8 score arm of the SAME variant (the kvq8 decode read; law 11's unlock)
@@ -359,7 +368,7 @@ foreach(_ns 4_1 8_2 4_2 4_4)
     COMMENT "vk-glslc attend_score.comp ATT_N=${_n} ATT_STEPS=${_st} Q8")
   set(_incq ${CMAKE_CURRENT_BINARY_DIR}/spv/attend_score_${_ns}_q8.spv.h)
   add_custom_command(OUTPUT ${_incq}
-    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spvq} ${_incq} attend_score_${_ns}_q8
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spvq} ${_incq} attend_score_${_ns}_q8
     DEPENDS ${_spvq})
   list(APPEND _att_spvs ${_incq})
 endforeach()
@@ -380,7 +389,7 @@ foreach(_n t1 t2 plain)
     COMMENT "vk-glslc attend_value.comp ATT_VARIANT=${_var}")
   set(_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/attend_value_${_n}.spv.h)
   add_custom_command(OUTPUT ${_inc}
-    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} attend_value_${_n}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} attend_value_${_n}
     DEPENDS ${_spv})
   list(APPEND _att_spvs ${_inc})
   set(_spvq ${CMAKE_CURRENT_BINARY_DIR}/spv/attend_value_${_n}_q8.spv)
@@ -392,7 +401,7 @@ foreach(_n t1 t2 plain)
     COMMENT "vk-glslc attend_value.comp ATT_VARIANT=${_var} Q8")
   set(_incq ${CMAKE_CURRENT_BINARY_DIR}/spv/attend_value_${_n}_q8.spv.h)
   add_custom_command(OUTPUT ${_incq}
-    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spvq} ${_incq} attend_value_${_n}_q8
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spvq} ${_incq} attend_value_${_n}_q8
     DEPENDS ${_spvq})
   list(APPEND _att_spvs ${_incq})
 endforeach()
@@ -432,7 +441,7 @@ foreach(_n group group_ungroup softmax scale dequant)
     COMMENT "vk-glslc ${_comp} -> attend_batch_${_n}")
   set(_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/attend_batch_${_n}.spv.h)
   add_custom_command(OUTPUT ${_inc}
-    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} attend_batch_${_n}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} attend_batch_${_n}
     DEPENDS ${_spv})
   list(APPEND _ab_spvs ${_inc})
 endforeach()
@@ -454,7 +463,7 @@ add_custom_command(OUTPUT ${_q5k_spv}
   COMMENT "vk-glslc(${GLSLC_MODE}) mmvq_q5_k.comp")
 set(_q5k_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/mmvq_q5_k.spv.h)
 add_custom_command(OUTPUT ${_q5k_inc}
-  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_q5k_spv} ${_q5k_inc} mmvq_q5_k
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_q5k_spv} ${_q5k_inc} mmvq_q5_k
   DEPENDS ${_q5k_spv})
 add_custom_target(mmvq_q5_k.spv_h DEPENDS ${_q5k_inc})
 # Task 2.6: the Q6_K (type 14) variant, same pattern (mmvq_q6_k.comp -> its own embedded .spv.h).
@@ -466,7 +475,7 @@ add_custom_command(OUTPUT ${_q6k_spv}
   COMMENT "vk-glslc(${GLSLC_MODE}) mmvq_q6_k.comp")
 set(_q6k_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/mmvq_q6_k.spv.h)
 add_custom_command(OUTPUT ${_q6k_inc}
-  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_q6k_spv} ${_q6k_inc} mmvq_q6_k
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_q6k_spv} ${_q6k_inc} mmvq_q6_k
   DEPENDS ${_q6k_spv})
 add_custom_target(mmvq_q6_k.spv_h DEPENDS ${_q6k_inc})
 # Task 2.8: native_mmvq_slots for types 16/13/14 — one slots .comp per format (24-25 storage
@@ -481,7 +490,7 @@ foreach(_s ${_slots_names})
     COMMENT "vk-glslc(${GLSLC_MODE}) ${_s}.comp")
   set(_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/${_s}.spv.h)
   add_custom_command(OUTPUT ${_inc}
-    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} ${_s}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} ${_s}
     DEPENDS ${_spv})
   add_custom_target(${_s}.spv_h DEPENDS ${_inc})
 endforeach()
@@ -495,7 +504,7 @@ add_custom_command(OUTPUT ${_iq3xxs_spv}
   COMMENT "vk-glslc(${GLSLC_MODE}) mmvq_iq3_xxs.comp")
 set(_iq3xxs_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/mmvq_iq3_xxs.spv.h)
 add_custom_command(OUTPUT ${_iq3xxs_inc}
-  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_iq3xxs_spv} ${_iq3xxs_inc} mmvq_iq3_xxs
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_iq3xxs_spv} ${_iq3xxs_inc} mmvq_iq3_xxs
   DEPENDS ${_iq3xxs_spv})
 add_custom_target(mmvq_iq3_xxs.spv_h DEPENDS ${_iq3xxs_inc})
 # Task 2.12: the IQ4_XS (type 23) variant, same pattern (mmvq_iq4_xs.comp -> its own embedded
@@ -508,7 +517,7 @@ add_custom_command(OUTPUT ${_iq4xs_spv}
   COMMENT "vk-glslc(${GLSLC_MODE}) mmvq_iq4_xs.comp")
 set(_iq4xs_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/mmvq_iq4_xs.spv.h)
 add_custom_command(OUTPUT ${_iq4xs_inc}
-  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_iq4xs_spv} ${_iq4xs_inc} mmvq_iq4_xs
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_iq4xs_spv} ${_iq4xs_inc} mmvq_iq4_xs
   DEPENDS ${_iq4xs_spv})
 add_custom_target(mmvq_iq4_xs.spv_h DEPENDS ${_iq4xs_inc})
 # Task 2.13: the Q8_0 (type 8) variant, same pattern (mmvq_q8_0.comp -> its own embedded .spv.h;
@@ -521,7 +530,7 @@ add_custom_command(OUTPUT ${_q80_spv}
   COMMENT "vk-glslc(${GLSLC_MODE}) mmvq_q8_0.comp")
 set(_q80_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/mmvq_q8_0.spv.h)
 add_custom_command(OUTPUT ${_q80_inc}
-  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_q80_spv} ${_q80_inc} mmvq_q8_0
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_q80_spv} ${_q80_inc} mmvq_q8_0
   DEPENDS ${_q80_spv})
 add_custom_target(mmvq_q8_0.spv_h DEPENDS ${_q80_inc})
 # Task 2.14: the IQ2_S (type 22) variant, same pattern (mmvq_iq2_s.comp -> its own embedded
@@ -534,7 +543,7 @@ add_custom_command(OUTPUT ${_iq2s_spv}
   COMMENT "vk-glslc(${GLSLC_MODE}) mmvq_iq2_s.comp")
 set(_iq2s_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/mmvq_iq2_s.spv.h)
 add_custom_command(OUTPUT ${_iq2s_inc}
-  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_iq2s_spv} ${_iq2s_inc} mmvq_iq2_s
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_iq2s_spv} ${_iq2s_inc} mmvq_iq2_s
   DEPENDS ${_iq2s_spv})
 add_custom_target(mmvq_iq2_s.spv_h DEPENDS ${_iq2s_inc})
 # Task 2.15: the Q4_K (type 12) variant, same pattern (mmvq_q4_k.comp -> its own embedded .spv.h).
@@ -546,7 +555,7 @@ add_custom_command(OUTPUT ${_q4k_spv}
   COMMENT "vk-glslc(${GLSLC_MODE}) mmvq_q4_k.comp")
 set(_q4k_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/mmvq_q4_k.spv.h)
 add_custom_command(OUTPUT ${_q4k_inc}
-  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_q4k_spv} ${_q4k_inc} mmvq_q4_k
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_q4k_spv} ${_q4k_inc} mmvq_q4_k
   DEPENDS ${_q4k_spv})
 add_custom_target(mmvq_q4_k.spv_h DEPENDS ${_q4k_inc})
 # Task 2.17: the Q2_K (type 10) variant, same pattern (mmvq_q2_k.comp -> its own embedded .spv.h).
@@ -558,7 +567,7 @@ add_custom_command(OUTPUT ${_q2k_spv}
   COMMENT "vk-glslc(${GLSLC_MODE}) mmvq_q2_k.comp")
 set(_q2k_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/mmvq_q2_k.spv.h)
 add_custom_command(OUTPUT ${_q2k_inc}
-  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_q2k_spv} ${_q2k_inc} mmvq_q2_k
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_q2k_spv} ${_q2k_inc} mmvq_q2_k
   DEPENDS ${_q2k_spv} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py)
 add_custom_target(mmvq_q2_k.spv_h DEPENDS ${_q2k_inc})
 # Task 2.18: the Q3_K (type 11) variant, same pattern (mmvq_q3_k.comp -> its own embedded .spv.h).
@@ -570,7 +579,7 @@ add_custom_command(OUTPUT ${_q3k_spv}
   COMMENT "vk-glslc(${GLSLC_MODE}) mmvq_q3_k.comp")
 set(_q3k_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/mmvq_q3_k.spv.h)
 add_custom_command(OUTPUT ${_q3k_inc}
-  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_q3k_spv} ${_q3k_inc} mmvq_q3_k
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_q3k_spv} ${_q3k_inc} mmvq_q3_k
   DEPENDS ${_q3k_spv} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py)
 add_custom_target(mmvq_q3_k.spv_h DEPENDS ${_q3k_inc})
 # Hybrid bring-up: the Q2_0 (type 42) variant, same pattern (mmvq_q2_0.comp -> its own embedded
@@ -583,7 +592,7 @@ add_custom_command(OUTPUT ${_q20_spv}
   COMMENT "vk-glslc(${GLSLC_MODE}) mmvq_q2_0.comp")
 set(_q20_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/mmvq_q2_0.spv.h)
 add_custom_command(OUTPUT ${_q20_inc}
-  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_q20_spv} ${_q20_inc} mmvq_q2_0
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_q20_spv} ${_q20_inc} mmvq_q2_0
   DEPENDS ${_q20_spv} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py)
 add_custom_target(mmvq_q2_0.spv_h DEPENDS ${_q20_inc})
 add_dependencies(strata_vk_kernel_native_mmvq mmvq_q5_k.spv_h mmvq_q6_k.spv_h mmvq_iq3_xxs.spv_h mmvq_iq4_xs.spv_h mmvq_q8_0.spv_h mmvq_iq2_s.spv_h mmvq_q4_k.spv_h mmvq_q2_k.spv_h mmvq_q3_k.spv_h mmvq_q2_0.spv_h mmvq_slots_iq2_xxs.spv_h mmvq_slots_q5_k.spv_h mmvq_slots_q6_k.spv_h mmvq_slots_q2_0.spv_h)
@@ -603,7 +612,7 @@ macro(_gdn_variant comp out_name)   # ARGN = extra glslc -D flags
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/kernels/${comp} ${VK_GLSLC})
   set(_inc ${CMAKE_CURRENT_BINARY_DIR}/spv/${out_name}.spv.h)
   add_custom_command(OUTPUT ${_inc}
-    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} ${out_name}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_spv} ${_inc} ${out_name}
     DEPENDS ${_spv})
   list(APPEND _gdn_spvs ${_inc})
 endmacro()
@@ -652,10 +661,10 @@ add_custom_command(OUTPUT ${_probe_sg_spv}
   COMMAND ${SPIRV_VAL} --target-env vulkan1.2 ${_probe_sg_spv}
   DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/probe/kernels/probe_subgroup.spvasm)
 add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_dot.spv.h
-  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_probe_dot_spv} ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_dot.spv.h probe_dot
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_probe_dot_spv} ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_dot.spv.h probe_dot
   DEPENDS ${_probe_dot_spv})
 add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_subgroup.spv.h
-  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_probe_sg_spv} ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_subgroup.spv.h probe_subgroup
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_probe_sg_spv} ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_subgroup.spv.h probe_subgroup
   DEPENDS ${_probe_sg_spv})
 set(_probe_wg_spv   ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_wg64k.spv)
 set(_probe_span_spv ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_spans.spv)
@@ -668,10 +677,10 @@ add_custom_command(OUTPUT ${_probe_span_spv}
   COMMAND ${SPIRV_VAL} --target-env vulkan1.2 ${_probe_span_spv}
   DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/probe/kernels/probe_spans.spvasm)
 add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_wg64k.spv.h
-  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_probe_wg_spv} ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_wg64k.spv.h probe_wg64k
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_probe_wg_spv} ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_wg64k.spv.h probe_wg64k
   DEPENDS ${_probe_wg_spv})
 add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_spans.spv.h
-  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_probe_span_spv} ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_spans.spv.h probe_spans
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_probe_span_spv} ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_spans.spv.h probe_spans
   DEPENDS ${_probe_span_spv})
 add_executable(vk_device_probe src/probe/device_probe.cpp
   ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_dot.spv.h ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_subgroup.spv.h
@@ -693,7 +702,7 @@ add_custom_command(OUTPUT ${_probe_db_spv}
   DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/probe/kernels/probe_doorbell.comp ${VK_GLSLC}
   COMMENT "vk-glslc(${GLSLC_MODE}) probe_doorbell.comp")
 add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_doorbell.spv.h
-  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_probe_db_spv} ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_doorbell.spv.h probe_doorbell
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py ${_probe_db_spv} ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_doorbell.spv.h probe_doorbell
   DEPENDS ${_probe_db_spv})
 add_executable(vk_doorbell_probe src/probe/doorbell_probe.cpp ${CMAKE_CURRENT_BINARY_DIR}/spv/probe_doorbell.spv.h)
 target_include_directories(vk_doorbell_probe PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/spv)

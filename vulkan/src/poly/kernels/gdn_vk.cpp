@@ -18,6 +18,7 @@
 #include "strata/vulkan_runtime.hpp"
 #include "strata/vulkan_compat/strata_vk.h"
 
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -142,7 +143,7 @@ void gdn_step(float* qkv, float* alpha, float* beta, const float* dt, const floa
         // model reached snapshot speculation).
         const size_t snap_layer = (uint64_t)n_head * dim * dim;
         const size_t snap_extent = (snap && stride && snaps)
-                                       ? ((size_t)__builtin_popcount(snaps) - 1u) * stride + snap_layer
+                                       ? ((size_t)std::popcount((uint32_t)snaps) - 1u) * stride + snap_layer
                                        : (size_t)0;
         const uint64_t sizes[6] = {row_n * (size_t)rows * 4, gates * 4, gates * 4,
                                    snap_layer * 4, (uint64_t)rows * d_inner * 4,

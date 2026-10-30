@@ -15,6 +15,12 @@
 #include <cstring>
 #include <stdexcept>
 #include <vector>
+#ifdef _WIN32
+static int setenv(const char* n, const char* v, int overwrite) {
+    if (!overwrite && std::getenv(n)) return 0;
+    return _putenv_s(n, v);
+}
+#endif
 
 #include "probe_dot.spv.h"
 #include "probe_subgroup.spv.h"

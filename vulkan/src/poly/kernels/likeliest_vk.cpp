@@ -14,6 +14,7 @@
 #include "strata/vulkan_compat/strata_vk.h"
 
 #include <cstdint>
+#include <limits>
 
 namespace strata::poly {
 namespace {
@@ -27,7 +28,7 @@ const vk::Kernel& pl_likeliest() {
 }  // namespace
 
 void likeliest(const float* logits, int n, Likeliest* out, void* stream) {
-    if (n <= 0) { out->token = 0; out->prob = 1.0f / 0.0f; return; }
+    if (n <= 0) { out->token = 0; out->prob = std::numeric_limits<float>::infinity(); return; }
     static uint64_t scratch = 0;
     if (!scratch) scratch = vk::Arena::instance().alloc(8);
     const uint64_t bufs[2] = {strata_vk_compat::off(logits), scratch};

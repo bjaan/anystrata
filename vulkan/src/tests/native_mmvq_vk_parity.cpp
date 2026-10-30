@@ -31,6 +31,7 @@
 #include "iq3xxs_grid_vk.h"
 #include "iq2s_grid_vk.h"
 
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -85,7 +86,7 @@ uint32_t vsub4(uint32_t a, uint32_t b) {
     return r;
 }
 int dp4a(uint32_t x, uint32_t y, int acc) { for (int i = 0; i < 4; ++i) acc += sbyte(x, i) * sbyte(y, i); return acc; }
-uint32_t unpack_ksigns(uint32_t v) { return (v ^ ((uint32_t(__builtin_popcount(v)) & 1u) << 7u)) * 0x01010101u; }
+uint32_t unpack_ksigns(uint32_t v) { return (v ^ ((uint32_t(std::popcount(v)) & 1u) << 7u)) * 0x01010101u; }
 
 // vec_dot_iq2_xxs_q8_1(bq2, bq8_1[iqs/2], iqs) transcribed; q8 points at the block's byte 0
 // (word 0 = ds, bytes 4..35 = qs).

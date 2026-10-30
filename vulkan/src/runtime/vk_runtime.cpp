@@ -20,7 +20,18 @@
 #include <algorithm>
 #include <chrono>
 #include <thread>
+#ifdef _WIN32
+// execinfo's two calls over kernel32's walker; addresses only (the PDB resolves them), declared here so
+// <windows.h>'s macros stay out of this file
+extern "C" __declspec(dllimport) unsigned short __stdcall RtlCaptureStackBackTrace(
+    unsigned long skip, unsigned long count, void** frames, unsigned long* hash);
+static int backtrace(void** bt, int n) { return RtlCaptureStackBackTrace(1, (unsigned long)n, bt, nullptr); }
+static void backtrace_symbols_fd(void* const* bt, int n, int) {
+    for (int i = 0; i < n; ++i) std::fprintf(stderr, "  #%d %p\n", i, bt[i]);
+}
+#else
 #include <execinfo.h>
+#endif
 #include <map>
 #include <atomic>
 #include <mutex>
@@ -1005,7 +1016,7 @@ bool interferes(const uint64_t* buffers, const uint64_t* sizes, uint32_t rw_mask
     // must NOT barrier, or the elision buys nothing on the mmvq fan-out path.
     for (const ClusterSpan& c : g_cluster)
         for (int i = 0; i < n_buffers; ++i) {
-            const ClusterSpan s{buffers[i], sizes[i], (rw_mask >> i) & 1u};
+            const ClusterSpan s{buffers[i], sizes[i], ((rw_mask >> i) & 1u) != 0};
             if (!c.wr && !s.wr) continue;
             if (spans_overlap(c, s)) return true;
         }
@@ -1013,7 +1024,7 @@ bool interferes(const uint64_t* buffers, const uint64_t* sizes, uint32_t rw_mask
 }
 void cluster_add(const uint64_t* buffers, const uint64_t* sizes, uint32_t rw_mask, int n_buffers) {
     for (int i = 0; i < n_buffers; ++i)
-        g_cluster.push_back(ClusterSpan{buffers[i], sizes[i], (rw_mask >> i) & 1u});
+        g_cluster.push_back(ClusterSpan{buffers[i], sizes[i], ((rw_mask >> i) & 1u) != 0});
 }
 void emit_full_barrier(VkCommandBuffer cb) {
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};

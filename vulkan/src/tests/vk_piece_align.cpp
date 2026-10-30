@@ -27,6 +27,12 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+static int setenv(const char* n, const char* v, int overwrite) {
+    if (!overwrite && std::getenv(n)) return 0;
+    return _putenv_s(n, v);
+}
+#endif
 
 using namespace strata;
 
