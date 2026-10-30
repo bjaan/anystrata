@@ -289,9 +289,10 @@ toward while keeping Strata's expert-cache design, which is what lets a 12 GB mo
 ## Known limits
 
 Read [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) and the backend pages before filing anything. The Vulkan
-port's open items are enumerated in `vulkan/PORT-STATUS.md`: captured graphs are pending Phase 4.2 (run
-`--no-graphs`), prefill tiles are under tuning, the q8_0 KV read on the decode path is still a named trap
-(the prompt path is wired), and every unported format or path traps by name — loudly, never silently.
+port's open items are enumerated in `vulkan/PORT-STATUS.md`: captured graphs are the verified default (Phase 4.2
+green and bitwise-inert; `--no-graphs` remains as the A/B toggle and is the recommendation in the expert-SWAP
+regime, where an open capture-vs-swap bug is recorded), prefill tiles are under tuning, and every unported
+format or path traps by name — loudly, never silently.
 pi's compaction defaults assume >64K windows; serve more context or lower them (USTRAT-8).
 On this APU, llama.cpp reference runs must obey `vulkan/PORT-NOTES.md` rule 10 (their loader copies the
 whole GGUF into pinned anon RAM on an iGPU and the OOM killer then takes the desktop): one load at a

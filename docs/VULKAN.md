@@ -8,9 +8,9 @@ Why Vulkan and not ROCm/HIP on this card: ROCm's userspace (rocBLAS/Tensile) shi
 HIP runtime does not target it, while the Mesa **RADV** driver is first-class (Vulkan 1.4). llama.cpp's own
 Vulkan backend is what people run models on this board with; this page is about running *Strata's* engine there.
 
-## Status (first increment)
+## Status (first increment, 2026-10-21 — the ground it was built on)
 
-`vulkan/` builds, runs, and passes its tests on real BC-250 hardware (2026-10-21, Mesa RADV, kernel 7.2.11):
+`vulkan/` builds, runs, and passes its tests on real BC-250 hardware (Mesa RADV, kernel 7.2.11):
 
 ```
 cmake -S vulkan -B build-vulkan && cmake --build build-vulkan && ctest --test-dir build-vulkan
@@ -44,18 +44,17 @@ weights leave room for a KV cache of about a gigabyte and a half beyond the expe
 | --- | --- | --- | --- |
 | 16,384 | 0.65 GiB | ~14.1 GB | proven: every long gate, pi round trips |
 | 32,768 | 1.28 GiB | ~13.9 GB | proven stable (32768 gate 2026-10-27) |
-| 65,536 | 2.56 GiB fp16 / 1.28 GiB `--kv q8_0` | — | needs the q8_0 KV cache (in progress: `store_q8` parity-green, `attend_batch` arm wired, the decode read still traps by name) |
+| 65,536 | 2.56 GiB fp16 / 1.28 GiB `--kv q8_0` | ~13.8 GB | **proven: `--max-context 65536 --kv q8_0` serves on this card** (law 11's unlock, 2026-10-28: store, prefill-read and fused decode-read all ported and parity-tested; the q8_0 arm costs ~1.82x the llama.cpp KL floor — the storage trade, documented) |
 | 131,072 | 5.1 GiB fp16 | — | not this card; the pod machines' territory |
 
 The q8_0 cache stores K and V rows as int8 codes with one fp16 scale per 32 values (544 bytes a
 row where fp16 costs 1,024): the engine's `--kv q8_0` switch, the same arm CUDA's correctness
-harness scores as `kvq8`. Until the port's kernels all land it traps **by name** — the engine
-refuses loudly rather than answering with a wrong kernel. See `vulkan/PORT-STATUS.md`
+harness scores as `kvq8`. See `vulkan/PORT-STATUS.md`
 ("q8_0 KV cache") and the driver rules in `vulkan/PORT-NOTES.md` 10-11.
 
 ## What the backend provides
 
-`src/runtime/vk_device.cpp` / `vk_runtime.cpp` + `include/strata/vulkan_runtime.hpp`:
+`vulkan/src/runtime/vk_device.cpp` / `vk_runtime.cpp` + `vulkan/include/strata/vulkan_runtime.hpp`:
 
 * **Device selection with a named reason**: a card without `VK_KHR_shader_integer_dot_product` or
   `VK_EXT_subgroup_size_control` (or that cannot run a 32-wide subgroup) fails at start instead of producing
@@ -68,7 +67,7 @@ refuses loudly rather than answering with a wrong kernel. See `vulkan/PORT-STATU
 * **Streams/events/copies**: a single-queue first cut (the BC-250 has one GPU): `cudaStream_t` -> the default
   queue, copies staged in chunks, host-visible coherent memory (it is an APU — `uma=1`, no PCIe tier).
 * **Kernel registry**: `kernel_load(name, spv, buffers, pushbytes, workgroup, force_subgroup32)` +
-  `kernel_launch_sized(...)`; `.comp` -> `glslc` -> embedded `uint32_t[]` (`tools/embed_spv.py`), no run-time
+  `kernel_launch_sized(...)`; `.comp` -> `glslc` -> embedded `uint32_t[]` (`vulkan/tools/embed_spv.py`), no run-time
   file access, matching the fork's no-downloads rule.
 
 ## The port plan for the rest of the engine
@@ -107,12 +106,27 @@ Measured baseline while the engine port proceeds — llama.cpp's **Vulkan** back
 UD-IQ2_XXS `-ngl 99`: prefill 383-375 tok/s (512/2048), decode 76 tok/s, `fp16: 1, uma: 1, warp 32,
 shared 64K`. Strata's engine on top of this backend is what turns that into expert-offload speeds.
 
-## Known limits of the first cut
+## Status now (what has landed since the first increment)
 
-* One queue, synchronous submit (launch = record + submit + wait): correct, not fast; streams/pipelining are
-  the next increment, and the parity harness tolerates it because it checks results, not throughput.
-* Events time 0 (host-clock probes are a TODO); the engine uses them only for PCIe probes, which a UMA APU
-  does not need.
-* `device_count()` returns 1; multi-GPU/VMM are not ported.
-* No model runs end-to-end on this backend yet — the S2 GEMV, probe, and arena/copy layer are increment 1 of
-  the plan above.
+The engine runs models end-to-end on this backend — Qwen3.6-35B-A3B (qwen35moe) at 16K/32K/64K-q8
+serve configs, all experts resident — with captured graphs the default (Phase 4.2, bitwise-inert),
+deferred-submit batching (Phase 4.1), the q8_0 KV chain ported, and the teacher-forced correctness
+gate scored at 1.39x llama.cpp's own floor (Phase 5). The full ledger is `../vulkan/PORT-STATUS.md`
+(repo path `vulkan/PORT-STATUS.md`); the driver laws that cost a session each are in
+`vulkan/PORT-NOTES.md`.
+
+## Known limits (current)
+
+* One queue still (the BC-250 has one GPU): copies and syncs stay EAGER (the staging-hazard law),
+  launches batch into pending CBs and replays; streams/pipelining beyond that are not on the table
+  for a single-queue APU.
+* Events carry REAL GPU timestamps (Task 4.2, 2026-10-30): a `vkCmdWriteTimestamp` node rides the
+  stream, `cudaEventElapsedTime` returns driver ticks scaled by `timestampPeriod` (radv BC-250:
+  10 ns/tick, 64 valid bits on the compute family); the host-clock arm stays as the fallback for
+  cards without the capability, and `STRATA_VK_NO_GPU_EVENTS=1` forces it for A/B. Both arms are
+  pinned by the `vk_event_timing` ctest pair. PORT-NOTES law 15.
+* An open deterministic bug: captured graphs + the expert-SWAP regime + the prompt-tail lookup
+  guesser collapse generation to id-0s (narrowed and worked around in `vulkan/PORT-STATUS.md`:
+  run the swap regime `--no-graphs`; full residency — every config this box serves — is clean).
+* `device_count()` returns 1; multi-GPU/VMM are not ported. The pack engine (`anystrata-pack`,
+  qwen4exp) and the dsv41 engine are not ported; every unported path traps BY NAME.
