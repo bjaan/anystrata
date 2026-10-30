@@ -14,7 +14,7 @@ set -e
 HERE=$(dirname "$0")
 REPO=$(cd "$HERE/../.." && pwd)
 MODEL=${SWIFT27_GGUF:-$HOME/models/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ2_XS.gguf}
-LLAMA=${LLAMA_VK_BIN:-~llama-vk/bin/llama-server}
+LLAMA=${LLAMA_VK_BIN:-$HOME/llama-vk/bin/llama-server}
 [ -f "$MODEL" ] || { echo "no model at $MODEL (set SWIFT27_GGUF)"; exit 1; }
 [ -x "$LLAMA" ] || { echo "no llama-server at $LLAMA (set LLAMA_VK_BIN; build: cmake -DGGML_VULKAN=ON on third_party/llama.cpp)"; exit 1; }
 exec "$LLAMA" \

@@ -4,15 +4,17 @@
 # (the /tmp/qids.txt gate is gone from /tmp; re-tokenized from the same ChatML shape on the
 # hybrid file's tokenizer).
 set -u
-M=~models/Qwen3.6-35B-A3B-GSQ-hybrid-GGUF/Qwen3.6-35B-A3B-GSQ-hybrid.gguf
+HERE=$(cd "$(dirname "$0")" && pwd)           # tools/vulkan
+REPO=$(cd "$HERE/../.." && pwd)               # the repo root
+M=$HOME/models/Qwen3.6-35B-A3B-GSQ-hybrid-GGUF/Qwen3.6-35B-A3B-GSQ-hybrid.gguf
 QIDS='248045,846,198,12195,369,220,16,22,830,220,17,18,30,21134,440,279,1324,1132,13,248046,198,248045,74455,198'
-B=~anystrata/build-vk/bin/anystrata-gguf-vk
-OUT=~anystrata/bench/vk-task42
+B=$REPO/build-vk/bin/anystrata-gguf-vk
+OUT=$REPO/bench/vk-task42
 mkdir -p "$OUT"
 run() {
   local tag="$1"; shift
   echo "== $tag $(date +%H:%M:%S)"
-  ~anystrata/tools/vulkan/leg.sh --gate engine \
+  "$HERE/leg.sh" --gate engine \
     "$B" --model "$M" --max-context 4096 --tokens "$QIDS" --max-new 16 "$@" \
     > "$OUT/$tag.log" 2>&1
   echo "rc=$?"; grep -E 'generated|ids|tok/s|391' "$OUT/$tag.log" | tail -4

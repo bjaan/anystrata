@@ -40,7 +40,7 @@ find_package(Vulkan REQUIRED)
 # vulkan/PORT-NOTES.md). Failing that, the system glslc. Both are driven through tools/vk-glslc.sh, a shim that
 # accepts the glslc-style invocation and translates to glslangValidator's CLI when that front-end is selected.
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/spv)
-find_program(GLSLANG_VENDORED NAMES glslangValidator PATHS ~build-glslang/glslang NO_DEFAULT_PATH)
+find_program(GLSLANG_VENDORED NAMES glslangValidator PATHS "$ENV{HOME}/build-glslang/glslang" NO_DEFAULT_PATH)
 find_program(GLSLC NAMES glslc glslc.bat PATHS /usr/bin /usr/local/bin ENV PATH)
 if(GLSLANG_VENDORED)
   set(GLSLC_TOOL ${GLSLANG_VENDORED})

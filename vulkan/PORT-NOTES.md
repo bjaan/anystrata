@@ -13,7 +13,7 @@ exist: the fork's `.gitmodules` is **empty** and the tree tracks **zero gitlinks
 third-party code to `vendor/` — httplib, nlohmann, stb, miniaudio, sheredom, hash — and carries no glslang at
 all). `git submodule update --init --recursive` therefore has nothing to fetch, and per the task rules no
 internet download was used to substitute. The CMakeLists still *prefers* a vendored binary
-(`~build-glslang/glslang/glslangValidator` — first entry of `find_program`) so the switch is automatic
+(`~/build-glslang/glslang/glslangValidator` — first entry of `find_program`) so the switch is automatic
 if one is ever built there; the shim's `VK_GLSLC_MODE=glslang` path was smoke-tested by pointing it at the
 system glslangValidator and compiling `dequant_s2.comp` through it (works: `-V --target-env <env> -O f.comp -o
 f.spv`).
