@@ -94,8 +94,12 @@ Use at your own risk. Works on my machine — and now, on yours.
 ## Box setup — CliffsNotes
 
 **AMD GPU or APU under Mesa — the Vulkan path, no CUDA, no ROCm, no vendor SDK.** Debian, Ubuntu and
-Linux Mint (22.x = Ubuntu 24.04: all ship `glslc`); the build needs only CMake ≥ 3.24, a C++20
-compiler, the Vulkan loader/headers, and `glslc` to compile the compute kernels:
+Linux Mint need only CMake ≥ 3.24, a C++20 compiler, the Vulkan loader/headers, and `glslc` to
+compile the compute kernels. (`glslc` ships from Debian bookworm and Ubuntu noble — i.e. Mint 22;
+on Mint 21 / Ubuntu 22.04 there is no glslc package, and on anything older the CMake ≥ 3.24 is the
+problem instead: use a newer release, the backports cmake, or the kit's own CMake ≥ 3.30 build.)
+On this path the two probes worth running before the build are the glslc check and the capability
+check below; the build then takes one command:
 
 ```bash
 sudo apt-get update
