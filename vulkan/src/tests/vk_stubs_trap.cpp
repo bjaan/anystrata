@@ -11,6 +11,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#ifdef _WIN32
+static int setenv(const char* n, const char* v, int overwrite) {
+    if (!overwrite && std::getenv(n)) return 0;
+    return _putenv_s(n, v);
+}
+#endif
 
 int main(int argc, char** argv) {
     const bool log_arm = argc > 1 && std::string(argv[1]) == "log";

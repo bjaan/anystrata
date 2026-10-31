@@ -36,6 +36,9 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+#ifdef _WIN32
+#include <malloc.h>
+#endif
 #include <vector>
 
 // The engine's host files carry `#if CUDART_VERSION >= ...` capability gates (dma_batch's CUDA-13 batched
@@ -328,7 +331,8 @@ inline cudaError_t cudaMemGetInfo(size_t* free_, size_t* total) {
     const strata::vk::DeviceInfo& d = strata::vk::device_info();
     const uint64_t used = strata::vk::Arena::instance().used();
     if (total) *total = (size_t) d.total_bytes;
-    if (free_) *free_ = (size_t) (d.total_bytes > used ? d.total_bytes - used : 0);
+    // the arena's own ceiling (arena_add refuses past free_bytes), not total: other processes' VRAM is not ours to plan
+    if (free_) *free_ = (size_t) (d.free_bytes > used ? d.free_bytes - used : 0);
     return cudaSuccess;
     STRATA_VK_CATCH(cudaErrorInitializationError)
 }
@@ -434,7 +438,11 @@ inline cudaError_t cudaHostAlloc(void** p, size_t bytes, unsigned) {
     void* m = nullptr;
     if (bytes) {
         size_t r = (bytes + 4095) & ~(size_t) 4095;      // aligned_alloc wants a multiple of the alignment
+#ifdef _WIN32
+        m = ::_aligned_malloc(r, 4096);   // the CRT has no aligned_alloc; cudaFreeHost pairs it with _aligned_free
+#else
         m = ::aligned_alloc(4096, r);
+#endif
     }
     if (!m) { strata_vk_compat::set_error(cudaErrorMemoryAllocation, "strata-vk: cudaHostAlloc (aligned_alloc) failed"); return cudaErrorMemoryAllocation; }
     std::lock_guard<std::mutex> lk(strata_vk_compat::host_map_m());
@@ -453,7 +461,11 @@ inline cudaError_t cudaFreeHost(void* p) {
         std::lock_guard<std::mutex> lk(strata_vk_compat::host_map_m());
         strata_vk_compat::host_map().erase(p);
     }
+#ifdef _WIN32
+    ::_aligned_free(p);
+#else
     ::free(p);
+#endif
     return cudaSuccess;
 }
 inline cudaError_t cudaHostRegister(void* p, size_t, unsigned) {

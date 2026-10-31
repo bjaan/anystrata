@@ -221,6 +221,101 @@ is unchanged; published packs stay at https://huggingface.co/robertkarl/Unbiased
 continuity). Model files are downloaded on a network box and copied in; the served files with sizes and SHA-256
 are in [docs/MODEL-FILES.md](docs/MODEL-FILES.md).
 
+## Windows
+
+Both GPU backends build natively with MSVC: the CUDA engine and the Vulkan engine, plus the front end that serves them.
+Verified 2026-10-30 on Windows 11 with an RTX 4070 Laptop GPU (8 GB, sm_89), 32 GB RAM, CUDA 12.6, Visual Studio 2022
+17.14 and Vulkan SDK 1.4.363, serving LM Studio's `lmstudio-community/Qwen3.6-35B-A3B-GGUF` Q4_K_M file (21 GB).
+
+What you need:
+
+| For | Install |
+| --- | --- |
+| everything | Visual Studio 2022 (or Build Tools) with *Desktop development with C++*, which brings CMake and Ninja; Git |
+| the CUDA engine | a CUDA 12.x or 13 toolkit (its installer puts `cudart64_*.dll` on `PATH`) |
+| the Vulkan engine | the LunarG Vulkan SDK (`winget install KhronosGroup.VulkanSDK`: glslc, spirv-as, headers) and Python 3 on `PATH` (a real interpreter, not the Microsoft Store alias) |
+
+Run everything below in an **x64 Native Tools Command Prompt for VS 2022** (`cmd`) at the repository root.
+`%CD:\=/%` is cmd's way of writing the current directory with forward slashes. The engines and the front end must end
+up in the same `bin` folder, because `--engine` takes a bare name and finds it beside `anystrata.exe`.
+
+```bat
+git submodule update --init
+```
+
+CUDA (set `CMAKE_CUDA_ARCHITECTURES` to your card: 75 RTX 20, 86 RTX 30, 89 RTX 40, 120 RTX 50):
+
+```bat
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_NATIVE_EXPERTS=ON ^
+  -DSTRATA_MMQ_KQUANTS=ON -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_BUILD_DSV41=ON -DSTRATA_BUILD_TESTS=OFF ^
+  -DCMAKE_CUDA_ARCHITECTURES=89 ^
+  -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=%CD:\=/%/build/bin -DCMAKE_LIBRARY_OUTPUT_DIRECTORY=%CD:\=/%/build/bin
+cmake --build build --target anystrata anystrata-gguf strata_kq anystrata-pack anystrata-gguf-dsv41
+```
+
+Vulkan (its tree has no front end; take `anystrata.exe` from the CUDA build, or build the CUDA-free front end below):
+
+```bat
+cmake -S . -B build-vk -G Ninja -DSTRATA_ENABLE_VULKAN=ON -DCMAKE_BUILD_TYPE=Release ^
+  -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=%CD:\=/%/build-vk/bin
+cmake --build build-vk
+ctest --test-dir build-vk --output-on-failure
+```
+
+The front end alone, without a CUDA toolkit:
+
+```bat
+cmake -S . -B build-frontend -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_BUILD_TESTS=OFF ^
+  -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=%CD:\=/%/build-frontend/bin
+cmake --build build-frontend --target anystrata
+```
+
+Serve with CUDA:
+
+```bat
+set M=%USERPROFILE%\.lmstudio\models\lmstudio-community\Qwen3.6-35B-A3B-GGUF\Qwen3.6-35B-A3B-Q4_K_M.gguf
+build\bin\anystrata.exe --engine anystrata-gguf -m "%M%" --host 127.0.0.1 --port 18091 ^
+  --alias qwen3.6-35b-a3b-q4_k_m --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0 --presence-penalty 1.5 ^
+  -- --model "%M%" --max-context 8192
+```
+
+Serve with Vulkan (`--engine` takes the engine's path; `--no-graphs` is needed when the model does not fit in VRAM,
+see below):
+
+```bat
+build-frontend\bin\anystrata.exe --engine %CD%\build-vk\bin\anystrata-gguf-vk.exe -m "%M%" --host 127.0.0.1 --port 18092 ^
+  --alias qwen3.6-35b-a3b-q4_k_m-vk --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0 --presence-penalty 1.5 ^
+  -- --model "%M%" --max-context 8192 --no-graphs
+```
+
+Ask it something (Windows ships `curl.exe`):
+
+```bat
+curl http://127.0.0.1:18091/v1/chat/completions -H "Content-Type: application/json" ^
+  -d "{\"messages\":[{\"role\":\"user\",\"content\":\"What is 17 * 23?\"}]}"
+```
+
+Ctrl+C stops the server, and the engine goes with it. Measured on the laptop above, at 8,192 context:
+
+| Engine | Experts in VRAM | Decode | Notes |
+| --- | --- | --- | --- |
+| `anystrata-gguf` (CUDA 12.6) | 2,159 of 10,240 (3.8 GiB) | 28.4 tok/s | the rest of the experts run on the CPU (24 threads) |
+| `anystrata-gguf-vk` (NVIDIA Vulkan driver) | 2,537 of 10,240 (4.5 GiB) | 10.0 tok/s | `--no-graphs`; 14.2 tok/s with graphs and `--lookup 0` |
+
+Both answered the test prompt correctly, and their first 32 generated token ids matched exactly.
+
+Known limits on Windows:
+
+* **Vulkan with a model larger than VRAM needs `--no-graphs`** (or `--lookup 0`). This is the open graphs + expert-SWAP
+  + lookup-guesser bug recorded in `vulkan/PORT-STATUS.md`. On the BC-250 it collapses the output to id-0s; on
+  NVIDIA under Windows the engine crashes mid-generation instead.
+* **`ctest` in `build-vk` passes 13 of 17 on a card that is not a BC-250.** The other four are pinned to that board:
+  `vk_core_smoke` asserts its 24 CUs, `vk_doorbell_probe` spins a kernel longer than Windows' 2 s GPU timeout allows,
+  and `native_mmvq_vk_parity` / `poly_kernels_vk_parity` expect RADV's bitwise floats, where NVIDIA's shader compiler
+  differs in the last bits (Q5_K mmvq, rope).
+* With a CUDA 12.x toolkit the build links the shared CUDA runtime (#585), so `cudart64_12.dll` must be on `PATH` when
+  the engine starts.
+
 ## Supported models
 
 Three engines, and what each one runs. The `general.architecture` string in a GGUF decides the engine family;

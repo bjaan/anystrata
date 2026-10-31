@@ -32,7 +32,12 @@
 #include <set>
 #include <chrono>
 #include <thread>
+#ifdef _WIN32
+#include <filesystem>
+#include <io.h>
+#else
 #include <unistd.h>
+#endif
 
 using strata_frontend::Engine;
 using strata_frontend::EngineLine;
@@ -74,7 +79,7 @@ struct Slot {
 
     void release() {
         if (!images_path.empty()) {
-            ::unlink(images_path.c_str());
+            std::remove(images_path.c_str());
         }
         *this = Slot{};
     }
@@ -521,6 +526,21 @@ struct strata_context_impl {
 
     // the request's pictures file (slot.images_path, unlinked when the slot is released)
     std::FILE * open_pictures_file(std::string & err) {
+#ifdef _WIN32
+        std::error_code ec;
+        std::string name = (std::filesystem::temp_directory_path(ec) / "anystrata-pictures-XXXXXX").string();
+        if (ec || ::_mktemp_s(name.data(), name.size() + 1) != 0) {
+            err = "cannot create the pictures file";
+            return nullptr;
+        }
+        std::FILE * f = std::fopen(name.c_str(), "wbx");
+        if (f == nullptr) {
+            err = "cannot open the pictures file";
+            return nullptr;
+        }
+        slot.images_path = name;
+        return f;
+#else
         char name[] = "/tmp/anystrata-pictures-XXXXXX";
         const int fd = ::mkstemp(name);
         if (fd < 0) {
@@ -534,6 +554,7 @@ struct strata_context_impl {
             err = "cannot open the pictures file";
         }
         return f;
+#endif
     }
 
     // the ids with every picture's rows written to `f` and image_pad in their place; slot.image_keys for the GENI line

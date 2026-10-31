@@ -13,6 +13,7 @@
 #include "strata/vulkan_runtime.hpp"
 #include "strata/vulkan_compat/strata_vk.h"
 
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -387,7 +388,7 @@ int main() {
                     r.out_u[size_t(row)*channels + c] = silu(yu);
                     s0 = s1; s1 = s2; s2 = v;
                     if (n_snap && row < 32 && ((snaps >> row) & 1u)) {
-                        int slot = __builtin_popcount(snaps & ((1u << row) - 1u));
+                        int slot = std::popcount((uint32_t)snaps & ((1u << row) - 1u));
                         r.snaps.push_back({(float)slot, (float)c, s0, s1, s2});
                     }
                 }
@@ -409,7 +410,7 @@ int main() {
             for (auto& v : x) v = u(rng);
             for (auto& v : st) v = u(rng);
             for (auto& v : w) v = u(rng);
-            const int n_snap = cs.snaps ? __builtin_popcount(cs.snaps) : 0;
+            const int n_snap = cs.snaps ? std::popcount((uint32_t)cs.snaps) : 0;
             const size_t stride = (size_t)channels * 3;
             std::vector<float> snap(n_snap ? (size_t)n_snap * stride : 0, 0.f);
             const uint64_t ax = a.alloc(x.size() * 4), as_ = a.alloc(st.size() * 4), aw = a.alloc(w.size() * 4),

@@ -185,13 +185,9 @@ void init() {
         g_info.multi_processor_count = cu > 0 && cu < 1024 ? (int) cu : 0;
     }
     g_info.l2_bytes = 0;   // no Vulkan query for it; radv exposes no L2 property (documented, not guessed)
-    VkPhysicalDeviceMemoryProperties mp;
-    vkGetPhysicalDeviceMemoryProperties(g_phys, &mp);
-    g_info.unified_memory = false;
-    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
-        const auto vis = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
-        if ((mp.memoryTypes[i].propertyFlags & vis) == vis) { g_info.unified_memory = true; break; }
-    }
+    // The device type, as llama.cpp's Vulkan backend decides it: a DEVICE_LOCAL|HOST_VISIBLE memory type alone is no
+    // proof (every discrete card with resizable BAR has one). The BC-250 reports INTEGRATED_GPU.
+    g_info.unified_memory = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
     // VRAM figures, Vulkan 1.4's memory budget through the device properties2 chain.
     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
     VkPhysicalDeviceMemoryProperties2 mp2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
@@ -199,6 +195,9 @@ void init() {
     vkGetPhysicalDeviceMemoryProperties2(g_phys, &mp2);
     uint64_t total = 0, free_b = 0;
     for (uint32_t h = 0; h < mp2.memoryProperties.memoryHeapCount; h++) {
+        // a discrete card also lists the system-RAM heap it can reach over PCIe; the arena allocates DEVICE_LOCAL, so
+        // counting that heap had the planner size an expert cache the card cannot hold (an 8 GiB RTX 4070 read 23.6 GiB)
+        if (!g_info.unified_memory && !(mp2.memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) continue;
         total += mp2.memoryProperties.memoryHeaps[h].size;
         const int64_t b = (int64_t)budget.heapBudget[h] - (int64_t)budget.heapUsage[h];
         if (b > 0) free_b += (uint64_t)b;

@@ -6,8 +6,10 @@
 // loop polls it between tasks so a cancel from a disconnected client is seen within the poll interval.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -17,13 +19,54 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 namespace strata_frontend {
 
+#ifdef _WIN32
+using pid_t = int;
+
+inline std::string win_error() {
+    const DWORD code = ::GetLastError();
+    char * msg = nullptr;
+    ::FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, code,
+                     0, (LPSTR) &msg, 0, nullptr);
+    std::string s = msg ? msg : "error " + std::to_string(code);
+    if (msg) ::LocalFree(msg);
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) s.pop_back();
+    return s;
+}
+
+// one argv entry quoted the way CommandLineToArgvW and the CRT read it back
+inline void append_quoted(std::string & cmd, const std::string & a) {
+    if (!a.empty() && a.find_first_of(" \t\n\v\"") == std::string::npos) {
+        cmd += a;
+        return;
+    }
+    cmd += '"';
+    for (size_t i = 0;; ++i) {
+        size_t bs = 0;
+        while (i < a.size() && a[i] == '\\') { ++i; ++bs; }
+        if (i == a.size()) { cmd.append(bs * 2, '\\'); break; }
+        if (a[i] == '"') { cmd.append(bs * 2 + 1, '\\'); cmd += '"'; }
+        else { cmd.append(bs, '\\'); cmd += a[i]; }
+    }
+    cmd += '"';
+}
+#else
 // Reap a dead child: kill(pid, 0) would report a zombie as alive. The pid slot is shared with quit() on another
 // thread (the supervisor polls this while a SIGTERM handler shuts down), so it is read once and cleared by
 // compare-exchange. Nothing here or in quit() may pass a pid that is not > 0 to kill(): kill(-1, SIGKILL) kills every
@@ -50,6 +93,7 @@ inline bool child_running(std::atomic<pid_t> & pid_slot, std::string & why) {
     pid_slot.compare_exchange_strong(pid, -1);
     return false;
 }
+#endif
 
 // One line from the engine, already classified.
 struct EngineLine {
@@ -72,8 +116,79 @@ public:
     Engine() = default;
     Engine(const Engine &) = delete;
     Engine & operator=(const Engine &) = delete;
-    ~Engine() { quit(); }
+    ~Engine() {
+        quit();
+#ifdef _WIN32
+        if (proc_) { ::CloseHandle(proc_); proc_ = nullptr; }
+#endif
+    }
 
+#ifdef _WIN32
+    // CreateProcess `executable` with `args` (args[0] is argv[0]); the child inherits only its three std handles.
+    bool start(const std::string & executable, const std::vector<std::string> & args, std::string & err) {
+        SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
+        HANDLE in_r = nullptr, in_w = nullptr, out_r = nullptr, out_w = nullptr;
+        if (!::CreatePipe(&in_r, &in_w, &sa, 0)) {
+            err = "CreatePipe: " + win_error();
+            return false;
+        }
+        if (!::CreatePipe(&out_r, &out_w, &sa, 0)) {
+            err = "CreatePipe: " + win_error();
+            ::CloseHandle(in_r); ::CloseHandle(in_w);
+            return false;
+        }
+        ::SetHandleInformation(in_w, HANDLE_FLAG_INHERIT, 0);
+        ::SetHandleInformation(out_r, HANDLE_FLAG_INHERIT, 0);
+        HANDLE err_dup = nullptr;
+        const HANDLE err_h = ::GetStdHandle(STD_ERROR_HANDLE);
+        if (err_h && err_h != INVALID_HANDLE_VALUE) {
+            ::DuplicateHandle(::GetCurrentProcess(), err_h, ::GetCurrentProcess(), &err_dup, 0, TRUE, DUPLICATE_SAME_ACCESS);
+        }
+        HANDLE inherit[3] = {in_r, out_w, err_dup};
+        const DWORD n_inherit = err_dup ? 3 : 2;
+        SIZE_T attr_size = 0;
+        ::InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_size);
+        std::vector<char> attr_buf(attr_size);
+        auto attrs = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buf.data());
+        const bool attrs_ok = ::InitializeProcThreadAttributeList(attrs, 1, 0, &attr_size) &&
+            ::UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit, n_inherit * sizeof(HANDLE),
+                                        nullptr, nullptr);
+        STARTUPINFOEXA si{};
+        si.StartupInfo.cb         = sizeof si;
+        si.StartupInfo.dwFlags    = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdInput  = in_r;
+        si.StartupInfo.hStdOutput = out_w;
+        si.StartupInfo.hStdError  = err_dup;
+        si.lpAttributeList        = attrs_ok ? attrs : nullptr;
+        std::string cmd;
+        for (size_t i = 0; i < args.size(); ++i) {
+            if (i) cmd += ' ';
+            append_quoted(cmd, args[i]);
+        }
+        PROCESS_INFORMATION pi{};
+        const BOOL ok = ::CreateProcessA(executable.c_str(), cmd.data(), nullptr, nullptr, TRUE,
+                                         attrs_ok ? EXTENDED_STARTUPINFO_PRESENT : 0, nullptr, nullptr, &si.StartupInfo, &pi);
+        if (!ok) {
+            err = "could not start the engine " + executable + ": " + win_error();
+        }
+        if (attrs_ok) ::DeleteProcThreadAttributeList(attrs);
+        ::CloseHandle(in_r);
+        ::CloseHandle(out_w);
+        if (err_dup) ::CloseHandle(err_dup);
+        if (!ok) {
+            ::CloseHandle(in_w);
+            ::CloseHandle(out_r);
+            return false;
+        }
+        ::CloseHandle(pi.hThread);
+        proc_  = pi.hProcess;
+        pid_   = (pid_t) pi.dwProcessId;
+        in_h_  = in_w;
+        out_h_ = out_r;
+        alive_ = true;
+        return true;
+    }
+#else
     // fork+exec `executable` with `args` (args[0] is argv[0]). Must be called before any thread exists.
     bool start(const std::string & executable, const std::vector<std::string> & args, std::string & err) {
         int to_child[2], from_child[2];
@@ -107,6 +222,7 @@ public:
         alive_  = true;
         return true;
     }
+#endif
 
     // Reads start-up lines until READY. Loading a model takes minutes; `timeout_s` bounds the wait (<= 0: forever).
     // `READY <max_context> [stop]`: the context the engine actually allocated (its VRAM plan may lower the request);
@@ -216,6 +332,42 @@ public:
         }
     }
 
+#ifdef _WIN32
+    // Stop the engine: QUIT, up to 10 s for it to leave, then TerminateProcess. The process handle stays open until
+    // the destructor, so reap_exit() on another thread never waits on a closed handle.
+    void quit() {
+        const pid_t pid = pid_.exchange(-1);
+        if (pid > 0 && proc_) {
+            send("QUIT\n");
+            if (::WaitForSingleObject(proc_, 10000) == WAIT_TIMEOUT) {
+                ::TerminateProcess(proc_, 1);
+                ::WaitForSingleObject(proc_, INFINITE);
+            }
+        }
+        if (in_h_)  { ::CloseHandle(in_h_);  in_h_  = nullptr; }
+        if (out_h_) { ::CloseHandle(out_h_); out_h_ = nullptr; }
+        alive_ = false;
+    }
+
+    // Non-blocking: has the child exited? `why` names the exit code (an NTSTATUS for a crash).
+    bool reap_exit(std::string & why) {
+        pid_t pid = pid_.load();
+        if (pid > 0 && proc_ && ::WaitForSingleObject(proc_, 0) == WAIT_TIMEOUT) {
+            return false;
+        }
+        if (pid > 0 && proc_) {
+            DWORD code = 0;
+            ::GetExitCodeProcess(proc_, &code);
+            char hex[16];
+            std::snprintf(hex, sizeof hex, "0x%08lX", (unsigned long) code);
+            why = code >= 0xC0000000u ? std::string("engine crashed with exception ") + hex
+                                      : "engine exited with code " + std::to_string(code);
+            pid_.compare_exchange_strong(pid, -1);
+        }
+        alive_ = false;
+        return true;
+    }
+#else
     // Stop the engine: QUIT, up to 10 s for it to leave, then SIGKILL. Safe against reap_exit() on another thread.
     void quit() {
         // Take the pid out of the shared slot first: from here only this call owns the child, and kill() below
@@ -246,6 +398,7 @@ public:
         alive_ = false;
         return true;
     }
+#endif
 
     bool alive() const { return alive_; }
     bool busy()  const { return busy_; }
@@ -256,12 +409,86 @@ public:
     pid_t pid() const { return pid_; }
 
     static int64_t now_ms() {
-        struct timespec ts;
-        ::clock_gettime(CLOCK_MONOTONIC, &ts);
-        return (int64_t) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
     }
 
 private:
+#ifdef _WIN32
+    bool send(const std::string & s) {
+        if (!in_h_) {
+            return false;
+        }
+        size_t off = 0;
+        while (off < s.size()) {
+            DWORD n = 0;
+            if (!::WriteFile(in_h_, s.data() + off, (DWORD) (s.size() - off), &n, nullptr) || n == 0) {
+                alive_ = false;
+                return false;
+            }
+            off += n;
+        }
+        return true;
+    }
+
+    // >0: bytes read; 0: nothing within wait_ms; -1: EOF/error. Anonymous pipes cannot be waited on, so this polls
+    // PeekNamedPipe at a millisecond tick.
+    int read_some(char * chunk, size_t cap, int wait_ms) {
+        const int64_t deadline = now_ms() + wait_ms;
+        while (true) {
+            DWORD avail = 0;
+            if (!::PeekNamedPipe(out_h_, nullptr, 0, nullptr, &avail, nullptr)) {
+                return -1;
+            }
+            if (avail > 0) {
+                DWORD got = 0;
+                if (!::ReadFile(out_h_, chunk, (DWORD) std::min<size_t>(avail, cap), &got, nullptr) || got == 0) {
+                    return -1;
+                }
+                return (int) got;
+            }
+            if (now_ms() >= deadline) {
+                return 0;
+            }
+            ::Sleep(1);
+        }
+    }
+
+    // 1: a line; 0: timeout; -1: EOF/error
+    int read_line(std::string & line, int timeout_ms) {
+        const int64_t deadline = now_ms() + timeout_ms;
+        while (true) {
+            const size_t nl = buf_.find('\n');
+            if (nl != std::string::npos) {
+                line.assign(buf_, 0, nl);
+                buf_.erase(0, nl + 1);
+                while (!line.empty() && line.back() == '\r') {
+                    line.pop_back();
+                }
+                return 1;
+            }
+            if (!out_h_) {
+                return -1;
+            }
+            const int wait = timeout_ms <= 0 ? 0 : (int) std::max<int64_t>(0, deadline - now_ms());
+            char chunk[65536];
+            const int n = read_some(chunk, sizeof chunk, wait);
+            if (n == 0) {
+                return 0;
+            }
+            if (n < 0) {
+                if (!buf_.empty()) {
+                    line.swap(buf_);
+                    buf_.clear();
+                    return 1;
+                }
+                alive_ = false;
+                return -1;
+            }
+            buf_.append(chunk, (size_t) n);
+        }
+    }
+#else
     bool send(const std::string & s) {
         if (in_fd_ < 0) {
             return false;
@@ -328,6 +555,7 @@ private:
             buf_.append(chunk, (size_t) n);
         }
     }
+#endif
 
     void parse_info(const std::string & kv) {
         size_t i = 0;
@@ -378,8 +606,14 @@ private:
     }
 
     std::atomic<pid_t> pid_{-1};
+#ifdef _WIN32
+    HANDLE proc_  = nullptr;
+    HANDLE in_h_  = nullptr;
+    HANDLE out_h_ = nullptr;
+#else
     int in_fd_   = -1;
     int out_fd_  = -1;
+#endif
     std::string buf_;
     std::atomic<bool> alive_{false};
     bool busy_      = false;

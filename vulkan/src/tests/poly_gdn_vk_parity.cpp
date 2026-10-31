@@ -21,6 +21,7 @@
 #include "strata/vulkan_runtime.hpp"
 #include "strata/vulkan_compat/strata_vk.h"
 
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -133,7 +134,7 @@ void ref_gdn_step(const std::vector<float>& qkv0, const std::vector<float>& alph
                                               : (col[i] * dc) + (kn[i] * d);
                         col[i] = n;
                         if (row < 32 && ((snaps >> row) & 1u)) {
-                            const size_t slot = __builtin_popcount(snaps & ((1u << row) - 1u));
+                            const size_t slot = std::popcount((uint32_t)snaps & ((1u << row) - 1u));
                             snap[slot * stride + (size_t(h) * dim + j) * dim + i] = n;
                         }
                         lane[l] = fused ? std::fmaf(n, qn[i], lane[l]) : lane[l] + n * qn[i];
@@ -181,7 +182,7 @@ int main() {
         const unsigned snaps = cs.snaps;
         // The engine's rec_n_: the WHOLE per-slot state span, since snap_of() adds mine=(h*dim+j)*dim.
         const size_t stride = size_t(cs.n_head) * cs.dim * cs.dim;
-        const int n_snap = snaps ? __builtin_popcount(snaps) : 0;
+        const int n_snap = snaps ? std::popcount((uint32_t)snaps) : 0;
 
         std::mt19937 rng(1234 + cs.dim + cs.rows);
         std::vector<float> qkv((size_t)cs.rows * row_n), alpha((size_t)cs.rows * cs.n_head),

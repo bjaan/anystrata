@@ -210,7 +210,8 @@ def main():
             else:
                 ps.append("%s p%d" % (pt, k))
         body = 'strata::vk_engine::missing("%s");' % d["qual"] + ret_stmt(r)
-        lines.append("namespace %s { %s %s(%s) { %s } }" % (ns, r, fn, ", ".join(ps), body))
+        nx = " noexcept" if re.search(r"\)\s*(const\s*)?noexcept\s*$", ty) else ""
+        lines.append("namespace %s { %s %s(%s)%s { %s } }" % (ns, r, fn, ", ".join(ps), nx, body))
     open(OUT, "w").write("\n".join(lines) + "\n")
     print("wrote %s: %d trap definitions" % (OUT, len(to_trap)))
 
