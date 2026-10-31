@@ -412,12 +412,22 @@ no CUDA, no ROCm)** with Qwen3.6-35B-A3B GSQ-hybrid 2-bit, 10,240/10,240 experts
 | prefill (735 / 4,954 token prompts) | 32 / 50 tok/s (5.5x after the GPU tiled GEMM; tuning continues) |
 | `pi` coding agent (1.6K-token system prompt) | served repeatedly: 52 s round trip, KV reuse, grammar parse |
 | parity vs the CUDA tree | ~50,000 outputs bitwise; runtime driver laws per GPU, measured |
-| context on the APU | 16K / 32K stable (14.1 / 13.9 GB resident); 64K needs `--kv q8_0` (store + prefill-read ported, the decode read traps by name) — PORT-NOTES laws 10-11 |
+| the canary | `17*23?` -> 391, 16 ids bitwise-fixed per configuration; run after every change ([docs/CANARY.md](docs/CANARY.md)) |
+| context on the APU | 16K / 32K stable (14.1 / 13.9 GB resident); 64K live with `--kv q8_0` — the whole q8 chain (store, prefill workspace read, fused decode read) ported, parity-green and correctness-scored — PORT-NOTES laws 10-13 |
 | correctness gate (teacher-forced vs llama.cpp at the pin) | base arm 1,678 steps: step-weighted KL 1.39x llama.cpp's own CPU-vs-GPU floor (bar: 1.5x); argmax agrees at every gap>=0.5-nat position but one near tie; draft arm bitwise-inert (T0); q8_0-KV arm 1,096 steps at 1.82x (the storage trade, zero argmax flips); graphs bitwise-inert — table in `vulkan/PORT-STATUS.md` |
 
 (llama.cpp's own Vulkan backend on the same card and model: ~76 tok/s decode — the ceiling this backend climbs
 toward while keeping Strata's expert-cache design, which is what lets a 12 GB model sit entirely inside
 15.7 GB of unified memory.)
+
+## The canary
+
+Before any build is trusted, it answers one question: `17*23?` — and the answer must be **391**,
+as the same 16 token ids, byte-identical to the recorded list, on every run. One multiplication
+crosses the whole engine — load, expert cache, kernels, attention, sampler — and it is the
+fastest way to learn that a single float moved somewhere it should not have. Silly the seabird
+carries the 18-byte Q2_0 crates this runs on; the number on Any Cyan's hairpin is the answer.
+The full story, and how to run it: [docs/CANARY.md](docs/CANARY.md).
 
 ## Known limits
 
