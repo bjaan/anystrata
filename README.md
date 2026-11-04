@@ -212,6 +212,21 @@ build/bin/anystrata --engine build/bin/anystrata-gguf \
      --expert-profile /models/expert-profile-q3km.txt --tail-skip 6
 ```
 
+Hybrid models (some experts cached, some computed on the CPU) take the streaming knobs after the `--`:
+
+```
+    --stage-rows N         from N tokens a call copies the experts outside the cache to the card
+                           (--stage-mib) and computes them there while the CPU takes its share
+                           meanwhile; under N the CPU computes all of them (default 32;
+                           1 = also while an answer is written — keeps card and bus busy instead
+                           of the CPU; --stage-overlap 0|1 copies a staging round under the
+                           cached experts' kernels)
+    --mmq-tab 0|1          CUDA only: a layer's cached experts in pointer-table launches of 16
+                           wherever follow() has traded their slots, instead of one launch per
+                           run (STRATA_POLY_MMQ_TAB=ON build; on the Vulkan path this is a no-op
+                           trap, named, per backend law)
+```
+
 With pictures, add `--mmproj /models/mmproj-F16.gguf` (the projector from the same repository) and `--threads N`
 before the `--`; the front end encodes each picture once (picture cache, keyed by its SHA-256) and hands the rows
 to the engine over the `GENI` protocol. A picture is at most 300 rows by default (`--image-max-tokens` changes it).
@@ -413,6 +428,7 @@ no CUDA, no ROCm)** with Qwen3.6-35B-A3B GSQ-hybrid 2-bit, 10,240/10,240 experts
 | `pi` coding agent (1.6K-token system prompt) | served repeatedly: 52 s round trip, KV reuse, grammar parse |
 | parity vs the CUDA tree | ~50,000 outputs bitwise; runtime driver laws per GPU, measured |
 | the canary | `17*23?` -> 391, 16 ids bitwise-fixed per configuration; run after every change ([docs/CANARY.md](docs/CANARY.md)) |
+| upstream merge 1d474dd (`--stage-rows` streaming + `--mmq-tab`, shared engine core) | canary bitwise-identical on the BC-250; decode at full residency 25.4 tok/s (96-token leg) — the best measured here; upstream's own cards gained 20.6 -> 26.5-29.3 tok/s decode streaming and 94.6 vs 68.1 t/s prefill with `--mmq-tab` (5090/1060-class, CUDA; their numbers, not this box's) |
 | context on the APU | 16K / 32K stable (14.1 / 13.9 GB resident); 64K live with `--kv q8_0` — the whole q8 chain (store, prefill workspace read, fused decode read) ported, parity-green and correctness-scored — PORT-NOTES laws 10-13 |
 | correctness gate (teacher-forced vs llama.cpp at the pin) | base arm 1,678 steps: step-weighted KL 1.39x llama.cpp's own CPU-vs-GPU floor (bar: 1.5x); argmax agrees at every gap>=0.5-nat position but one near tie; draft arm bitwise-inert (T0); q8_0-KV arm 1,096 steps at 1.82x (the storage trade, zero argmax flips); graphs bitwise-inert — table in `vulkan/PORT-STATUS.md` |
 

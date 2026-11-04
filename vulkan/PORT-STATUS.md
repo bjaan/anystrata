@@ -1000,3 +1000,29 @@ compat header), and docs/VULKAN.md still said "Events time 0". Shipped now:
   stage-timing CLI. What Task 4.2 owed — a compat event surface returning real device time for
   every consumer in the tree (bench harnesses, session sweep, STRATA_COMMIT_TIMING when a core
   engine runs on Vulkan) — is what landed and is pinned. ctest 17/17.
+
+## Upstream core merge 1d474dd — hybrid streaming + pointer-table MMQ (2026-11-04): VERIFIED INERT HERE
+
+upstream/robertkarl's `hybrid-mmq-tab` branch (29511cf fd4f95f 0c6c01c d2da41b 3d5fc52:
+`--stage-rows`/`--stage-overlap` expert streaming while an answer is written; `--mmq-tab`
+pointer-table launches of 16 for a layer's cached experts wherever follow() traded their slots)
+touches the SHARED core `src/poly/engine.cpp`, so this backend runs the new state machine too.
+Cherry-pick sequence conflicted on the fork's diverged docs; the code region applied 3-way clean
+as one reviewed patch, upstream's five messages preserved verbatim in the commit body.
+
+Gate on this box (tools/vulkan/post-restart-verify.sh, the standing post-reboot one-command
+check): canary 16 ids BITWISE-identical to the recorded line; experts 10,240/10,240 resident,
+0 swapped; ctest 17/17; make test e2e green. Decode at full residency 25.4 tok/s (96-token leg)
+— inside the existing band: the merge is exactly as promised, inert here. The wins upstream
+measured (20.6 -> 26.5-29.3 tok/s decode streaming on a 1060-class card; 94.6 vs 68.1 t/s
+prefill with --mmq-tab on a 5090) are DISCRETE-card numbers — this APU's hybrid regime shares
+one bus with everything, and the pointer-table kernels are CUDA (STRATA_POLY_MMQ_TAB stays OFF;
+the Vulkan Mmq shim answers tab()=false and mul_tab() traps by name, added so the shared core
+links). Their numbers are the README's, attributed; this box's own number is this one.
+
+Process note kept on purpose: the first verify run reported "CANARY: DIFFERS" under a swap
+storm — an EMPTY capture from the load timeout read as a mismatch. Fixed in da692de (empty =
+inconclusive, exit 2); the false alarm is exactly why "compare ids" must never be conflated
+with "got no ids". The serve held :18090's engine slot during the storm; one engine at a time
+(law 10) applies to verification legs too — stop, leg, restart.
+
