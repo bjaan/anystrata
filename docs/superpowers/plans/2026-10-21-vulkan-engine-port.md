@@ -181,9 +181,50 @@ The goal of this phase is **not** running: it is `strata-poly`'s eleven host fil
 
 ## Phase 6 — Finish the roster (never blocks the gate)
 
-- [ ] Sweep PORT-STATUS to zero `todo` for everything `strata-poly`'s qwen35moe + gemma4 + glm5next paths can reach; `native_*`/`qsa` TC variants stay `fp32-fallback (TC n/a on gfx1013)` honestly forever.
-- [ ] Port `strata` (the Qwen3.8 engine)? **Out of scope unless asked** — `strata-poly` carries Qwen3.6; note in docs.
+- [ ] **Task 6.0 (GATE-FIRST, added 2026-10-29; two-platform reproduction from the windows-build merge 2026-11-04):** kill the open **graphs x expert-swap x lookup-guesser** bug — capture keys hold stale slot/expert bindings after `follow()` trades them (id-0 collapse on the BC-250, segfault on an RTX 4070 Laptop; `--no-graphs` or `--lookup 0` both dodge it). Fix shape recorded in PORT-STATUS: retire a layer's per-layer capture key when any of its slots move; A/B law: canary bitwise vs eager, then the swap-regime 96-token legs (`bench/correctness` harness untouched). **Phase 7 cannot start before this is green** — pack is born in the swap regime, and this bug would ship into a second engine on day one.
+- [ ] **Task 6.0b:** `store_q8_at`'s eager path (still a named trap, PORT-STATUS 792) — one small gap so `--no-graphs` remains a fully equivalent A/B toggle at 64K q8_0.
+- [ ] Sweep PORT-STATUS to zero `todo` for everything `strata-poly`'s qwen35moe + gemma4 + glm5next paths can reach; `native_*`/`qsa` TC variants stay `fp32-fallback (TC n/a on gfx1013)` honestly forever. (gemma4/glm5-next bring-up is its own demand-driven ladder: they are *untried*, not broken — same Phase-2 recipe per architecture, model files from docs/MODEL-FILES.md.)
 - [ ] PR-readiness pass: `git diff main --stat` review, UPSTREAM.md line, commit messages self-contained.
+
+## Phase 7 (rewritten 2026-11-04 — user asked for it: "port the other engines too")
+
+The plan's old Phase 7 ("out of scope unless asked") is now the ask. Two unported engine
+families, port order argued, each following the proven ladder (compat shim -> trap roster ->
+model-demanded kernel order -> parity gates -> teacher-forced correctness -> canary pinned):
+
+- [ ] **Task 7.1: `anystrata-pack` / `qwen4exp` — Qwen3.8-Flash-Next (and its fine-tunes).**
+  WHY FIRST: it is Strata's flagship (125B-class MoE, 512 experts a layer, the pack + MTP
+  directory format) and the model this box physically cannot fit (47 GB shards + pack + MTP;
+  ~76 GB of routed experts vs 15.7 GB unified) — so it is also the *honest test* of the
+  streaming design on a consumer APU, which is the whole point of the project.
+  DEPENDS ON Task 6.0 (swap regime; see why above).
+  FILES: NOT fetched by the engine (policy): upstream's release shards + the pack/MTP trees
+  (docs/MODEL-FILES.md: GSQ-RCO IQ3_XXS 2-shard + pack-iq3-xxs/ + mtp/, made by
+  tools/iq_pack.py / mtp_fetch.py / mtp_pack.py / mtp_rt.py — the pack tree may come from the
+  upstream pod or rebuild here from the shards, ~40 min, documented either way).
+  EXPECTED NEW KERNEL SURFACE: the pack-format weight reader, the MTP drafter path (this port
+  has only run gguf-in-place draft), qwen4exp's attention family, the larger router. Engine
+  host code (src/pack/ or equivalent) is architecture-neutral and compiles unchanged through
+  the compat layer, same as src/poly did (Phase 1's contract, re-proved per engine).
+  GATE: same law every engine here obeys — traps by name until cleared; canary bitwise;
+  the Phase-5 teacher-forced harness at the fork's KL bar against the pinned llama.cpp; the
+  A6000/pod record in MODEL-FILES (identical greedy answers across boxes) is the parity oracle
+  the Vulkan tree diffs against.
+- [ ] **Task 7.2: `anystrata-gguf-dsv41` / `deepseek41` — DeepSeek-V4.1-Flash-1017.**
+  WHY SECOND: newest engine upstream (imported 2026-10-23, bd2dbb9; four shards, Engram table,
+  DSpark drafter, IQ1_M/IQ2 quants) — moves fastest, so port it while its kernels are hot and
+  the CUDA tree is the reference. Its CPU-kernel set from the import is already in-tree.
+  GATE: same ladder; MODEL-FILES' A6000 first-light record (152c5af) is the parity oracle.
+- [ ] **Task 7.3: README's Vulkan column truth table** after each: `not ported` -> `untried`
+  -> `end-to-end` only at its own green gate; per-engine trap rosters in PORT-STATUS (the
+  roster IS the honest status; 85 todo marks and counting per engine).
+
+Order stays demand-driven and one-engine-at-a-time (law 10 applies to bring-up legs on a
+15 GB box). The old 7.1 finding stands unchanged: no qwen35-DENSE family exists upstream or
+here — dense models ride llama.cpp's Vulkan backend (serve-swift27.sh, 87/15.5 tok/s); that is
+not a port gap, it is Strata's scope.
+
+(Phase 7-old, the qwen35-dense authoring sketch, stays below as history.)
 
 ---
 
@@ -192,7 +233,7 @@ Unit gate every commit: `ctest --test-dir build-vk`. Model gate from Phase 2 on:
 
 ---
 
-## Phase 7 — DROPPED 2026-10-23 (user decision)
+## Phase 7-dense-DROPPED 2026-10-23 (user decision; history, superseded by the Phase 7 above 2026-11-04)
 
 Swift-1.5-Qwen3.8-27B is DENSE: no routed experts to stream, so Strata's design gives it
 nothing (llama.cpp baseline 87/15.5 tok/s stands as the today-path, tools/vulkan/serve-swift27.sh).
