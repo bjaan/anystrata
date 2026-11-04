@@ -182,8 +182,11 @@ engine, started as a child with `--serve` added and spoken to over its line prot
 modes: [docs/MEMORY_LAYOUT.md](docs/MEMORY_LAYOUT.md). The server answers `/v1/chat/completions` (streaming and
 not), `/v1/models`, `/health`, `/props`, `/tokenize`, `/detokenize`, one request at a time.
 
-Vulkan, the default — Qwen3.6-35B-A3B 2-bit GSQ (chtisgit's hybrid conversion of ISTA-DASLab's checkpoint; 12.2 GB;
-all 10,240 routed experts in VRAM) on a Mesa-AMD card, with the Qwen3.6 sampling defaults:
+Vulkan, the default — Qwen3.6-35B-A3B 2-bit GSQ ([chtisgit's hybrid conversion](https://huggingface.co/chtisgit/Qwen3.6-35B-A3B-2Bit-GSQ-hybrid-GGUF)
+of [ISTA-DASLab's checkpoint](https://huggingface.co/ISTA-DASLab/Qwen3.6-35B-A3B-2Bit-GSQ); 12.2 GB, sha256
+`8e50912f5d0703401ca21b09deb2ee8a84d03536ade6fb44815fcb40a0b03596` — the file this port gates on; the engine
+fetches nothing, download it and point `--model` at it; all 10,240 routed experts fit in VRAM on this class of
+card) on a Mesa-AMD card, with the Qwen3.6 sampling defaults:
 
 ```
 build-vk/bin/anystrata --engine build-vk/bin/anystrata-gguf-vk \
