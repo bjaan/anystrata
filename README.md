@@ -42,7 +42,9 @@ first. This repo carries the port of that engine, kernel by kernel and parity te
 (`vulkan/`): the cards nobody's CUDA serves — AMD APUs Mesa keeps as RADV homes, integrated graphics, and
 oddities like the BC-250, a repurposed PS5 board with 16 GB of unified memory that ROCm refuses to see. On one
 such board, Qwen3.6-35B-A3B at 2 bits keeps all 10,240 routed experts resident in VRAM, decodes ~19 tok/s, and
-answers `pi` and other coding agents over the OpenAI API.
+answers `pi` and other coding agents over the OpenAI API. It is not one card's port: the same Vulkan engine
+served Qwen3.6-35B-A3B successfully on an **RTX 4070 Laptop with only 8 GB of VRAM** — experts streaming
+around a card too small to hold them (Windows section below; the measured table there is its record).
 
 The port is held to the fork's correctness culture: integer arithmetic is **bitwise** against the CUDA tree (a
 parity suite of ~50,000 outputs, zero differences, across every quantized weight format the models use — Q2_0,
@@ -481,6 +483,21 @@ time, mmap forced, and an oom-score above the session's.
         She belongs to every card that runs the engine.
         Cute, but she documents it.
       </p>
+    </td>
+  </tr>
+  <tr>
+    <td width="280" valign="top">
+      <img src="vulkan/docs/silly.png"
+           alt="Silly the crate-bird"
+           width="260" />
+    </td>
+    <td valign="top">
+      <strong>Silly</strong> — the crate-bird, and the load path.
+      A round teal seabird (skillfish species: the BC-250's die codename is <em>Cyan
+      Skillfish</em>) hauling an <strong>18-byte crate</strong>: exactly one Q2_0 block —
+      32 weights at 2 bits plus its fp16 scale — the unit most routed experts of an MoE
+      arrive at the card in. Every expert the engine streams is one crate in her beak;
+      she is how 12.2 GB gets where 8.4 of it fits.
     </td>
   </tr>
 </table>
