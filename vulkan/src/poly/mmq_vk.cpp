@@ -44,4 +44,17 @@ void Mmq::mul(const void*, int, int64_t, int64_t, size_t, int, const void*, cons
     strata::vk_engine::missing("strata::poly::Mmq::mul (ggml-cuda mul_mat_q_case)");
 }
 
+bool Mmq::tab(int) {
+    // No pointer-table instance is built for this backend (same shape as fits()): the honest answer is
+    // "this build has no such kernel", so engine.cpp keeps runs-of-slots launches. Defined so the
+    // shared engine links; reached only where fits() said true, which on this backend is nowhere.
+    return false;
+}
+
+bool Mmq::mul_tab(const void* const*, int, int64_t, int64_t, int, const void*, const int32_t*,
+                  const int32_t*, int64_t, int64_t, float*, int64_t, void*) {
+    strata::vk_engine::missing("strata::poly::Mmq::mul_tab (ggml-cuda mul_mat_q_tab)");
+    return false;
+}
+
 }  // namespace strata::poly
