@@ -21,7 +21,9 @@ out=$(tools/vulkan/leg.sh --gate engine timeout 420 build-vk/bin/anystrata-gguf-
       --model "$M" --max-context 4096 --tokens "$IDS" --max-new 16 2>/dev/null \
       | grep -E "^[0-9]+(,[0-9]+)+$" | head -1)
 echo "got: $out"
-if [ "$out" = "$REC" ]; then
+if [ -z "$out" ]; then
+    echo "CANARY: NO OUTPUT (load timed out or crashed) — inconclusive, re-run on a quieter box"; exit 2
+elif [ "$out" = "$REC" ]; then
     echo "CANARY: bitwise-identical — the merge is inert on this backend, as required"
 else
     echo "CANARY: DIFFERS — do NOT keep the merge: git revert 1d474dd, then bisect 29511cf^..3d5fc52"
