@@ -106,6 +106,9 @@ target_include_directories(strata_vk_blas PUBLIC
   ${STRATA_ROOT}/include)
 target_link_libraries(strata_vk_blas PUBLIC strata_vk_runtime)
 add_library(strata_vk_compat INTERFACE)
+# STRATA_VULKAN: the ONE platform marker the host sources may ask about (native_head.cpp's VRAM
+# fallback for the no-alias case); everything else about the compat layer stays name-transparent.
+target_compile_definitions(strata_vk_compat INTERFACE STRATA_VULKAN=1)
 target_include_directories(strata_vk_compat BEFORE INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/vulkan_compat)
 target_link_libraries(strata_vk_compat INTERFACE strata_vk_runtime strata_vk_blas)
 
@@ -638,7 +641,8 @@ target_link_libraries(strata_vk_kernel_gdn PUBLIC strata_vk_runtime strata_vk_co
 # wins; strata_vk_stubs is the tail.)
 add_library(strata_vk_stubs STATIC src/engine/missing.cpp src/engine/stubs_gen.cpp)
 target_include_directories(strata_vk_stubs PUBLIC
-  ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/vulkan_compat)
+  ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/vulkan_compat
+  ${STRATA_VK_GGML_DIR}/src)   # missing.cpp's byte tables include ggml-common.h (block_* structs)
 target_link_libraries(strata_vk_stubs PUBLIC strata_vk_runtime)
 
 # ---- probe: asserts the device's Vulkan surface the port needs (dp4a executes, subgroups force to 32),
@@ -916,4 +920,113 @@ target_include_directories(poly_draft_race_test_vk PRIVATE ${STRATA_ROOT}/includ
 target_link_libraries(poly_draft_race_test_vk PRIVATE
   ${VK_POLY_ENGINE_LIBS}
   strata_vk_compat strata_vk_stubs
+  Threads::Threads)
+
+# ---- Phase 7.1 (first rung): anystrata-pack-vk — the pack engine's link shape on Vulkan ----
+# The Task-1.4 recipe applied to the qwen4exp/pack engine (src/program/generate.cpp, UNCHANGED: it
+# syntax-compiles against the compat layer clean). The CUDA target links strata_engine + strata_prefill
+# + strata_spec + strata_qwen35; here the .cu libraries are replaced the same way as for poly:
+#  - strata_kernels (49 CUDA .cu files): ALREADY replaced by strata_vk_stubs (Task 1.2), the whole
+#    strata::kernels surface trapped by name;
+#  - strata_prefill's kernels (prefill/gemm.cu, kernels.cu: 61 __global__ between them): trapped by the
+#    generated roster vulkan/src/pack/stubs_gen.cpp (tools/gen_pack_stubs.py over prefill/kernels.hpp,
+#    gemm.hpp, moe_mmq.hpp — 31 free launchers); prefill.cpp itself is pure host and compiles unchanged;
+#  - strata_qwen35 (q36_engine.cu, 4k lines, kernels TU-internal): its whole public contract is one
+#    function (strata::qwen35::run) — trapped at that seam (q36_run_trap.cpp): the family says so loudly;
+#  - remote_expert_opt.cu (2 kernels, --remote-expert-opt only): method-level traps (remote_expert_opt_trap.cpp);
+#  - strata_engine's other TUs are pure host: layer.cpp's one __global__ sits inside a CUDA guard.
+# The link today is EXPECTED to halt at the first demanded pack kernel: the traps ARE the roster, and
+# the halt point advancing is the bring-up bar (PORT-STATUS 'model-demanded order', Phase 0's method).
+# Model files (docs/MODEL-FILES.md): GGUF shards on external media, the pack tree + mtp/ built by
+# tools/iq_pack.py into ~/models (mtp from robertkarl/UnbiasedStrataPacks).
+add_library(strata_vk_pack_stubs STATIC
+  src/pack/stubs_gen.cpp src/pack/q36_run_trap.cpp src/pack/remote_expert_opt_trap.cpp src/pack/gemm_trap.cpp)
+target_include_directories(strata_vk_pack_stubs PUBLIC
+  ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/vulkan_compat)
+target_link_libraries(strata_vk_pack_stubs PUBLIC strata_vk_runtime)
+
+set(VK_PACK_ENGINE_SRC
+  ${STRATA_ROOT}/src/core/layer.cpp
+  ${STRATA_ROOT}/src/core/session.cpp
+  ${STRATA_ROOT}/src/core/expert_source.cpp
+  ${STRATA_ROOT}/src/core/remote_experts.cpp
+  ${STRATA_ROOT}/src/core/expert_cache.cpp
+  ${STRATA_ROOT}/src/core/native_head.cpp
+  ${STRATA_ROOT}/src/core/native_dense.cpp
+  ${STRATA_ROOT}/src/core/verify.cpp
+  ${STRATA_ROOT}/src/core/mtp.cpp
+  ${STRATA_ROOT}/src/core/conversation_snapshot.cpp
+  ${STRATA_ROOT}/src/core/conversation_state.cpp
+  ${STRATA_ROOT}/src/core/conversation_memory.cpp
+  ${STRATA_ROOT}/src/core/peer_experts.cpp
+  ${STRATA_ROOT}/src/core/arch_defaults.cpp
+  ${STRATA_ROOT}/src/core/vmm.cpp
+  ${STRATA_ROOT}/src/core/conversation_file.cpp
+  ${STRATA_ROOT}/src/prefill/prefill.cpp
+  ${STRATA_ROOT}/src/spec/suffix_drafter.cpp
+  ${STRATA_ROOT}/src/spec/controller.cpp
+  ${STRATA_ROOT}/src/spec/draft_policy.cpp
+  ${STRATA_ROOT}/src/spec/draft_source.cpp
+  ${STRATA_ROOT}/src/core/weights.cpp
+  ${STRATA_ROOT}/src/core/layout.cpp
+  ${STRATA_ROOT}/src/platform/memory.cpp
+  ${STRATA_ROOT}/src/core/graph.cpp
+  # ngram.cpp/PleTable: host-only by its own CMake note (it lives in strata_kernels only to share
+  # geometry constants with ple.cu); compile unchanged, like prefill.cpp.
+  ${STRATA_ROOT}/src/kernels/ngram.cpp
+  ${STRATA_ROOT}/src/ngram/ple_reader.cpp    # PleReader: host-side mmap/SSSE3 (0 CUDA constructs); same rule as ngram.cpp
+  ${STRATA_ROOT}/src/platform/direct_file.cpp)  # the O_DIRECT reader behind it: host, _WIN32 branches aside
+# strata_kernels_cpu's four .cpp files, compiled here with the same per-file ISA flags the CUDA build
+# uses (the pool probes at runtime; gfx1013's host has AVX-512 per PORT-NOTES) — not a CUDA target,
+# so it does not exist in this subproject.
+add_library(strata_vk_kernels_cpu STATIC
+  ${STRATA_ROOT}/src/kernels/cpu/expert.cpp
+  ${STRATA_ROOT}/src/kernels/cpu/pool.cpp
+  ${STRATA_ROOT}/src/kernels/cpu/expert_layout.cpp
+  ${STRATA_ROOT}/src/kernels/cpu/q2_avx2.cpp
+  ${STRATA_ROOT}/src/kernels/cpu/native_expert.cpp
+  ${STRATA_ROOT}/src/kernels/cpu/iq_avx512.cpp
+  ${STRATA_ROOT}/src/kernels/cpu/iq_avx2.cpp
+  ${STRATA_ROOT}/src/kernels/cpu/kq_avx2.cpp
+  ${STRATA_ROOT}/src/kernels/cpu/kq_avx1.cpp
+  ${STRATA_ROOT}/src/kernels/cpu/q2_avx1.cpp
+  ${STRATA_ROOT}/src/kernels/cpu/iq_avx1.cpp
+  ${STRATA_ROOT}/src/kernels/cpu/nvfp4_avx512.cpp
+  ${STRATA_ROOT}/src/kernels/cpu/nvfp4_avx2.cpp
+  ${STRATA_ROOT}/src/kernels/cpu/tq_cpu.cpp
+  ${STRATA_ROOT}/src/kernels/cpu/tq_avx2.cpp
+  ${STRATA_ROOT}/src/kernels/cpu/tq_avx512.cpp)
+target_include_directories(strata_vk_kernels_cpu PUBLIC ${STRATA_ROOT}/include
+  PRIVATE ${STRATA_VK_GGML_DIR}/src ${STRATA_ROOT}/third_party/ggml)   # ggml-common.h + the trellis tq header, like the root target
+# the native-IQ expert tier: the same define the root build puts on strata_kernels_cpu's users
+# (expert_layout.cpp guards its native path with it at COMPILE time, so the library needs it too)
+target_compile_definitions(strata_vk_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
+# the same per-file ISA flags as the root build (strata_kernels_cpu): expert.cpp is the AVX-512 pool,
+# the q2/iq/kq *_avx1.cpp files run behind cpu_avx1_ok() on a probe (one library: no static-link cycle)
+set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/expert.cpp
+  PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
+set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/iq_avx512.cpp ${STRATA_ROOT}/src/kernels/cpu/nvfp4_avx512.cpp ${STRATA_ROOT}/src/kernels/cpu/tq_avx512.cpp
+  PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mavx512vpopcntdq;-mbmi2;-mf16c;-mfma")
+set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/nvfp4_avx2.cpp ${STRATA_ROOT}/src/kernels/cpu/tq_avx2.cpp
+  PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/q2_avx2.cpp ${STRATA_ROOT}/src/kernels/cpu/iq_avx2.cpp ${STRATA_ROOT}/src/kernels/cpu/kq_avx2.cpp
+  PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/kq_avx1.cpp
+  PROPERTIES COMPILE_OPTIONS "-mavx")
+set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/iq_avx1.cpp
+  PROPERTIES COMPILE_OPTIONS "-msse4.2;-mavx;-mno-avx2;-mno-fma;-mno-f16c")
+set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/q2_avx1.cpp
+  PROPERTIES COMPILE_OPTIONS "-msse4.2;-mavx;-mno-avx2;-mno-fma;-mno-f16c")
+
+add_executable(anystrata-pack-vk
+  ${STRATA_ROOT}/src/program/generate.cpp
+  ${VK_PACK_ENGINE_SRC})
+target_include_directories(anystrata-pack-vk PRIVATE
+  ${STRATA_ROOT}/include ${STRATA_VK_GGML_DIR}/include ${STRATA_ROOT}/src/poly)
+target_compile_definitions(anystrata-pack-vk PRIVATE STRATA_HAVE_QWEN35=1 STRATA_NATIVE_EXPERTS=1)
+target_link_libraries(anystrata-pack-vk PRIVATE
+  strata_vk_kernels_cpu
+  ${VK_POLY_ENGINE_LIBS}
+  strata_vk_pack_stubs                          # pack rosters before the global stubs
+  strata_vk_compat strata_vk_stubs              # global stubs last: the link tail
   Threads::Threads)

@@ -37,7 +37,16 @@ PORTED = {"s2_gemv", "dequant_s2", "native_quantize_q8_1", "native_mmvq", "nativ
 # the CUDA build too — the engine's load path asks them before any kernel is launched, and trapping
 # them would route the whole load through a different format than the CUDA engine picks.
 HOST_DEFINED = {"cvec", "native_mmvq_supported", "native_mmvq_ids_supported", "native_mmvq_il_supported",
-                "native_q8_1_bytes", "native_q8_1_il_bytes"}
+                "native_q8_1_bytes", "native_q8_1_il_bytes",
+                # Phase 7.1: the native-expert tier's capability/byte queries — pure host arithmetic
+                # transcribed verbatim into missing.cpp (same rule as native_mmvq_supported: trapping a
+                # load-path QUESTION re-routes the whole model through another tier than CUDA's build).
+                "iq_row_bytes", "native_expert_supported", "native_expert_layout",
+                "native_expert_scratch_bytes",
+                # the rope table builders + the rope config: host float64 loops (rope.cu:45-86),
+                # transcribed verbatim above; bitwise what CUDA computes
+                "rope_scaling_set", "rope_scaling", "build_rope_table",
+                "iq_supported", "embed_type_supported"}
 
 # ---- N/A: ledger rows whose state is `n/a` — these must NOT trap (the engine's
 # verify.cpp evaluates pdl_supported() on EVERY run, graphs or not; a trap there
@@ -45,6 +54,16 @@ HOST_DEFINED = {"cvec", "native_mmvq_supported", "native_mmvq_ids_supported", "n
 # vulkan/src/engine/missing.cpp instead: PDL is an NVIDIA launch feature, the
 # honest answer is "not supported, scope off" — the CUDA build's own fallback.
 NA = {"pdl_scope", "pdl_supported"}
+
+# ---- HOST_TU: bodyless in the headers only because their .cu sibling shares the library; a PURE-HOST
+# translation unit defines them, and the Phase-7.1 pack target compiles that TU unchanged
+# (src/kernels/ngram.cpp — its own CMake note: host-only, in strata_kernels only for the geometry
+# constants). Trapping them would collide with the real definitions; poly never references them, so
+# dropping the traps costs the poly link nothing.
+HOST_TU = {"bf16_dequant_row", "fp8_e4m3_dequant_row", "iq4nl_code", "iq4nl_dequant_row",
+           "ngram_mixed", "ngram_rows", "ple_artifact_consts", "ple_format_count",
+           "ple_format_for_type", "ple_format_info", "ple_format_list", "ple_formats",
+           "ple_prefetch_enable", "ple_prefetch_enabled"}
 
 CLANG = os.environ.get("CLANGXX", "clang++")
 INCLUDES = ["-I", os.path.join(ROOT, "vulkan", "include", "strata", "vulkan_compat"),
@@ -172,7 +191,8 @@ def main():
     kernels_decls = [d for d in decls if d["qual"].startswith("strata::kernels::")]
     def simple(d): return d["qual"].rsplit("::", 1)[1]
     to_trap = [d for d in kernels_decls
-               if simple(d) not in PORTED and simple(d) not in HOST_DEFINED and simple(d) not in NA]
+               if simple(d) not in PORTED and simple(d) not in HOST_DEFINED and simple(d) not in NA
+               and simple(d) not in HOST_TU]
     seen = {simple(d) for d in kernels_decls}
 
     # ledger cross-check 2: every todo-row name that IS a header contract function got a trap
