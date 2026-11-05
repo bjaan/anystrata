@@ -952,6 +952,21 @@ identically; eager control on current main is clean - the earlier "eager collaps
 was an instrument bug: the run() helper never passed "$@", so --no-graphs never reached
 the engine; caught by re-running with env/args honored).
 
+FIX SHIPPED (2026-11-05, branch task-6.0-head-capture): the stale binding is the WINDOWED HEAD
+capture replayed after the window's halves shift rows/snapshots. follow()'s slot writes churn
+the caches mostly-fresh (recorded=1623 vs replayed=57 in the collapse combo), and a slot-move
+retire did NOT fix it (traced: captures already empty at the slot write) — the mechanism is the
+snapshot/row state baked at record time, not the expert address. The fix: while the cache MOVES
+(n_swap_ > 0, the swap regime), head launches record fresh instead of replaying (one condition
+on the three heads-replay sites); full residency keeps replaying bitwise as before. Measured:
+the old collapse combo (swap+graphs+lookup defaults) is byte-for-byte vs the recorded canary at
+16 AND 96 tokens; eager-swap, nolookup, and the full-residency serve path all EXACT; the regime
+is FASTER than the --no-graphs workaround (7.4 vs 5.2-6.2 tok/s: shared/tail/card captures still
+replay) — so the swap-regime recommendation upgrades from --no-graphs to graphs-on.
+Dead ends recorded honestly: slot-move retire (empty at that moment), halves-off probe (invalid
+env var, never existed), mask arithmetic that read as passes_ staleness (the mask-63 leg differed
+from mask-1 only via the logits site; the heads site was the constant).
+
 Candidate fix next session: retire per-layer capture keys when a swap moved that layer's slots
 (the slot table is host-visible to the engine; record() lifetime belongs to the engine), or
 replay-gate on all_cached() at launch time and drop to eager when the cache moved - matching

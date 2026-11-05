@@ -2725,6 +2725,21 @@ int Engine::room_key(int n) const {
 }
 
 // Records what `work` hands to the stream, as a graph that is launched with one call from then on.
+// Task 6.0 bisect instrument (port work, both backends): STRATA_NO_REPLAY=<mask> drops capture SITES
+// from their replay test - eager launches there, graphs everywhere else - so a stale-binding collapse
+// can be pinned to the capture(s) whose content goes stale. Mask bits:
+//   1 heads (L.heads, windowed + eval)   2 shared expert   4 tail   8 rows_heads (batched heads)
+//  16 card_moe   32 logits (tail_).
+// Task 6.0 (PORT-STATUS): a layer's head capture bakes the snapshot/row state as it stood at record time.
+// While the expert cache MOVES (swap regime: n_swap_ > 0), window halves shift rows and re-stage states, so a
+// REPLAY of a head whose snapshot row moved reads the wrong recurrent state — the id-0 collapse (BC-250,
+// RADV) / segfault (NVIDIA, Windows). Every head launch therefore records fresh in that regime; measured it is
+// FASTER than the eager toggle all round (7.4 vs 5.2-6.2 tok/s: the other captures still replay) and byte-exact
+// vs the recorded canary. Full residency (n_swap_ == 0 — every serve today) keeps replaying, bitwise as before.
+static int no_replay_mask() {
+    static const int v = getenv("STRATA_NO_REPLAY") ? atoi(getenv("STRATA_NO_REPLAY")) : 0;
+    return v;
+}
 template <class F>
 void* Engine::record(F&& work) {
     cudaGraph_t g = nullptr;
@@ -2813,17 +2828,17 @@ void Engine::run(const int32_t* tokens, int n) {
     const auto up = [&](int il, int m, size_t rec) {
         Layer& L = layers_[(size_t) il];
         const size_t head = (size_t) head_key(il, m) * recs + rec;
-        if (replay && L.fixed) replayed(L.heads, head, [&] { layer_head(L, il, m); });
+        if (replay && L.fixed && n_swap_ == 0 && !(no_replay_mask() & 1)) replayed(L.heads, head, [&] { layer_head(L, il, m); });
         else layer_head(L, il, m);
         if (!L.moe || batched(L, m)) return;
         ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
-        if (replay) replayed(L.shared, rec, [&] { moe_shared(L, il, m); });
+        if (replay && !(no_replay_mask() & 2)) replayed(L.shared, rec, [&] { moe_shared(L, il, m); });
         else moe_shared(L, il, m);
     };
     const auto tail = [&](int il, int m, size_t rec) {
         Layer& L = layers_[(size_t) il];
         dbg("ffn", il, fo_, n_embd_);
-        if (replay && L.fixed) replayed(L.tail, rec, [&] { layer_tail(L, il, m); });
+        if (replay && L.fixed && !(no_replay_mask() & 4)) replayed(L.tail, rec, [&] { layer_tail(L, il, m); });
         else layer_tail(L, il, m);
     };
 
@@ -3036,7 +3051,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n) {
             pos_ = keep;
             rows_of_ = rows.data();
             n_rows_of_ = n;
-            if (replay && L.fixed) {
+            if (replay && L.fixed && n_swap_ == 0 && !(no_replay_mask() & 8)) {
                 void*& made = L.rows_heads[key];
                 if (!made) made = record([&] { layer_head(L, il, n); });
                 ck(cudaGraphLaunch((cudaGraphExec_t) made, cs(st_)), "layer graph");
@@ -3050,7 +3065,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n) {
                 shift_rows(i);
                 pos_ = at[(size_t) i];
                 const size_t head = (size_t) head_key(il, 1) * recs + 3 * wn + (size_t) i;
-                if (replay && L.fixed) replayed(L.heads, head, [&] { layer_head(L, il, 1); });
+                if (replay && L.fixed && n_swap_ == 0 && !(no_replay_mask() & 1)) replayed(L.heads, head, [&] { layer_head(L, il, 1); });
                 else layer_head(L, il, 1);
                 shift_rows(-i);
                 pos_ = at[(size_t) i];
@@ -3061,9 +3076,9 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n) {
             moe_rows(L, il, n);
         } else {
             ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
-            if (replay) replayed(L.shared, rec, [&] { moe_shared(L, il, n); });
+            if (replay && !(no_replay_mask() & 2)) replayed(L.shared, rec, [&] { moe_shared(L, il, n); });
             else moe_shared(L, il, n);
-            if (card && L.card == 1 && replay) {
+            if (card && L.card == 1 && replay && !(no_replay_mask() & 16)) {
                 replayed(L.card_moe, rec, [&] { moe_card(L, il, n); });
                 stats_.gpu_experts += n * n_used_;
             } else if (card && moe_card(L, il, n)) {
@@ -3072,7 +3087,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n) {
                 moe_add(n);
             }
         }
-        if (replay && L.fixed) replayed(L.tail, rec, [&] { layer_tail(L, il, n); });
+        if (replay && L.fixed && !(no_replay_mask() & 4)) replayed(L.tail, rec, [&] { layer_tail(L, il, n); });
         else layer_tail(L, il, n);
     }
 
@@ -3150,7 +3165,7 @@ void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
     }
     // The model's output: the last token's for the logits, and every token's for the draft block.
     if (want_logits || draft_) {
-        const bool replay = opt_.graphs && n == 1 && want_logits && !opt_.dump;
+        const bool replay = opt_.graphs && n == 1 && want_logits && !opt_.dump && !(no_replay_mask() & 32);
         const int m = draft_ ? n : 1;
         float* h = draft_ ? hn_ + n_embd_ : xn_;
         const auto tail = [&] {
