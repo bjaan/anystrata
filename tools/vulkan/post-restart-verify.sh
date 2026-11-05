@@ -30,6 +30,15 @@ else
     exit 1
 fi
 
+echo "== swap-regime canary (the regime the 16-id full-residency pass cannot see)"
+out2=$(tools/vulkan/leg.sh --gate engine timeout 420 build-vk/bin/anystrata-gguf-vk \
+      --model "$M" --max-context 4096 --vram-reserve-mib 11000 --tokens "$IDS" --max-new 16 2>/dev/null \
+      | grep -E "^[0-9]+(,[0-9]+)+$" | head -1)
+echo "got: $out2"
+if [ -z "$out2" ]; then echo "SWAP CANARY: no output (load timed out) — inconclusive"; exit 2
+elif [ "$out2" = "$REC" ]; then echo "SWAP CANARY: bitwise-identical (Task 6.0 regime holds)"
+else echo "SWAP CANARY: DIFFERS — a core change broke the swap regime (head-capture staleness, Task 6.0 history)"; exit 1; fi
+
 echo "== perf leg (max-new 96) for the docs table"
 tools/vulkan/leg.sh --gate engine timeout 420 build-vk/bin/anystrata-gguf-vk \
     --model "$M" --max-context 4096 --tokens "$IDS" --max-new 96 2>/dev/null \

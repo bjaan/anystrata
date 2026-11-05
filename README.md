@@ -195,11 +195,14 @@ build-vk/bin/anystrata --engine build-vk/bin/anystrata-gguf-vk \
   -- --model /models/Qwen3.6-35B-A3B-GSQ-hybrid.gguf --max-context 16384
 ```
 
-(Captured graphs are the default and bitwise-verified inert on this backend — `--no-graphs`
-remains as an A/B toggle for debugging, and is the recommended setting for the SWAP regime
-(`--vram-reserve-mib` big enough that experts leave the card): a deterministic collapse there
-is recorded as an open bug in `vulkan/PORT-STATUS.md`; every full-residency serve config on
-this box — including 64K with `--kv q8_0` — runs on graphs and is verified bitwise.)
+(Captured graphs are the default and bitwise-verified inert on this backend, in **both** regimes:
+full residency and the expert-SWAP regime (`--vram-reserve-mib` big enough that experts leave the
+card). The swap regime's collapse bug — six weeks open, graphs replaying a stale windowed head
+capture after the halves shifted rows — is fixed by recording head captures fresh while the cache
+moves (`vulkan/PORT-STATUS.md` Task 6.0): byte-for-byte canary at 16 and 96 tokens, and 7.4 tok/s
+against the old workaround's 5.2-6.2, so `--no-graphs` stays only as an A/B toggle for debugging.
+Every full-residency serve config on this box — including 64K with `--kv q8_0` — runs on graphs
+and is verified bitwise.)
 
 `--max-context` on this APU: **16K / 32K with the fp16 cache, and 64K with `--kv q8_0`** — the
 q8_0 KV cache (int8 codes, one fp16 scale per 32 values: 544 bytes a row where fp16 costs 1,024)
@@ -326,9 +329,11 @@ Both answered the test prompt correctly, and their first 32 generated token ids 
 
 Known limits on Windows:
 
-* **Vulkan with a model larger than VRAM needs `--no-graphs`** (or `--lookup 0`). This is the open graphs + expert-SWAP
-  + lookup-guesser bug recorded in `vulkan/PORT-STATUS.md`. On the BC-250 it collapses the output to id-0s; on
-  NVIDIA under Windows the engine crashes mid-generation instead.
+* **Vulkan with a model larger than VRAM:** the graphs + expert-SWAP + lookup-guesser bug that made that
+  configuration collapse to id-0s (BC-250) or crash mid-generation (NVIDIA/Windows) is FIXED on branch
+  `task-6.0-head-capture` (swap-regime head captures record fresh; byte-for-byte canary on the BC-250, and
+  7.4 vs 5.2-6.2 tok/s over the old `--no-graphs` workaround). Until it merges into your build, run the
+  swap regime with `--no-graphs` or `--lookup 0`. The Windows card should re-run its arm once merged.
 * **`ctest` in `build-vk` passes 13 of 17 on a card that is not a BC-250.** The other four are pinned to that board:
   `vk_core_smoke` asserts its 24 CUs, `vk_doorbell_probe` spins a kernel longer than Windows' 2 s GPU timeout allows,
   and `native_mmvq_vk_parity` / `poly_kernels_vk_parity` expect RADV's bitwise floats, where NVIDIA's shader compiler
@@ -439,7 +444,7 @@ inert at full residency, are both in; rows re-run on 2026-11-04 carry that date,
 | the canary | `17*23?` -> 391, 16 ids bitwise-fixed per configuration; run after every change ([docs/CANARY.md](docs/CANARY.md)) |
 | upstream merge 1d474dd (`--stage-rows` streaming + `--mmq-tab`, shared engine core) | canary bitwise-identical on the BC-250; decode at full residency 25.4 tok/s (96-token leg) — the best measured here; upstream's own cards gained 20.6 -> 26.5-29.3 tok/s decode streaming and 94.6 vs 68.1 t/s prefill with `--mmq-tab` (5090/1060-class, CUDA; their numbers, not this box's) |
 | context on the APU | 16K / 32K stable (14.1 / 13.9 GB resident); 64K live with `--kv q8_0` — the whole q8 chain (store, prefill workspace read, fused decode read) ported, parity-green and correctness-scored — PORT-NOTES laws 10-13 |
-| swap regime (experts streaming, 4096-ctx legs, current main) | eager: 5.2-6.2 tok/s at 50-55.5% residency, canary **byte-for-byte vs the recorded line** (re-verified 2026-11-04); graphs+`--lookup 0`: no collapse, answers 391 (its guess-off continuation drifts one echo token — a second-order path difference, not the bug); graphs+`--lookup` (defaults): collapses to id-0s — the open Task 6.0 bug; merge `1d474dd` proven innocent (pre-merge binary collapses identically), and the STRATA_NO_REPLAY battery pinned the site: only the per-layer HEAD captures go stale — killing them alone restores byte-for-byte correctness |
+| swap regime (experts streaming, 4096-ctx legs, current main) | eager: 5.2-6.2 tok/s at 50-55.5% residency, canary **byte-for-byte vs the recorded line** (re-verified 2026-11-04); graphs+`--lookup 0`: no collapse, answers 391 (its guess-off continuation drifts one echo token — a second-order path difference, not the bug); graphs+`--lookup` (defaults) collapsed to id-0s — the Task 6.0 bug: the windowed HEAD capture replays a stale snapshot/row state once the halves shift; fixed by recording heads fresh while the cache moves (byte-exact at 16/96 tokens, 7.4 vs 5.2-6.2 tok/s over the workaround; merge `1d474dd` proven innocent, pre-merge binary collapsed identically) |
 | memory on the 15.7 GiB unified board | boot: 15,714 MiB total / 14,780 MiB free. Full serve: 8.4 GiB expert arena, ~14.1 GB resident at 64K q8_0 — ~1.5-2 GB free for the desktop afterward; `leg.sh` blocks a second engine load under 10,500 MB available (law 10, the crash-week lesson): one load at a time, always |
 | correctness gate (teacher-forced vs llama.cpp at the pin) | base arm 1,678 steps: step-weighted KL 1.39x llama.cpp's own CPU-vs-GPU floor (bar: 1.5x); argmax agrees at every gap>=0.5-nat position but one near tie; draft arm bitwise-inert (T0); q8_0-KV arm 1,096 steps at 1.82x (the storage trade, zero argmax flips); graphs bitwise-inert — table in `vulkan/PORT-STATUS.md` |
 
@@ -460,8 +465,8 @@ The full story, and how to run it: [docs/CANARY.md](docs/CANARY.md).
 
 Read [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) and the backend pages before filing anything. The Vulkan
 port's open items are enumerated in `vulkan/PORT-STATUS.md`: captured graphs are the verified default (Phase 4.2
-green and bitwise-inert; `--no-graphs` remains as the A/B toggle and is the recommendation in the expert-SWAP
-regime, where an open capture-vs-swap bug is recorded), prefill tiles are under tuning, and every unported
+green and bitwise-inert, in the expert-SWAP regime too since the Task 6.0 capture-staleness fix; `--no-graphs`
+remains as the A/B toggle), prefill tiles are under tuning, and every unported
 format or path traps by name — loudly, never silently.
 pi's compaction defaults assume >64K windows; serve more context or lower them (USTRAT-8).
 On this APU, llama.cpp reference runs must obey `vulkan/PORT-NOTES.md` rule 10 (their loader copies the

@@ -125,8 +125,11 @@ gate scored at 1.39x llama.cpp's own floor (Phase 5). The full ledger is `../vul
   10 ns/tick, 64 valid bits on the compute family); the host-clock arm stays as the fallback for
   cards without the capability, and `STRATA_VK_NO_GPU_EVENTS=1` forces it for A/B. Both arms are
   pinned by the `vk_event_timing` ctest pair. PORT-NOTES law 15.
-* An open deterministic bug: captured graphs + the expert-SWAP regime + the prompt-tail lookup
-  guesser collapse generation to id-0s (narrowed and worked around in `vulkan/PORT-STATUS.md`:
-  run the swap regime `--no-graphs`; full residency — every config this box serves — is clean).
+* The graphs + expert-SWAP regime collapse (id-0s on the BC-250, crashes on NVIDIA) is FIXED
+  (Task 6.0, branch `task-6.0-head-capture`): while the cache moves, a layer's windowed head
+  captures record fresh instead of replaying a stale snapshot/row state — byte-exact canary at
+  16/96 tokens, 7.4 tok/s vs the 5.2-6.2 of the old `--no-graphs` workaround. Full residency —
+  every config this box serves — was and stays clean, bitwise by construction. The record, the
+  dead ends, and the STRATA_NO_REPLAY site mask: `vulkan/PORT-STATUS.md`.
 * `device_count()` returns 1; multi-GPU/VMM are not ported. The pack engine (`anystrata-pack`,
   qwen4exp) and the dsv41 engine are not ported; every unported path traps BY NAME.
