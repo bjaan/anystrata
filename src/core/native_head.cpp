@@ -165,8 +165,12 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
         } else {
             std::memcpy(host_, gguf.tensor_data(*t), bytes_);
             void* d = nullptr;
-#if defined(STRATA_USE_HIP)
-            // #325: the Windows HIP stack can refuse the device alias of a mapped allocation (and, when it gives
+#if defined(STRATA_USE_HIP) || defined(STRATA_VULKAN)
+            // #325: the Windows HIP stack can refuse the device alias of a mapped allocation
+            // (STRATA_VULKAN: the same situation by measurement, not accident - the Vulkan compat layer
+            // refuses the alias because RADV delivers no live host store to a running kernel and the
+            // arena's offset-pointer space excludes host RAM; vulkan/PORT-NOTES law, doorbell probe.
+            // The table is only gathered from, so VRAM is correct and staged copies keep it fed.) (and, when it gives
             // one, it is the host address itself - unified addressing; kernels read it correctly there, a
             // device-to-device copy into it does not land: tests/hip/mapped_alias). The table is only gathered from,
             // so without an alias it goes into VRAM like the unpinnable case above, instead of failing the start.

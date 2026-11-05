@@ -37,7 +37,16 @@ PORTED = {"s2_gemv", "dequant_s2", "native_quantize_q8_1", "native_mmvq", "nativ
 # the CUDA build too — the engine's load path asks them before any kernel is launched, and trapping
 # them would route the whole load through a different format than the CUDA engine picks.
 HOST_DEFINED = {"cvec", "native_mmvq_supported", "native_mmvq_ids_supported", "native_mmvq_il_supported",
-                "native_q8_1_bytes", "native_q8_1_il_bytes"}
+                "native_q8_1_bytes", "native_q8_1_il_bytes",
+                # Phase 7.1: the native-expert tier's capability/byte queries — pure host arithmetic
+                # transcribed verbatim into missing.cpp (same rule as native_mmvq_supported: trapping a
+                # load-path QUESTION re-routes the whole model through another tier than CUDA's build).
+                "iq_row_bytes", "native_expert_supported", "native_expert_layout",
+                "native_expert_scratch_bytes",
+                # the rope table builders + the rope config: host float64 loops (rope.cu:45-86),
+                # transcribed verbatim above; bitwise what CUDA computes
+                "rope_scaling_set", "rope_scaling", "build_rope_table",
+                "iq_supported", "embed_type_supported"}
 
 # ---- N/A: ledger rows whose state is `n/a` — these must NOT trap (the engine's
 # verify.cpp evaluates pdl_supported() on EVERY run, graphs or not; a trap there

@@ -41,7 +41,8 @@ header helpers, one row per header) | `n/a` (decision `n/a`).
 | quantize_q8_1_rows / iq_mmvq / iq_mmvq_slots / iq_mmvq_ids | iq_kernels.hpp | src/kernels/cuda/iq_kernels.cu | iq_parity.cpp, iq_multi_parity.cpp | `__shfl`, `__shared__` | translate | todo |
 | iq_dequant_f16 / iq_dequant_f32 / iq_embed_rows / iq_dequant_gu_f16 | iq_kernels.hpp | src/kernels/cuda/iq_kernels.cu | iq_parity.cpp | `__shfl`, `__shared__` | translate | todo |
 | iq_xmx_grouped | iq_kernels.hpp | src/kernels/cuda/iq_kernels.cu | native_grouped_parity.cpp | `mma` (matrix-instruction path) | fp32-fallback (docs/AMD_HIP.md: matrix instructions have an ordered-FP32 fallback; CMakeLists.txt tf32-mma fallback at sm_75) | todo |
-| native_expert_grouped / native_expert_layout (mode setters host-side) | iq_kernels.hpp | src/kernels/cuda/iq_kernels.cu | native_expert_parity.cpp, native_grouped_parity.cpp | `__shfl`, `__shared__` | translate | todo |
+| native_expert_grouped (the grouped launch) | iq_kernels.hpp | src/kernels/cuda/iq_kernels.cu | native_expert_parity.cpp, native_grouped_parity.cpp | `__shfl`, `__shared__` | translate | todo |
+| native_expert_supported / _layout / _scratch_bytes, iq_row_bytes | iq_kernels.hpp | src/kernels/cuda/iq_kernels.cu:3570ff | (pure arithmetic; transcribed body vs the CUDA table) | none (type tables) | host (free) | host-defined (missing.cpp, Phase 7.1: the CPU expert tier answers, the kernels stay the launch traps) |
 | nvfp4 expert path | iq_kernels.hpp (cpu/nvfp4_*.hpp) | (nvfp4 — NVIDIA-only format) | nvfp4_expert_gpu_parity.cpp | NVIDIA nvfp4 format | n/a (nvfp4 is an NVIDIA-only format; gfx1013 has no path) | n/a |
 | native_quantize_q8_1 | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu | (unit: poly_kernels_vk_parity.cpp; in-tree family tests cover the mmvq consumers) | `__shfl` (warp chains) | translate | **ported+parity-green** (vulkan/src/kernels/quantize_q8_1.comp, native_quantize_q8_1_vk.cpp) |
 | q8_1 (add_rms_norm_q8_1, swiglu_quantize_q8_1) | native_mmvq.hpp | src/kernels/cuda/native_mmvq.cu (+ q8_1_il.cuh) | mmvq_multi_parity.cpp, mmvq_il_parity.cpp, q5_projection_parity.cpp | `__shfl`, `__shared__` | translate | todo |
@@ -73,9 +74,10 @@ header helpers, one row per header) | `n/a` (decision `n/a`).
 | native_qsa_score | native_qsa_score.hpp | src/kernels/cuda/native_qsa_score.cu | qsa_scores_parity.cpp | `mma`, `asm volatile`, `__shared__` | fp32-fallback (ordered-FP32 scorer, as on HIP without matrix cores) | todo |
 | native_qsa_indexer_append / _batch / _steps / _steps_layers | native_qsa_indexer.hpp | src/kernels/cuda/native_qsa_indexer.cu | qsa_slots_parity.cpp | `__shfl`, `__shared__` | translate | todo |
 | native_flash_attn_short_step | native_flash_attn.hpp | src/kernels/cuda/native_flash_attn.cu | none (covered via batch_rows_parity) | `__shfl`, `__shared__` | translate | todo |
-| rope_neox_pair / build_rope_table / rope_neox_apply | rope.hpp | src/kernels/cuda/rope.cu | rope_parity.cpp | none | translate | todo |
+| rope_neox_pair / rope_neox_apply | rope.hpp | src/kernels/cuda/rope.cu | rope_parity.cpp | none | translate | todo |
+| build_rope_table (both overloads) | rope_scaling.hpp | src/kernels/cuda/rope.cu:48-86 | (host float64 loops, transcribed verbatim) | none | host (free) | host-defined (missing.cpp, Phase 7.1) |
 | rope_tab_cs / mrope_pos (rope/mrope table setters host-side) | mrope.hpp | (inline / rope.cu) | rope_parity.cpp | none | translate | todo |
-| rope_scaling (yarn: rope_yarn_corr_dim / ramp / rope_scaled_angle — inline math) | rope_scaling.hpp | (header-inline) | rope_parity.cpp | none | host-free (compiled-unchanged; CPU/FMA math, GLSL-compatible if device-used) | todo |
+| rope_scaling / rope_scaling_set (the process config pair; yarn math header-inline) | rope_scaling.hpp | src/kernels/cuda/rope.cu:42-46 | rope_parity.cpp | none | host (free) | host-defined (missing.cpp, Phase 7.1) |
 | native_rope_apply / native_qsa_rms_norm_rope | native_rope.hpp | src/kernels/cuda/native_rope.cu | rope_parity.cpp | `__shfl`, `__shared__`, `asm volatile` | translate | todo |
 | router_top10 / router_top10_variant | router_top10.hpp | src/kernels/cuda/router_top10.cu | router_top10_parity.cpp | `__shfl`, `__shared__` | translate | todo |
 | native_router_top10 / _multi / native_router_topk / native_route_resident | native_router.hpp | src/kernels/cuda/native_router.cu | router_top10_parity.cpp, route_resident_parity.cu | `__shfl` | translate | todo |

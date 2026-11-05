@@ -106,6 +106,9 @@ target_include_directories(strata_vk_blas PUBLIC
   ${STRATA_ROOT}/include)
 target_link_libraries(strata_vk_blas PUBLIC strata_vk_runtime)
 add_library(strata_vk_compat INTERFACE)
+# STRATA_VULKAN: the ONE platform marker the host sources may ask about (native_head.cpp's VRAM
+# fallback for the no-alias case); everything else about the compat layer stays name-transparent.
+target_compile_definitions(strata_vk_compat INTERFACE STRATA_VULKAN=1)
 target_include_directories(strata_vk_compat BEFORE INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/vulkan_compat)
 target_link_libraries(strata_vk_compat INTERFACE strata_vk_runtime strata_vk_blas)
 
@@ -638,7 +641,8 @@ target_link_libraries(strata_vk_kernel_gdn PUBLIC strata_vk_runtime strata_vk_co
 # wins; strata_vk_stubs is the tail.)
 add_library(strata_vk_stubs STATIC src/engine/missing.cpp src/engine/stubs_gen.cpp)
 target_include_directories(strata_vk_stubs PUBLIC
-  ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/vulkan_compat)
+  ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/vulkan_compat
+  ${STRATA_VK_GGML_DIR}/src)   # missing.cpp's byte tables include ggml-common.h (block_* structs)
 target_link_libraries(strata_vk_stubs PUBLIC strata_vk_runtime)
 
 # ---- probe: asserts the device's Vulkan surface the port needs (dp4a executes, subgroups force to 32),
@@ -986,15 +990,25 @@ add_library(strata_vk_kernels_cpu STATIC
   ${STRATA_ROOT}/src/kernels/cpu/kq_avx2.cpp
   ${STRATA_ROOT}/src/kernels/cpu/kq_avx1.cpp
   ${STRATA_ROOT}/src/kernels/cpu/q2_avx1.cpp
-  ${STRATA_ROOT}/src/kernels/cpu/iq_avx1.cpp)
+  ${STRATA_ROOT}/src/kernels/cpu/iq_avx1.cpp
+  ${STRATA_ROOT}/src/kernels/cpu/nvfp4_avx512.cpp
+  ${STRATA_ROOT}/src/kernels/cpu/nvfp4_avx2.cpp
+  ${STRATA_ROOT}/src/kernels/cpu/tq_cpu.cpp
+  ${STRATA_ROOT}/src/kernels/cpu/tq_avx2.cpp
+  ${STRATA_ROOT}/src/kernels/cpu/tq_avx512.cpp)
 target_include_directories(strata_vk_kernels_cpu PUBLIC ${STRATA_ROOT}/include
-  PRIVATE ${STRATA_VK_GGML_DIR}/src)   # iq_avx512.cpp includes ggml-common.h, like the root target
+  PRIVATE ${STRATA_VK_GGML_DIR}/src ${STRATA_ROOT}/third_party/ggml)   # ggml-common.h + the trellis tq header, like the root target
+# the native-IQ expert tier: the same define the root build puts on strata_kernels_cpu's users
+# (expert_layout.cpp guards its native path with it at COMPILE time, so the library needs it too)
+target_compile_definitions(strata_vk_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
 # the same per-file ISA flags as the root build (strata_kernels_cpu): expert.cpp is the AVX-512 pool,
 # the q2/iq/kq *_avx1.cpp files run behind cpu_avx1_ok() on a probe (one library: no static-link cycle)
 set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/expert.cpp
   PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
-set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/iq_avx512.cpp
+set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/iq_avx512.cpp ${STRATA_ROOT}/src/kernels/cpu/nvfp4_avx512.cpp ${STRATA_ROOT}/src/kernels/cpu/tq_avx512.cpp
   PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mavx512vpopcntdq;-mbmi2;-mf16c;-mfma")
+set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/nvfp4_avx2.cpp ${STRATA_ROOT}/src/kernels/cpu/tq_avx2.cpp
+  PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
 set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/q2_avx2.cpp ${STRATA_ROOT}/src/kernels/cpu/iq_avx2.cpp ${STRATA_ROOT}/src/kernels/cpu/kq_avx2.cpp
   PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
 set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/kq_avx1.cpp
