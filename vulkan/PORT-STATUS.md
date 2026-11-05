@@ -911,6 +911,10 @@ box): each swap-in skips one full DRAM round trip. Laws: PORT-NOTES 13.
 
 ## Open bug (recorded 2026-10-29, deterministic): graphs + expert-SWAP regime + speculation -> id-0 collapse
 
+**FIXED 2026-11-05** (branch task-6.0-head-capture, 5f49173: swap-regime head captures record fresh; the
+full record with dead ends is at the end of this section — read the FIX SHIPPED paragraph before this
+matrix for what the collapse actually was).
+
 Isolation matrix (hybrid, canary ids, 4096 ctx, max-new 32; `--vram-reserve-mib 11000` forces a
 2.0 GiB expert cache -> ~35% of experts on CPU with the staging thread live):
 
