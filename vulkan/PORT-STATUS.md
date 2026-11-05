@@ -940,6 +940,18 @@ Lanes ruled out (same combo, each mitigated): STAGED arena copies (NO_MAP_ARENA=
 collapse; BATCH=0 (per-launch eager submit, no pending CB) fails DIFFERENTLY - degenerate
 token-18 repetition, not zeros - so the capture/replay record itself is implicated, not the
 copy lane or the barrier-elision cluster.
+SITE PINNED (2026-11-04, STRATA_NO_REPLAY battery, swap regime --vram-reserve-mib 11000,
+canary+32): killing ONLY the heads site (site 0: the windowed/step `layer_head` captures,
+L.heads/L.rows_heads) restores byte-for-byte-correct output (ids 18,30,198,32,25,220,18,
+24,16,13,271,... = recorded line); shared/tail/card_moe/logits kills all still collapse.
+So the stale binding lives in the HEAD capture - what it records about the layer ahead of
+the router is what a slot trade invalidates (candidates: the recorded copy lane's host
+source pointer at capture time, and the router inputs whose arena addresses the head baked
+before follow() moved them). The merge 1d474dd is INNOCENT (pre-merge binary collapses
+identically; eager control on current main is clean - the earlier "eager collapses" fear
+was an instrument bug: the run() helper never passed "$@", so --no-graphs never reached
+the engine; caught by re-running with env/args honored).
+
 Candidate fix next session: retire per-layer capture keys when a swap moved that layer's slots
 (the slot table is host-visible to the engine; record() lifetime belongs to the engine), or
 replay-gate on all_cached() at launch time and drop to eager when the cache moved - matching

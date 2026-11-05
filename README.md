@@ -426,15 +426,21 @@ correctness record with its USTRAT tickets, the pi acceptance runs) are unchange
 `bench/correctness/` and git history at 7551f138. New, from the port itself — **BC-250 (gfx1013 APU, Mesa/RADV:
 no CUDA, no ROCm)** with Qwen3.6-35B-A3B GSQ-hybrid 2-bit, 10,240/10,240 experts resident:
 
+These numbers qualify **main** (engine version `0.1.45`, `CMakeLists.txt`; the `windows-build` merge `7ece380` —
+native MSVC + the discrete-card planner fixes — and upstream's hybrid-performance merge `1d474dd`, canary-verified
+inert at full residency, are both in; rows re-run on 2026-11-04 carry that date, older rows say when).
+
 | Gate | Result |
 | --- | --- |
-| decode (16 / 128 token runs) | 18.3 / up to 24.3 tok/s |
-| prefill (735 / 4,954 token prompts) | 32 / 50 tok/s (5.5x after the GPU tiled GEMM; tuning continues) |
+| decode | 25.4 tok/s (96-token leg, full residency, 2026-11-04 re-run); 16-token legs are load-boundary-bound (10.6-11.5); up to 24.3 across the older 128-token gates |
+| prefill (736 / 4,954 token prompts) | **36.2** / 50 tok/s (736-token leg re-run on current main 2026-11-04, canary ids correct after; 4,954 from the 2026-10-27 tiled-GEMM era) |
 | `pi` coding agent (1.6K-token system prompt) | served repeatedly: 52 s round trip, KV reuse, grammar parse |
 | parity vs the CUDA tree | ~50,000 outputs bitwise; runtime driver laws per GPU, measured |
 | the canary | `17*23?` -> 391, 16 ids bitwise-fixed per configuration; run after every change ([docs/CANARY.md](docs/CANARY.md)) |
 | upstream merge 1d474dd (`--stage-rows` streaming + `--mmq-tab`, shared engine core) | canary bitwise-identical on the BC-250; decode at full residency 25.4 tok/s (96-token leg) — the best measured here; upstream's own cards gained 20.6 -> 26.5-29.3 tok/s decode streaming and 94.6 vs 68.1 t/s prefill with `--mmq-tab` (5090/1060-class, CUDA; their numbers, not this box's) |
 | context on the APU | 16K / 32K stable (14.1 / 13.9 GB resident); 64K live with `--kv q8_0` — the whole q8 chain (store, prefill workspace read, fused decode read) ported, parity-green and correctness-scored — PORT-NOTES laws 10-13 |
+| swap regime (experts streaming, 4096-ctx legs, current main) | eager: 5.2-6.2 tok/s at 50-55.5% residency, canary **byte-for-byte vs the recorded line** (re-verified 2026-11-04); graphs+`--lookup 0`: no collapse, answers 391 (its guess-off continuation drifts one echo token — a second-order path difference, not the bug); graphs+`--lookup` (defaults): collapses to id-0s — the open Task 6.0 bug; merge `1d474dd` proven innocent (pre-merge binary collapses identically), and the STRATA_NO_REPLAY battery pinned the site: only the per-layer HEAD captures go stale — killing them alone restores byte-for-byte correctness |
+| memory on the 15.7 GiB unified board | boot: 15,714 MiB total / 14,780 MiB free. Full serve: 8.4 GiB expert arena, ~14.1 GB resident at 64K q8_0 — ~1.5-2 GB free for the desktop afterward; `leg.sh` blocks a second engine load under 10,500 MB available (law 10, the crash-week lesson): one load at a time, always |
 | correctness gate (teacher-forced vs llama.cpp at the pin) | base arm 1,678 steps: step-weighted KL 1.39x llama.cpp's own CPU-vs-GPU floor (bar: 1.5x); argmax agrees at every gap>=0.5-nat position but one near tie; draft arm bitwise-inert (T0); q8_0-KV arm 1,096 steps at 1.82x (the storage trade, zero argmax flips); graphs bitwise-inert — table in `vulkan/PORT-STATUS.md` |
 
 (llama.cpp's own Vulkan backend on the same card and model: ~76 tok/s decode — the ceiling this backend climbs
