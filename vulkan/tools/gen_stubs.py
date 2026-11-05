@@ -73,7 +73,7 @@ HOST_DEFINED = {"cvec", "native_mmvq_supported", "native_mmvq_ids_supported", "n
                 "native_expert_set_expdec", "native_expert_expdec",
                 "native_expert_set_expdec_params", "native_expert_expdec_params",
                 "native_expert_expdec_takes",
-                "native_q6_k_packed_enabled", "native_expert_set_mode",
+                "native_q6_k_packed_enabled", "native_q6_k_unpack", "native_expert_set_mode",
                 # load-path scratch arithmetic + type tables (transcribed verbatim above)
                 "moe_hit_grouped_scratch_bytes", "shared_expert_scratch_bytes",
                 "argmax_rows_scratch_bytes", "row_top_prob_scratch_bytes", "coupled_draft_scratch_bytes",

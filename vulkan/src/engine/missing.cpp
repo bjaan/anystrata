@@ -36,6 +36,7 @@ void missing(const char* name) {
 
 // ---- the functions the trap roster does NOT cover, defined honestly here
 #include <atomic>
+#include <unordered_map>
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/fused_gr.hpp"
@@ -331,6 +332,17 @@ void native_expert_set_mode(int m) { g_exp_mode = m; }   // bench knob; the laun
 bool native_q6_k_packed_enabled() {
     static const bool enabled = [] { const char* v = std::getenv("STRATA_Q6K_PACKED"); return v && v[0] == '1'; }();
     return enabled;
+}
+// native_q6_k_unpack (native_mmvq.cu:2560): the packed-plane registry's owner-side free — pure host
+// map bookkeeping (no kernel). This backend never packs unless STRATA_Q6K_PACKED=1 routes the run to
+// native_q6_k_pack, which stays a named trap (its plane build is host, but its selftest and the packed
+// mmvq consumer are CUDA-kernel territory); the cleanup path in native_head.cpp/mtp.cpp calls unpack
+// UNCONDITIONALLY, and on CUDA a never-packed weight simply misses the registry and returns. Same here.
+namespace { std::unordered_map<const void*, int>& q6_registry() { static std::unordered_map<const void*, int> r; return r; } }
+void native_q6_k_unpack(const void* weights) {
+    auto found = q6_registry().find(weights);
+    if (found == q6_registry().end()) return;
+    q6_registry().erase(found);   // nothing was ever allocated here: the pack trap would have stopped the run first
 }
 
 // ---- the load-path byte-size questions (a run must ANSWER these to size its scratch before any kernel
