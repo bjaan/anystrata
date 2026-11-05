@@ -61,7 +61,6 @@ namespace strata::kernels { void add_streams_broadcast(const float * p0, const f
 namespace strata::kernels { void argmax_rows(const float * p0, int p1, int p2, void * p3, int32_t * p4, void * p5) { strata::vk_engine::missing("strata::kernels::argmax_rows"); } }
 namespace strata::kernels { uint64_t argmax_rows_scratch_bytes(int p0) { strata::vk_engine::missing("strata::kernels::argmax_rows_scratch_bytes"); return {}; } }
 namespace strata::kernels { bool argmax_rows_wanted() { strata::vk_engine::missing("strata::kernels::argmax_rows_wanted"); return {}; } }
-namespace strata::kernels { void bf16_dequant_row(const uint8_t * p0, float * p1) { strata::vk_engine::missing("strata::kernels::bf16_dequant_row"); } }
 namespace strata::kernels { void bf16_gemv(const uint16_t * p0, const uint16_t * p1, float * p2, int64_t p3, int64_t p4, void * p5) { strata::vk_engine::missing("strata::kernels::bf16_gemv"); } }
 namespace strata::kernels { void bf16_gemv_fp32_mmvf(const float * p0, const uint16_t * p1, float * p2, int64_t p3, int64_t p4, void * p5) { strata::vk_engine::missing("strata::kernels::bf16_gemv_fp32_mmvf"); } }
 namespace strata::kernels { void bf16_gemv_fp32_mmvf_cols(const float * p0, const uint16_t * p1, float * p2, int64_t p3, int64_t p4, int p5, void * p6) { strata::vk_engine::missing("strata::kernels::bf16_gemv_fp32_mmvf_cols"); } }
@@ -114,7 +113,6 @@ namespace strata::kernels { void f32_to_bf16_bulk(const float * p0, uint16_t * p
 namespace strata::kernels { void f32_to_f16_bulk(const float * p0, uint16_t * p1, int64_t p2, void * p3) { strata::vk_engine::missing("strata::kernels::f32_to_f16_bulk"); } }
 namespace strata::kernels { void fetch_blobs(const unsigned long long * p0, const int32_t * p1, uint8_t * p2, int64_t p3, int p4, void * p5) { strata::vk_engine::missing("strata::kernels::fetch_blobs"); } }
 namespace strata::kernels { void force_token(int32_t * p0, const int32_t * p1, int p2, void * p3) { strata::vk_engine::missing("strata::kernels::force_token"); } }
-namespace strata::kernels { void fp8_e4m3_dequant_row(const uint8_t * p0, float p1, float * p2) { strata::vk_engine::missing("strata::kernels::fp8_e4m3_dequant_row"); } }
 namespace strata::kernels { void fused_gdn_ab(const float * p0, const uint16_t * p1, const uint16_t * p2, const float * p3, const float * p4, float * p5, float * p6, int p7, int p8, void * p9) { strata::vk_engine::missing("strata::kernels::fused_gdn_ab"); } }
 namespace strata::kernels { void fused_gdn_conv_l2(float * p0, const float * p1, const float * p2, float * p3, int p4, int p5, float p6, void * p7) { strata::vk_engine::missing("strata::kernels::fused_gdn_conv_l2"); } }
 namespace strata::kernels { void fused_gdn_step_norm(float * p0, const float * p1, const float * p2, const float * p3, const float * p4, const float * p5, const float * p6, const float * p7, float p8, float * p9, int p10, int p11, void * p12) { strata::vk_engine::missing("strata::kernels::fused_gdn_step_norm"); } }
@@ -158,8 +156,6 @@ namespace strata::kernels { void handoff_publish(float * p0, const float * p1, i
 namespace strata::kernels { void hc_q8_to_bf16(const void * p0, const float * p1, uint16_t * p2, long long p3, void * p4) { strata::vk_engine::missing("strata::kernels::hc_q8_to_bf16"); } }
 namespace strata::kernels { void ident_hits(const int32_t * p0, int p1, int32_t * p2, int32_t * p3, int32_t * p4, void * p5) { strata::vk_engine::missing("strata::kernels::ident_hits"); } }
 namespace strata::kernels { void indexer_key_append(const float * p0, const int32_t * p1, int32_t p2, const float * p3, float p4, const QsaIndexerBuffers & p5, const QsaShapes & p6, const float * p7, const float * p8, void * p9) { strata::vk_engine::missing("strata::kernels::indexer_key_append"); } }
-namespace strata::kernels { int iq4nl_code(int p0) { strata::vk_engine::missing("strata::kernels::iq4nl_code"); return {}; } }
-namespace strata::kernels { void iq4nl_dequant_row(const uint8_t * p0, float * p1) { strata::vk_engine::missing("strata::kernels::iq4nl_dequant_row"); } }
 namespace strata::kernels { void iq_dequant_f16(int p0, const void * p1, int64_t p2, uint16_t * p3, void * p4, const float * p5) { strata::vk_engine::missing("strata::kernels::iq_dequant_f16"); } }
 namespace strata::kernels { void iq_dequant_f32(int p0, const void * p1, int64_t p2, float * p3, void * p4) { strata::vk_engine::missing("strata::kernels::iq_dequant_f32"); } }
 namespace strata::kernels { void iq_dequant_gu_f16(int p0, const void * p1, const void * p2, int64_t p3, int64_t p4, uint16_t * p5, void * p6, const float * p7) { strata::vk_engine::missing("strata::kernels::iq_dequant_gu_f16"); } }
@@ -318,23 +314,13 @@ namespace strata::kernels { void native_router_top10_multi(const float * p0, int
 namespace strata::kernels { void native_router_topk(const float * p0, int32_t * p1, float * p2, int p3, int p4, int p5, void * p6) { strata::vk_engine::missing("strata::kernels::native_router_topk"); } }
 namespace strata::kernels { bool native_router_topk_supported(int p0, int p1) { strata::vk_engine::missing("strata::kernels::native_router_topk_supported"); return {}; } }
 namespace strata::kernels { void native_swiglu_quantize_q8_1(const float * p0, const float * p1, void * p2, int p3, int p4, void * p5) { strata::vk_engine::missing("strata::kernels::native_swiglu_quantize_q8_1"); } }
-namespace strata::kernels { uint64_t ngram_mixed(const int64_t * p0, const uint64_t * p1, int p2) { strata::vk_engine::missing("strata::kernels::ngram_mixed"); return {}; } }
-namespace strata::kernels { void ngram_rows(const int32_t * p0, const int32_t * p1, int p2, const PleConsts & p3, uint32_t * p4) { strata::vk_engine::missing("strata::kernels::ngram_rows"); } }
-namespace strata::kernels { PleConsts ple_artifact_consts() { strata::vk_engine::missing("strata::kernels::ple_artifact_consts"); return {}; } }
 namespace strata::kernels { void ple_block(const float * p0, const float * p1, const float * p2, const PleWeights & p3, PleOut & p4, void * p5, void * p6) { strata::vk_engine::missing("strata::kernels::ple_block"); } }
 namespace strata::kernels { bool ple_block_available() { strata::vk_engine::missing("strata::kernels::ple_block_available"); return {}; } }
 namespace strata::kernels { void ple_block_projected(const float * p0, const float * p1, const float * p2, const float * p3, const PleWeights & p4, PleOut & p5, void * p6, void * p7) { strata::vk_engine::missing("strata::kernels::ple_block_projected"); } }
 namespace strata::kernels { uint64_t ple_block_scratch_bytes() { strata::vk_engine::missing("strata::kernels::ple_block_scratch_bytes"); return {}; } }
-namespace strata::kernels { int ple_format_count() { strata::vk_engine::missing("strata::kernels::ple_format_count"); return {}; } }
-namespace strata::kernels { const PleFormatInfo * ple_format_for_type(const char * p0) { strata::vk_engine::missing("strata::kernels::ple_format_for_type"); return {}; } }
-namespace strata::kernels { const PleFormatInfo & ple_format_info(PleFormat p0) { strata::vk_engine::missing("strata::kernels::ple_format_info"); static std::remove_cv_t<std::remove_reference_t<const PleFormatInfo &>> s{}; return s; } }
-namespace strata::kernels { std::string ple_format_list() { strata::vk_engine::missing("strata::kernels::ple_format_list"); return {}; } }
-namespace strata::kernels { const PleFormatInfo * ple_formats() { strata::vk_engine::missing("strata::kernels::ple_formats"); return {}; } }
 namespace strata::kernels { void ple_history_advance(float * p0, const float * p1, void * p2) { strata::vk_engine::missing("strata::kernels::ple_history_advance"); } }
 namespace strata::kernels { bool ple_native_bf16_enabled() { strata::vk_engine::missing("strata::kernels::ple_native_bf16_enabled"); return {}; } }
 namespace strata::kernels { bool ple_native_postops_enabled() { strata::vk_engine::missing("strata::kernels::ple_native_postops_enabled"); return {}; } }
-namespace strata::kernels { void ple_prefetch_enable(bool p0) { strata::vk_engine::missing("strata::kernels::ple_prefetch_enable"); } }
-namespace strata::kernels { bool ple_prefetch_enabled() { strata::vk_engine::missing("strata::kernels::ple_prefetch_enabled"); return {}; } }
 namespace strata::kernels { void ple_set_native_bf16(bool p0) { strata::vk_engine::missing("strata::kernels::ple_set_native_bf16"); } }
 namespace strata::kernels { void ple_set_native_postops(bool p0) { strata::vk_engine::missing("strata::kernels::ple_set_native_postops"); } }
 namespace strata::kernels { void qsa_attend(const float * p0, const uint16_t * p1, const uint16_t * p2, int64_t p3, const QsaShapes & p4, float * p5, float * p6, void * p7) { strata::vk_engine::missing("strata::kernels::qsa_attend"); } }
