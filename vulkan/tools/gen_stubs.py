@@ -46,7 +46,42 @@ HOST_DEFINED = {"cvec", "native_mmvq_supported", "native_mmvq_ids_supported", "n
                 # the rope table builders + the rope config: host float64 loops (rope.cu:45-86),
                 # transcribed verbatim above; bitwise what CUDA computes
                 "rope_scaling_set", "rope_scaling", "build_rope_table",
-                "iq_supported", "embed_type_supported"}
+                "iq_supported", "embed_type_supported", "native_mmvq_weight_bytes",
+                "native_q8_0_packed_enabled", "native_q8_0_packed_eligible",
+                # gr/fused_gr host surface (setters, geometry query, workspace layout): transcribed
+                # above; the read/write kernels and the multi/persist launches stay named traps
+                "gr_set_fp32_activations", "gr_set_native_mmvf", "gr_native_mmvf_enabled",
+                "gr_workspace_init", "fused_gr_set_fast", "fused_gr_supported",
+                "fused_gr_variant", "fused_gr_check", "fused_gr_persist_init",
+                # ple host surface (mode setters, availability, scratch arithmetic)
+                "ple_set_native_bf16", "ple_native_bf16_enabled", "ple_set_native_postops",
+                "ple_native_postops_enabled", "ple_block_available", "ple_block_scratch_bytes",
+                # the config-flag family (setters/getters/geometry predicates/byte arithmetic only):
+                # they pick WHICH trap a run reaches, exactly as on CUDA; no kernel path invented here
+                "native_gdn_set_enabled", "native_gdn_enabled",
+                "native_rope_set_enabled", "native_rope_enabled",
+                "native_router_set_enabled", "native_router_enabled", "native_router_topk_supported",
+                "native_qsa_set_enabled", "native_qsa_enabled",
+                "native_qsa_indexer_set_enabled", "native_qsa_indexer_enabled",
+                "native_qsa_score_set_enabled", "native_qsa_score_enabled",
+                "native_moe_combine_set_enabled", "native_moe_combine_enabled",
+                "native_moe_combine_hits_supported",
+                "shared_expert_set_native_bf16", "shared_expert_native_bf16_enabled",
+                "iq_set_old_kernels", "native_grouped_set_v1",
+                "native_mmvq_set_b6_rows", "native_mmvq_set_multi_exact",
+                "qsa_prompt_attn_set_imma",
+                "native_expert_set_expdec", "native_expert_expdec",
+                "native_expert_set_expdec_params", "native_expert_expdec_params",
+                "native_expert_expdec_takes",
+                "native_q6_k_packed_enabled", "native_expert_set_mode",
+                # load-path scratch arithmetic + type tables (transcribed verbatim above)
+                "moe_hit_grouped_scratch_bytes", "shared_expert_scratch_bytes",
+                "argmax_rows_scratch_bytes", "row_top_prob_scratch_bytes", "coupled_draft_scratch_bytes",
+                "kv_block_bytes", "dequant_bf16_supported", "dequant_set_wide",
+                "cvec_enabled", "cvec_set_enabled", "qsa_decode_attn_scratch_floats",
+                # the rope/mrope table registries (pointer stores + the opt-in query): host state only,
+                # the native_rope launches that read them stay traps
+                "rope_table_set", "rope_table_release", "rope_table_for", "mrope_table_set", "mrope_table"}
 
 # ---- N/A: ledger rows whose state is `n/a` — these must NOT trap (the engine's
 # verify.cpp evaluates pdl_supported() on EVERY run, graphs or not; a trap there

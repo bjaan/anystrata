@@ -1234,7 +1234,29 @@ namespace {}
 uint64_t doorbell_init(const ModelGeometry& g, int64_t k, Doorbell& db) {    db.n_embd = g.n_embd;    db.k = k;    uint64_t bytes = 0;
 // ONE region per field, each MAPPED PINNED, so the device and the host have different pointers to the same
 // bytes and no copy is needed to publish them.
-auto alloc = [&](size_t n, void** h, void** d, const char* what) {        if (cudaHostAlloc(h, n, cudaHostAllocMapped) != cudaSuccess) {            std::fprintf(stderr, "doorbell_init: cudaHostAlloc(%s) failed\n", what);            return false;        }        if (cudaHostGetDevicePointer(d, *h, 0) != cudaSuccess) {            std::fprintf(stderr, "doorbell_init: cudaHostGetDevicePointer(%s) failed\n", what);            return false;        }        std::memset(*h, 0, n);        bytes += n;        return true;    };    if (!alloc((size_t) g.n_embd * 4, (void**) &db.h_x_f, (void**) &db.d_x_f, "x_f")) return 0;    if (!alloc((size_t) k * 4, (void**) &db.h_ids, (void**) &db.d_ids, "ids")) return 0;    if (!alloc((size_t) k * 4, (void**) &db.h_weights, (void**) &db.d_weights, "weights")) return 0;    if (!alloc(4, (void**) &db.h_seq, (void**) &db.d_seq, "seq")) return 0;    if (!alloc(4, (void**) &db.h_flag, (void**) &db.d_flag, "flag")) return 0;    return bytes;}
+auto alloc = [&](size_t n, void** h, void** d, const char* what) {
+            if (cudaHostAlloc(h, n, cudaHostAllocMapped) != cudaSuccess) {
+                std::fprintf(stderr, "doorbell_init: cudaHostAlloc(%s) failed\n", what);
+                return false;
+            }
+#ifdef STRATA_VULKAN
+            // Vulkan port (measured: vulkan/src/probe/doorbell_probe.cpp, PORT-NOTES): this driver delivers
+            // no live host store to a RUNNING kernel, so the doorbell's spin design has no device-side
+            // meaning here, and the compat layer honestly refuses the alias. Init passes with d == h: every
+            // kernel that would read the device pointer (doorbell_publish / _ring / _wait) is a named trap
+            // on this backend, so nothing dereferences these until the handshake is re-ported to a
+            // submit-boundary shape, and THAT port is the doorbell's Vulkan question.
+            *d = *h;
+#else
+            if (cudaHostGetDevicePointer(d, *h, 0) != cudaSuccess) {
+                std::fprintf(stderr, "doorbell_init: cudaHostGetDevicePointer(%s) failed\n", what);
+                return false;
+            }
+#endif
+            std::memset(*h, 0, n);
+            bytes += n;
+            return true;
+        };    if (!alloc((size_t) g.n_embd * 4, (void**) &db.h_x_f, (void**) &db.d_x_f, "x_f")) return 0;    if (!alloc((size_t) k * 4, (void**) &db.h_ids, (void**) &db.d_ids, "ids")) return 0;    if (!alloc((size_t) k * 4, (void**) &db.h_weights, (void**) &db.d_weights, "weights")) return 0;    if (!alloc(4, (void**) &db.h_seq, (void**) &db.d_seq, "seq")) return 0;    if (!alloc(4, (void**) &db.h_flag, (void**) &db.d_flag, "flag")) return 0;    return bytes;}
 void doorbell_free(Doorbell& db) {    if (db.h_x_f) (void) cudaFreeHost(db.h_x_f);    if (db.h_ids) (void) cudaFreeHost(db.h_ids);    if (db.h_weights) (void) cudaFreeHost(db.h_weights);    if (db.h_seq) (void) cudaFreeHost(db.h_seq);    if (db.h_flag) (void) cudaFreeHost(db.h_flag);    db = Doorbell{};}
 void doorbell_reset(const Doorbell& db) {
     if (db.h_seq) *db.h_seq = 0;
