@@ -26,6 +26,11 @@ case "${1:-}" in
 esac
 case "$gate" in
   engine) floor=10500;;   # the engine maps its own arena; measured safe at 13.9-14.1 GB resident
+  pack)   floor=9400;;    # anystrata-pack --mmap-experts: experts are FILE-BACKED (the GGUF shards in
+                          # place, reclaimable like the cpu tier); its anon budget is the explicit
+                          # --expert-cache MiB + KV. NOT the 35.5 GB pinned arena arm - that one wants
+                          # the engine floor. Measured on the BC-250: the mmap arm halts cleanly at
+                          # kernel demand with 10.0 GB available (pack bring-up legs, Phase 7.1)
   cpu)    floor=9400;;    # mmap page cache is reclaimable: 9.2 GiB available is plenty
   gpu)    floor=12300;;   # pinned TTM tiers: ONLY a machine idle enough for 12.0 GiB free
   *) echo "leg.sh: unknown gate '$gate'"; exit 2;;
