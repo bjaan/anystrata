@@ -130,9 +130,15 @@ def main():
             else:
                 dem = line
             want.add(dem.split("(")[0].strip())
+    # HEADER_HOST: declarations whose CUDA body is entirely #if defined(__HIPCC__) (non-HIP builds get
+    # a no-op / fixed false). The AST sees only the declaration, so the roster would trap host code that
+    # CUDA compiles to nothing; these are defined by hand at the top of the emitted file instead.
+    HEADER_HOST = {"prompt_f16", "gemm_set_dense_f16", "gemm_set_dense_f32", "gemm_f16_range_read",
+                   "gemm_set_f16_range"}
     pack = [d for d in all_decls
             if d["qual"].startswith("strata::prefill::") and "type" in d
             and d["qual"] not in defined
+            and d["qual"].split("::")[-1] not in HEADER_HOST
             and (not want or d["qual"] in want or ("::".join(d["qual"].split("::")[:3]) in want))]
     # unique on qualified name
     seen, uniq = set(), []
@@ -158,6 +164,15 @@ def main():
 #include <type_traits>
 
 namespace strata::vk_engine { void missing(const char* name); }
+
+// HEADER_HOST (see the generator): declarations whose CUDA bodies are wholly #if defined(__HIPCC__) —
+// non-HIP builds compile them to no-ops, so trapping them would abort runs CUDA completes silently.
+namespace strata::prefill {
+bool prompt_f16() { return false; }
+void gemm_set_dense_f32(int) {}
+bool gemm_f16_range_read(float*, unsigned long long*, bool) { return false; }
+void gemm_set_f16_range(bool) {}
+}  // namespace strata::prefill
 
 """)
         emitted = 0

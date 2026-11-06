@@ -940,7 +940,15 @@ target_link_libraries(poly_draft_race_test_vk PRIVATE
 # Model files (docs/MODEL-FILES.md): GGUF shards on external media, the pack tree + mtp/ built by
 # tools/iq_pack.py into ~/models (mtp from robertkarl/UnbiasedStrataPacks).
 add_library(strata_vk_pack_stubs STATIC
-  src/pack/stubs_gen.cpp src/pack/q36_run_trap.cpp src/pack/remote_expert_opt_trap.cpp src/pack/gemm_trap.cpp)
+  src/pack/stubs_gen.cpp src/pack/q36_run_trap.cpp src/pack/remote_expert_opt_trap.cpp)
+
+# Phase 7.1 leg 9: the real Gemm on this backend (compat cublas = vk_blas's GPU tiles + ordered CPU
+# fallback); the library sits BEFORE the pack stubs on the link so its symbols win; Gemm::native
+# still lands on strata::kernels::dequant_f16's named trap (PORT-STATUS row 30) — the honest frontier.
+add_library(strata_vk_pack_gemm STATIC src/pack/gemm_vk.cpp)
+target_include_directories(strata_vk_pack_gemm PUBLIC
+  ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/vulkan_compat)
+target_link_libraries(strata_vk_pack_gemm PUBLIC strata_vk_runtime strata_vk_blas)
 target_include_directories(strata_vk_pack_stubs PUBLIC
   ${STRATA_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/vulkan_compat)
 target_link_libraries(strata_vk_pack_stubs PUBLIC strata_vk_runtime)
@@ -1025,6 +1033,7 @@ target_include_directories(anystrata-pack-vk PRIVATE
   ${STRATA_ROOT}/include ${STRATA_VK_GGML_DIR}/include ${STRATA_ROOT}/src/poly)
 target_compile_definitions(anystrata-pack-vk PRIVATE STRATA_HAVE_QWEN35=1 STRATA_NATIVE_EXPERTS=1)
 target_link_libraries(anystrata-pack-vk PRIVATE
+  strata_vk_pack_gemm
   strata_vk_kernels_cpu
   ${VK_POLY_ENGINE_LIBS}
   strata_vk_pack_stubs                          # pack rosters before the global stubs
