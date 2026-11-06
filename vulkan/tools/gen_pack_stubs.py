@@ -134,7 +134,10 @@ def main():
     # a no-op / fixed false). The AST sees only the declaration, so the roster would trap host code that
     # CUDA compiles to nothing; these are defined by hand at the top of the emitted file instead.
     HEADER_HOST = {"prompt_f16", "gemm_set_dense_f16", "gemm_set_dense_f32", "gemm_f16_range_read",
-                   "gemm_set_f16_range"}
+                   "gemm_set_f16_range",
+                   # kernels.cu too: same shape (CUDA builds compile them empty; the state lives in
+                   # HIP __constant__ device globals these builds never declare)
+                   "set_act_f16", "set_f16_range", "f16_range_read"}
     pack = [d for d in all_decls
             if d["qual"].startswith("strata::prefill::") and "type" in d
             and d["qual"] not in defined
@@ -171,7 +174,10 @@ namespace strata::prefill {
 bool prompt_f16() { return false; }
 void gemm_set_dense_f32(int) {}
 bool gemm_f16_range_read(float*, unsigned long long*, bool) { return false; }
-void gemm_set_f16_range(bool) {}
+void gemm_set_f16_range(bool) {}                    // gemm.cu
+void set_act_f16(bool) {}                           // kernels.cu: CUDA's activation image is always BF16
+void set_f16_range(bool) {}
+bool f16_range_read(float&, unsigned long long&, bool) { return false; }
 }  // namespace strata::prefill
 
 """)
